@@ -1,0 +1,5 @@
+1) Tambahkan import berikut di bagian atas routes/api.php:
+use App\Http\Controllers\Api\V1\AccessMatrixDiagnosticController;
+
+2) Tambahkan route berikut di dalam group Route::prefix('user-management')->group(function () { ... }:
+Route::get('/diagnostics/access-consistency', [AccessMatrixDiagnosticController::class, 'index']);
