@@ -86,6 +86,10 @@ class SalesController extends Controller
 
     public function show(Request $request, string $id)
     {
+        if (!$request->user()?->can('sale.view') && !$request->user()?->can('pos.checkout')) {
+            return ApiResponse::error('User does not have the right permissions.', 'FORBIDDEN', 403);
+        }
+
         $outletId = OutletScope::id($request); // null => ALL
 
         $sale = Sale::query()

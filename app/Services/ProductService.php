@@ -179,13 +179,14 @@ class ProductService
         });
     }
 
-    public function setActiveForOutlet(string $outletId, Product $product, bool $isActive): void
+    public function setActiveForOutlet(string $outletId, Product $product, bool $isActive): Product
     {
-        // ensure row exists then set is_active
         DB::table('outlet_product')->updateOrInsert(
             ['product_id' => (string) $product->id, 'outlet_id' => (string) $outletId],
             ['is_active' => $isActive, 'created_at' => now(), 'updated_at' => now()]
         );
+
+        return $this->loadForOutlet($product->fresh(), $outletId);
     }
 
     public function delete(Product $product): void

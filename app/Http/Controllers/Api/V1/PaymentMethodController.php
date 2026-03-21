@@ -38,6 +38,11 @@ class PaymentMethodController extends Controller
         return $candidate;
     }
 
+    private function findMethod(string $id): ?PaymentMethod
+    {
+        return PaymentMethod::query()->whereKey($id)->first();
+    }
+
     public function index(ListPaymentMethodRequest $request)
     {
         $outletId = $this->resolveOutletId($request);
@@ -77,7 +82,7 @@ class PaymentMethodController extends Controller
             return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
         }
 
-        $method = PaymentMethod::query()->whereKey($id)->first();
+        $method = $this->findMethod($id);
         if (!$method) {
             return ApiResponse::error('Payment method not found', 'NOT_FOUND', 404);
         }
@@ -92,9 +97,35 @@ class PaymentMethodController extends Controller
             return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
         }
 
-        $method = $this->service->update((string) $id, (string) $outletId, $request->validated());
+        $method = $this->findMethod($id);
+        if (!$method) {
+            return ApiResponse::error('Payment method not found', 'NOT_FOUND', 404);
+        }
+
+        $method = $this->service->update((string) $outletId, $method, $request->validated());
 
         return ApiResponse::ok(new PaymentMethodResource($method), 'Payment method updated');
+    }
+
+    public function setOutletActive(Request $request, string $id)
+    {
+        $outletId = $this->resolveOutletId($request);
+        if (!$outletId) {
+            return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
+        }
+
+        $method = $this->findMethod($id);
+        if (!$method) {
+            return ApiResponse::error('Payment method not found', 'NOT_FOUND', 404);
+        }
+
+        $validated = $request->validate([
+            'is_active' => ['required', 'boolean'],
+        ]);
+
+        $method = $this->service->setOutletActive((string) $outletId, $method, (bool) $validated['is_active']);
+
+        return ApiResponse::ok(new PaymentMethodResource($method), 'Payment method outlet status updated');
     }
 
     public function destroy(Request $request, string $id)
@@ -104,7 +135,12 @@ class PaymentMethodController extends Controller
             return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
         }
 
-        $this->service->delete((string) $id, (string) $outletId);
+        $method = $this->findMethod($id);
+        if (!$method) {
+            return ApiResponse::error('Payment method not found', 'NOT_FOUND', 404);
+        }
+
+        $this->service->delete($method);
 
         return ApiResponse::ok(null, 'Payment method deleted');
     }

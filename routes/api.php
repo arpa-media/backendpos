@@ -110,8 +110,7 @@ Route::prefix('v1')->group(function () {
         Route::get('/sales', [SalesController::class, 'index'])
             ->middleware('permission:sale.view');
 
-        Route::get('/sales/{id}', [SalesController::class, 'show'])
-            ->middleware('permission:sale.view');
+        Route::get('/sales/{id}', [SalesController::class, 'show']);
 
         // Patch-8 (extra): Admin cancel bill and confirm delete
         Route::post('/sales/{id}/cancel', [SalesController::class, 'cancel'])
@@ -174,17 +173,20 @@ Route::put('/outlet', [OutletController::class, 'update'])
             return ApiResponse::ok(['pong' => true], 'OK');
         })->middleware('permission:admin.access');
 
-        Route::prefix('user-management')->group(function () {
+        Route::prefix('user-management')->middleware('permission:user_management.view')->group(function () {
             Route::get('/overview', [UserManagementController::class, 'overview']);
-            Route::post('/roles', [UserManagementController::class, 'storeRole']);
-            Route::put('/roles/{id}', [UserManagementController::class, 'updateRole']);
-            Route::post('/levels', [UserManagementController::class, 'storeLevel']);
-            Route::put('/levels/{id}', [UserManagementController::class, 'updateLevel']);
-            Route::put('/users/{userId}/access', [UserManagementController::class, 'updateUserAccess']);
-            Route::put('/portal-permissions', [UserManagementController::class, 'updatePortalPermission']);
-            Route::put('/portal-permissions/bulk', [UserManagementController::class, 'bulkPortalPermissions']);
-            Route::put('/menu-permissions', [UserManagementController::class, 'updateMenuPermission']);
-            Route::put('/menu-permissions/bulk', [UserManagementController::class, 'bulkMenuPermissions']);
+
+            Route::middleware('permission:user_management.edit')->group(function () {
+                Route::post('/roles', [UserManagementController::class, 'storeRole']);
+                Route::put('/roles/{id}', [UserManagementController::class, 'updateRole']);
+                Route::post('/levels', [UserManagementController::class, 'storeLevel']);
+                Route::put('/levels/{id}', [UserManagementController::class, 'updateLevel']);
+                Route::put('/users/{userId}/access', [UserManagementController::class, 'updateUserAccess']);
+                Route::put('/portal-permissions', [UserManagementController::class, 'updatePortalPermission']);
+                Route::put('/portal-permissions/bulk', [UserManagementController::class, 'bulkPortalPermissions']);
+                Route::put('/menu-permissions', [UserManagementController::class, 'updateMenuPermission']);
+                Route::put('/menu-permissions/bulk', [UserManagementController::class, 'bulkMenuPermissions']);
+            });
         });
 
         /**
@@ -260,8 +262,7 @@ Route::put('/outlet', [OutletController::class, 'update'])
             Route::post('/', [PaymentMethodController::class, 'store'])
                 ->middleware('permission:payment_method.create');
 
-            Route::get('/{id}', [PaymentMethodController::class, 'show'])
-                ->middleware('permission:payment_method.view');
+            Route::get('/{id}', [PaymentMethodController::class, 'show']);
 
             Route::put('/{id}', [PaymentMethodController::class, 'update'])
                 ->middleware('permission:payment_method.update');

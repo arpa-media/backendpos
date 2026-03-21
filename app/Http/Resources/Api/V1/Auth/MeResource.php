@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources\Api\V1\Auth;
 
+use App\Services\UserManagementService;
 use App\Support\Auth\UserAuthContextResolver;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -14,6 +15,7 @@ class MeResource extends JsonResource
         $assignment = $employee?->assignment;
         $resolvedOutlet = $assignment?->outlet ?: $user->outlet;
         $authContext = app(UserAuthContextResolver::class)->resolve($user);
+        $snapshot = app(UserManagementService::class)->currentSessionSnapshot($user);
 
         return [
             'id' => (string) $user->id,
@@ -54,7 +56,10 @@ class MeResource extends JsonResource
                 'requires_legacy_bridge' => (bool) ($authContext['requires_legacy_bridge'] ?? false),
             ],
             'roles' => $user->roles?->pluck('name')->values() ?? [],
-            'permissions' => $user->getAllPermissions()->pluck('name')->values(),
+            'permissions' => $snapshot['permissions'] ?? $user->getAllPermissions()->pluck('name')->values(),
+            'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
+            'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
+            'can_edit_user_management' => (bool) ($snapshot['can_edit_user_management'] ?? false),
         ];
     }
 }

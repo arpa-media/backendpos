@@ -55,6 +55,20 @@ class AuthSeeder extends Seeder
                 'sale.view',
                 'report.view',
             ],
+            'squad' => [
+                'auth.me',
+                'dashboard.view',
+                'outlet.view',
+                'category.view',
+                'product.view',
+                'payment_method.view',
+                'discount.view',
+                'pos.checkout',
+                'sale.view',
+                'sale.cancel.request',
+                'customer.view', 'customer.create',
+                'report.view',
+            ],
         ];
 
         $permissions = [

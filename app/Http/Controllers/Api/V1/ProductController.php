@@ -127,7 +127,7 @@ class ProductController extends Controller
             $data['image_path'] = $request->file('image')->store('products/'.(string) $outletId, 'public');
         }
 
-        $product = $this->service->update((string) $id, (string) $outletId, $data);
+        $product = $this->service->update((string) $outletId, $current, $data);
 
         return ApiResponse::ok(new ProductResource($product), 'Product updated');
     }
@@ -139,7 +139,12 @@ class ProductController extends Controller
             return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
         }
 
-        $this->service->delete((string) $id, (string) $outletId);
+        $product = Product::query()->find($id);
+        if (!$product) {
+            return ApiResponse::error('Product not found', 'NOT_FOUND', 404);
+        }
+
+        $this->service->delete($product);
 
         return ApiResponse::ok(null, 'Product deleted');
     }
@@ -155,7 +160,12 @@ class ProductController extends Controller
             'is_active' => ['required', 'boolean'],
         ]);
 
-        $product = $this->service->setOutletActive((string) $id, (string) $outletId, (bool) $validated['is_active']);
+        $product = Product::query()->find($id);
+        if (!$product) {
+            return ApiResponse::error('Product not found', 'NOT_FOUND', 404);
+        }
+
+        $product = $this->service->setActiveForOutlet((string) $outletId, $product, (bool) $validated['is_active']);
 
         return ApiResponse::ok(new ProductResource($product), 'Product outlet status updated');
     }

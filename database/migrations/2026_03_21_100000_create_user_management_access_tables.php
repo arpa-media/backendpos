@@ -148,7 +148,7 @@ return new class extends Migration {
             ['portal' => 'sales', 'code' => 'sales-payment-method', 'name' => 'Payment Method', 'path' => '/payment-methods', 'sort' => 70, 'view' => 'payment_method.view', 'create' => 'payment_method.create', 'update' => 'payment_method.update', 'delete' => 'payment_method.delete'],
             ['portal' => 'sales', 'code' => 'sales-discount', 'name' => 'Discount', 'path' => '/discounts', 'sort' => 80, 'view' => 'discount.view', 'create' => 'discount.create', 'update' => 'discount.update', 'delete' => 'discount.delete'],
             ['portal' => 'sales', 'code' => 'sales-taxes', 'name' => 'Taxes', 'path' => '/taxes', 'sort' => 90, 'view' => 'taxes.view', 'create' => 'taxes.create', 'update' => 'taxes.update', 'delete' => 'taxes.delete'],
-            ['portal' => 'sales', 'code' => 'sales-outlet', 'name' => 'Outlet', 'path' => '/settings/outlet', 'sort' => 100, 'view' => 'outlet.view', 'update' => 'outlet.update'],
+            ['portal' => 'operational', 'code' => 'operational-outlet', 'name' => 'Outlet', 'path' => '/settings/outlet', 'sort' => 100, 'view' => 'outlet.view', 'update' => 'outlet.update'],
             ['portal' => 'human-resource', 'code' => 'hr-dashboard', 'name' => 'Dashboard', 'path' => '/portal/human-resource/dashboard', 'sort' => 10],
             ['portal' => 'human-resource', 'code' => 'hr-user-management', 'name' => 'Data Users', 'path' => '/user-management', 'sort' => 20, 'view' => 'user_management.view', 'update' => 'user_management.edit'],
             ['portal' => 'customer', 'code' => 'customer-list', 'name' => 'Customer', 'path' => '/customers', 'sort' => 10, 'view' => 'customer.view', 'create' => 'customer.create'],

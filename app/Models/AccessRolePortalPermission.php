@@ -24,4 +24,9 @@ class AccessRolePortalPermission extends Model
             'can_view' => 'boolean',
         ];
     }
+
+    public function portal()
+    {
+        return $this->belongsTo(AccessPortal::class, 'portal_id');
+    }
 }

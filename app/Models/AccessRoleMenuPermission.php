@@ -30,4 +30,9 @@ class AccessRoleMenuPermission extends Model
             'can_delete' => 'boolean',
         ];
     }
+
+    public function menu()
+    {
+        return $this->belongsTo(AccessMenu::class, 'menu_id');
+    }
 }

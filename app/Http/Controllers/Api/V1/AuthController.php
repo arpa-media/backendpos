@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Auth\LoginRequest;
 use App\Http\Resources\Api\V1\Auth\MeResource;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
+use App\Services\UserManagementService;
 use App\Support\Auth\UserAuthContextResolver;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
@@ -13,8 +14,10 @@ use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
 {
-    public function __construct(private readonly UserAuthContextResolver $resolver)
-    {
+    public function __construct(
+        private readonly UserAuthContextResolver $resolver,
+        private readonly UserManagementService $userManagement,
+    ) {
     }
 
     public function login(LoginRequest $request)
@@ -68,7 +71,13 @@ class AuthController extends Controller
             }
         }
 
-        $abilities = $user->getAllPermissions()->pluck('name')->values()->all();
+        $this->userManagement->ensureMasters();
+        $this->userManagement->syncUserPermissions($user);
+
+        $user = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet']);
+        $snapshot = $this->userManagement->currentSessionSnapshot($user);
+        $abilities = $snapshot['permissions'] ?? [];
+
         if ($user->hasRole('admin') && empty($abilities)) {
             $abilities = ['*'];
         }
@@ -82,16 +91,27 @@ class AuthController extends Controller
             'token_type' => 'Bearer',
             'abilities' => $abilities,
             'auth_context' => $ctx,
-            'user' => new MeResource($user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet'])),
+            'user' => new MeResource($user),
+            'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
+            'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
+            'can_edit_user_management' => (bool) ($snapshot['can_edit_user_management'] ?? false),
+            'permissions' => $snapshot['permissions'] ?? [],
         ], 'Login success');
     }
 
     public function me(Request $request)
     {
-        return ApiResponse::ok(
-            new MeResource($request->user()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet'])),
-            'OK'
-        );
+        $user = $request->user()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet']);
+        $snapshot = $this->userManagement->currentSessionSnapshot($user);
+
+        return ApiResponse::ok([
+            'user' => new MeResource($user),
+            'abilities' => $snapshot['permissions'] ?? [],
+            'permissions' => $snapshot['permissions'] ?? [],
+            'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
+            'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
+            'can_edit_user_management' => (bool) ($snapshot['can_edit_user_management'] ?? false),
+        ], 'OK');
     }
 
     public function logout(Request $request)

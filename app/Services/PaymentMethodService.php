@@ -28,20 +28,17 @@ class PaymentMethodService
             }]);
 
         if ($forPos) {
-            // POS: only methods active in this outlet
             $query->whereHas('outlets', function ($sub) use ($outletId) {
                 $sub->where('outlets.id', $outletId)
                     ->where('outlet_payment_method.is_active', true);
             });
         } else {
-            // Admin: show all methods; filter by outlet pivot if requested
             if (!is_null($isActive)) {
                 $query->whereHas('outlets', function ($sub) use ($outletId, $isActive) {
                     $sub->where('outlets.id', $outletId)
                         ->where('outlet_payment_method.is_active', $isActive);
                 });
             } else {
-                // ensure pivot exists so resource can read is_active_in_outlet
                 $query->whereHas('outlets', function ($sub) use ($outletId) {
                     $sub->where('outlets.id', $outletId);
                 });
@@ -76,14 +73,11 @@ class PaymentMethodService
                 'name' => $name,
                 'type' => $data['type'],
                 'sort_order' => (int) ($data['sort_order'] ?? 0),
-                // global flag, keep true (availability per outlet stored in pivot)
                 'is_active' => true,
             ]);
 
             $isActiveInOutlet = array_key_exists('is_active', $data) ? (bool) $data['is_active'] : true;
 
-            // Initialize pivot rows for ALL outlets:
-            // active in selected outlet (per is_active), inactive in others.
             $outletIds = Outlet::query()->pluck('id')->all();
             $now = now();
             $rows = [];
@@ -131,12 +125,9 @@ class PaymentMethodService
 
             $method->save();
 
-            // Outlet-specific activation toggle (pivot outlet_payment_method)
-            // If UI sends is_active, apply it to CURRENT outlet only.
             if (array_key_exists('is_active', $data)) {
                 $this->setActiveForOutlet($outletId, $method, (bool) $data['is_active']);
             } else {
-                // ensure pivot exists (do not flip existing state)
                 $this->ensureOutletPivotExists($outletId, $method);
             }
 
@@ -146,12 +137,18 @@ class PaymentMethodService
         });
     }
 
-    public function setActiveForOutlet(string $outletId, PaymentMethod $method, bool $isActive): void
+    public function setActiveForOutlet(string $outletId, PaymentMethod $method, bool $isActive): PaymentMethod
     {
+        $this->assertOutletExists($outletId);
+
         DB::table('outlet_payment_method')->updateOrInsert(
             ['payment_method_id' => (string) $method->id, 'outlet_id' => (string) $outletId],
             ['is_active' => $isActive, 'created_at' => now(), 'updated_at' => now()]
         );
+
+        return $method->fresh()->load(['outlets' => function ($q) use ($outletId) {
+            $q->where('outlets.id', $outletId);
+        }]);
     }
 
     private function ensureOutletPivotExists(string $outletId, PaymentMethod $method): void

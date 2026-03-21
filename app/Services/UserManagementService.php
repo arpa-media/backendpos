@@ -14,6 +14,7 @@ use App\Models\UserAccessAssignment;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Spatie\Permission\Models\Permission;
 use Spatie\Permission\PermissionRegistrar;
 
@@ -32,7 +33,12 @@ class UserManagementService
         $user->loadMissing('roles');
         $roleNames = $user->roles->pluck('name')->map(fn ($name) => strtolower((string) $name))->all();
 
-        $targetCode = 'CASHIER';
+        $defaultRole = AccessRole::query()->with('userType')
+            ->where('code', 'SQUAD_DEFAULT')
+            ->orWhere('code', 'CASHIER')
+            ->first();
+
+        $targetCode = 'SQUAD_DEFAULT';
         foreach (['admin' => 'ADMIN', 'manager' => 'MANAGER', 'warehouse' => 'WAREHOUSE', 'cashier' => 'CASHIER'] as $spatie => $code) {
             if (in_array($spatie, $roleNames, true)) {
                 $targetCode = $code;
@@ -41,12 +47,16 @@ class UserManagementService
         }
 
         $accessRole = AccessRole::query()->with('userType')->firstWhere('code', $targetCode)
+            ?? $defaultRole
             ?? AccessRole::query()->with('userType')->first();
+
+        $defaultLevel = AccessLevel::query()->where('code', 'DEFAULT')->first()
+            ?? AccessLevel::query()->first();
 
         $assignment = UserAccessAssignment::query()->create([
             'user_id' => $user->id,
             'access_role_id' => $accessRole?->id,
-            'access_level_id' => null,
+            'access_level_id' => $defaultLevel?->id,
             'assigned_by_user_id' => null,
         ]);
 
@@ -296,9 +306,10 @@ class UserManagementService
             ['code' => 'MANAGER', 'user_type' => 'BACKOFFICE', 'name' => 'Manager', 'spatie_role_name' => 'manager'],
             ['code' => 'WAREHOUSE', 'user_type' => 'BACKOFFICE', 'name' => 'Warehouse', 'spatie_role_name' => 'warehouse'],
             ['code' => 'CASHIER', 'user_type' => 'POS', 'name' => 'Cashier', 'spatie_role_name' => 'cashier'],
+            ['code' => 'SQUAD_DEFAULT', 'user_type' => 'BACKOFFICE', 'name' => 'Squad Default', 'spatie_role_name' => 'cashier'],
         ];
         foreach ($roleSeeds as $seed) {
-            AccessRole::query()->firstOrCreate(
+            AccessRole::query()->updateOrCreate(
                 ['code' => $seed['code']],
                 [
                     'user_type_id' => $userTypes[$seed['user_type']]->id ?? null,
@@ -313,11 +324,96 @@ class UserManagementService
         foreach ([
             ['code' => 'HQ', 'name' => 'Head Office'],
             ['code' => 'OUTLET', 'name' => 'Outlet'],
+            ['code' => 'DEFAULT', 'name' => 'Default'],
         ] as $seed) {
-            AccessLevel::query()->firstOrCreate(
+            AccessLevel::query()->updateOrCreate(
                 ['code' => $seed['code']],
                 ['name' => $seed['name'], 'description' => $seed['name'], 'is_active' => true]
             );
+        }
+
+        $this->syncCanonicalAccessMenus();
+    }
+
+    private function syncCanonicalAccessMenus(): void
+    {
+        $portalMap = AccessPortal::query()->pluck('id', 'code');
+        if ($portalMap->isEmpty()) {
+            return;
+        }
+
+        $menuSeeds = [
+            [
+                'portal_code' => 'operational',
+                'code' => 'operational-outlet',
+                'legacy_codes' => ['sales-outlet', 'outlet'],
+                'name' => 'Outlet',
+                'path' => '/settings/outlet',
+                'sort_order' => 100,
+                'permission_view' => 'outlet.view',
+                'permission_update' => 'outlet.update',
+            ],
+        ];
+
+        foreach ($menuSeeds as $seed) {
+            $portalId = $portalMap->get($seed['portal_code']);
+            if (!$portalId) {
+                continue;
+            }
+
+            $this->upsertCanonicalMenu($seed, (string) $portalId);
+        }
+    }
+
+    private function upsertCanonicalMenu(array $seed, string $portalId): void
+    {
+        $canonicalCode = (string) $seed['code'];
+        $codes = array_values(array_unique(array_filter(array_merge([$canonicalCode], $seed['legacy_codes'] ?? []))));
+
+        DB::transaction(function () use ($seed, $portalId, $canonicalCode, $codes) {
+            $menus = AccessMenu::query()->whereIn('code', $codes)->orderByRaw("case when code = ? then 0 else 1 end", [$canonicalCode])->get();
+            $target = $menus->firstWhere('code', $canonicalCode) ?: $menus->first();
+
+            $payload = [
+                'portal_id' => $portalId,
+                'code' => $canonicalCode,
+                'name' => (string) $seed['name'],
+                'path' => (string) $seed['path'],
+                'sort_order' => (int) ($seed['sort_order'] ?? 0),
+                'permission_view' => $seed['permission_view'] ?? null,
+                'permission_create' => $seed['permission_create'] ?? null,
+                'permission_update' => $seed['permission_update'] ?? null,
+                'permission_delete' => $seed['permission_delete'] ?? null,
+                'is_active' => true,
+            ];
+
+            if (!$target) {
+                AccessMenu::query()->create($payload + ['id' => (string) Str::ulid()]);
+                return;
+            }
+
+            $target->fill($payload);
+            $target->save();
+
+            foreach ($menus as $menu) {
+                if ((string) $menu->id === (string) $target->id) {
+                    continue;
+                }
+                $this->repointMenuReferences((string) $menu->id, (string) $target->id);
+                $menu->delete();
+            }
+        });
+    }
+
+    private function repointMenuReferences(string $fromMenuId, string $toMenuId): void
+    {
+        foreach (['access_role_menu_permissions'] as $table) {
+            if (!DB::getSchemaBuilder()->hasTable($table) || !DB::getSchemaBuilder()->hasColumn($table, 'menu_id')) {
+                continue;
+            }
+            DB::table($table)
+                ->where('menu_id', $fromMenuId)
+                ->update(['menu_id' => $toMenuId]);
         }
     }
 }
