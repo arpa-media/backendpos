@@ -123,7 +123,8 @@ class PosCheckoutService
             $discounts,
             $taxId,
             $taxName,
-            $taxPercent
+            $taxPercent,
+            $clientSyncId
         ) {
 
             // 0) Optional: validate customer globally.
