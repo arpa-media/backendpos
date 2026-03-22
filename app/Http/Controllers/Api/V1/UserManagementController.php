@@ -43,6 +43,7 @@ class UserManagementController extends Controller
         if ($q !== '') {
             $usersQuery->where(function ($inner) use ($q) {
                 $inner->where('name', 'like', "%{$q}%")
+                    ->orWhere('username', 'like', "%{$q}%")
                     ->orWhere('nisj', 'like', "%{$q}%")
                     ->orWhere('email', 'like', "%{$q}%");
             });
@@ -77,6 +78,7 @@ class UserManagementController extends Controller
             return [
                 'id' => (string) $user->id,
                 'name' => (string) $user->name,
+                'username' => $user->username,
                 'nisj' => $user->nisj,
                 'email' => $user->email,
                 'is_active' => (bool) ($user->is_active ?? true),

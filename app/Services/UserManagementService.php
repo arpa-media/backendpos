@@ -20,6 +20,10 @@ use Spatie\Permission\PermissionRegistrar;
 
 class UserManagementService
 {
+    public function __construct(private readonly ReportPortalAccessService $reportPortalAccess)
+    {
+    }
+
     public function ensureAccessAssignment(User $user): UserAccessAssignment
     {
         $existing = UserAccessAssignment::query()
@@ -39,7 +43,7 @@ class UserManagementService
             ->first();
 
         $targetCode = 'SQUAD_DEFAULT';
-        foreach (['admin' => 'ADMIN', 'manager' => 'MANAGER', 'warehouse' => 'WAREHOUSE', 'cashier' => 'CASHIER'] as $spatie => $code) {
+        foreach (['admin' => 'ADMIN', 'manager' => 'MANAGER', 'warehouse' => 'WAREHOUSE', 'cashier' => 'CASHIER', 'stakeholder' => 'STAKEHOLDER', 'observer' => 'OBSERVER'] as $spatie => $code) {
             if (in_array($spatie, $roleNames, true)) {
                 $targetCode = $code;
                 break;
@@ -283,11 +287,21 @@ class UserManagementService
 
     public function currentSessionSnapshot(User $user): array
     {
-        $user = $user->fresh(['roles', 'permissions', 'employee.assignment.outlet', 'outlet']);
+        $user = $user->fresh(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+        $access = $this->buildSessionAccess($user);
+        $permissions = $user->getAllPermissions()->pluck('name')->values()->all();
+        $visiblePortals = collect($access['portals'] ?? [])
+            ->filter(fn ($portal) => !empty($portal['can_view']))
+            ->map(fn ($portal) => Arr::only($portal, ['id', 'code', 'name']))
+            ->values()
+            ->all();
 
         return [
-            'permissions' => $user->getAllPermissions()->pluck('name')->values()->all(),
-            'access' => $this->buildSessionAccess($user),
+            'permissions' => $permissions,
+            'access' => $access,
+            'visible_backoffice_portals' => $visiblePortals,
+            'can_edit_user_management' => in_array('user_management.edit', $permissions, true),
+            'report_access' => $this->reportPortalAccess->snapshot($user),
         ];
     }
 
@@ -301,6 +315,8 @@ class UserManagementService
             ['code' => 'ADMIN', 'user_type' => 'BACKOFFICE', 'name' => 'Administrator', 'spatie_role_name' => 'admin'],
             ['code' => 'MANAGER', 'user_type' => 'BACKOFFICE', 'name' => 'Manager', 'spatie_role_name' => 'manager'],
             ['code' => 'WAREHOUSE', 'user_type' => 'BACKOFFICE', 'name' => 'Warehouse', 'spatie_role_name' => 'warehouse'],
+            ['code' => 'STAKEHOLDER', 'user_type' => 'BACKOFFICE', 'name' => 'Stakeholder', 'spatie_role_name' => 'stakeholder'],
+            ['code' => 'OBSERVER', 'user_type' => 'BACKOFFICE', 'name' => 'Observer', 'spatie_role_name' => 'observer'],
             ['code' => 'CASHIER', 'user_type' => 'POS', 'name' => 'Cashier', 'spatie_role_name' => 'cashier'],
             ['code' => 'SQUAD_DEFAULT', 'user_type' => 'BACKOFFICE', 'name' => 'Squad Default', 'spatie_role_name' => 'cashier'],
         ];
@@ -325,6 +341,21 @@ class UserManagementService
             AccessLevel::query()->updateOrCreate(
                 ['code' => $seed['code']],
                 ['name' => $seed['name'], 'description' => $seed['name'], 'is_active' => true]
+            );
+        }
+
+        foreach ([
+            ['code' => 'omzet-report', 'name' => 'Omzet Report', 'description' => 'Portal report omzet seluruh transaksi POS.', 'sort_order' => 16],
+            ['code' => 'sales-report', 'name' => 'Sales Report', 'description' => 'Portal report transaksi dengan marking 1.', 'sort_order' => 17],
+        ] as $portalSeed) {
+            AccessPortal::query()->updateOrCreate(
+                ['code' => $portalSeed['code']],
+                [
+                    'name' => $portalSeed['name'],
+                    'description' => $portalSeed['description'],
+                    'sort_order' => $portalSeed['sort_order'],
+                    'is_active' => true,
+                ]
             );
         }
 
@@ -357,6 +388,54 @@ class UserManagementService
                 'path' => '/c/offline-transactions',
                 'sort_order' => 35,
                 'permission_view' => 'pos.offline_sync.view',
+            ],
+            [
+                'portal_code' => 'omzet-report',
+                'code' => 'omzet-report-dashboard',
+                'name' => 'Dashboard',
+                'path' => '/omzet-report/dashboard',
+                'sort_order' => 10,
+                'permission_view' => 'dashboard.view',
+            ],
+            [
+                'portal_code' => 'omzet-report',
+                'code' => 'omzet-report-ledger',
+                'name' => 'Ledger',
+                'path' => '/omzet-report/ledger',
+                'sort_order' => 20,
+                'permission_view' => 'report.view',
+            ],
+            [
+                'portal_code' => 'omzet-report',
+                'code' => 'omzet-report-report',
+                'name' => 'Report',
+                'path' => '/omzet-report/report',
+                'sort_order' => 30,
+                'permission_view' => 'report.view',
+            ],
+            [
+                'portal_code' => 'sales-report',
+                'code' => 'sales-report-dashboard',
+                'name' => 'Dashboard',
+                'path' => '/sales-report/dashboard',
+                'sort_order' => 10,
+                'permission_view' => 'dashboard.view',
+            ],
+            [
+                'portal_code' => 'sales-report',
+                'code' => 'sales-report-sales',
+                'name' => 'Sales',
+                'path' => '/sales-report/sales',
+                'sort_order' => 20,
+                'permission_view' => 'sale.view',
+            ],
+            [
+                'portal_code' => 'sales-report',
+                'code' => 'sales-report-report',
+                'name' => 'Report',
+                'path' => '/sales-report/report',
+                'sort_order' => 30,
+                'permission_view' => 'report.view',
             ],
         ];
 

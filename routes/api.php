@@ -15,6 +15,7 @@ use App\Http\Controllers\Api\V1\SaleCancelRequestController;
 use App\Http\Controllers\Api\V1\AddonController;
 use App\Http\Controllers\Api\V1\TaxController;
 use App\Http\Controllers\Api\V1\ReportController;
+use App\Http\Controllers\Api\V1\ReportPortalController;
 use App\Http\Controllers\Api\V1\UserManagementController;
 
 
@@ -35,7 +36,7 @@ Route::prefix('v1')->group(function () {
      */
     // outlet_scope MUST run after auth:sanctum so it can lock cashier by user.outlet_id
     // and allow admin to select outlet via header X-Outlet-Id.
-    Route::middleware(['auth:sanctum', 'outlet_scope'])->group(function () {
+    Route::middleware(['auth:sanctum', 'outlet_scope', 'outlet_timezone'])->group(function () {
 
         /**
          * AUTH (me, logout)
@@ -51,6 +52,36 @@ Route::prefix('v1')->group(function () {
          */
         Route::get('/dashboard/summary', [DashboardController::class, 'summary'])
             ->middleware('permission:dashboard.view');
+
+        /**
+         * REPORT PORTALS (Patch-02)
+         */
+        Route::prefix('report-portals/{portalCode}')->group(function () {
+            Route::get('/dashboard', [ReportPortalController::class, 'dashboard'])
+                ->middleware('permission:dashboard.view');
+
+            Route::get('/ledger', [ReportPortalController::class, 'ledger'])
+                ->middleware('permission:report.view');
+
+            Route::get('/recent-sales', [ReportPortalController::class, 'recentSales'])
+                ->middleware('permission:report.view');
+
+            Route::get('/item-sold', [ReportPortalController::class, 'itemSold'])
+                ->middleware('permission:report.view');
+
+            Route::get('/item-by-product', [ReportPortalController::class, 'itemByProduct'])
+                ->middleware('permission:report.view');
+
+            Route::get('/item-by-variant', [ReportPortalController::class, 'itemByVariant'])
+                ->middleware('permission:report.view');
+
+            Route::get('/tax', [ReportPortalController::class, 'tax'])
+                ->middleware('permission:report.view');
+
+            Route::get('/sales/{saleId}', [ReportPortalController::class, 'saleDetail'])
+                ->middleware('permission:sale.view');
+        });
+
 
         /**
          * POS

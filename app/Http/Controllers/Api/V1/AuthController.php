@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Auth\LoginRequest;
 use App\Http\Resources\Api\V1\Auth\MeResource;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
+use App\Services\ReportPortalAccessService;
 use App\Services\UserManagementService;
 use App\Support\Auth\UserAuthContextResolver;
 use Illuminate\Http\Request;
@@ -17,6 +18,7 @@ class AuthController extends Controller
     public function __construct(
         private readonly UserAuthContextResolver $resolver,
         private readonly UserManagementService $userManagement,
+        private readonly ReportPortalAccessService $reportPortalAccess,
     ) {
     }
 
@@ -25,14 +27,25 @@ class AuthController extends Controller
         $validated = $request->validated();
         $loginAs = strtoupper((string) ($validated['login_as'] ?? 'BACKOFFICE'));
 
+        $identifier = trim((string) ($validated['login'] ?? $validated['username'] ?? $validated['nisj'] ?? ''));
+        if ($identifier === '') {
+            throw ValidationException::withMessages([
+                'login' => ['Username atau NISJ wajib diisi.'],
+            ]);
+        }
+
         $user = \App\Models\User::query()
-            ->where('nisj', $validated['nisj'])
-            ->with(['roles', 'permissions', 'employee.assignment.outlet', 'outlet'])
+            ->where(function ($query) use ($identifier) {
+                $query->where('nisj', $identifier)
+                    ->orWhere('username', $identifier)
+                    ->orWhere('email', $identifier);
+            })
+            ->with(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet'])
             ->first();
 
         if (!$user || !Hash::check($validated['password'], $user->password)) {
             throw ValidationException::withMessages([
-                'nisj' => ['Invalid credentials.'],
+                'login' => ['Invalid credentials.'],
             ]);
         }
 
@@ -74,7 +87,7 @@ class AuthController extends Controller
         $this->userManagement->ensureMasters();
         $this->userManagement->syncUserPermissions($user);
 
-        $user = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet']);
+        $user = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
         $snapshot = $this->userManagement->currentSessionSnapshot($user);
         $abilities = $snapshot['permissions'] ?? [];
 
@@ -95,19 +108,21 @@ class AuthController extends Controller
             'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
             'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
             'can_edit_user_management' => (bool) ($snapshot['can_edit_user_management'] ?? false),
+            'report_access' => $snapshot['report_access'] ?? $this->reportPortalAccess->snapshot($user),
             'permissions' => $snapshot['permissions'] ?? [],
         ], 'Login success');
     }
 
     public function me(Request $request)
     {
-        $user = $request->user()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet']);
+        $user = $request->user()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
         $snapshot = $this->userManagement->currentSessionSnapshot($user);
 
         return ApiResponse::ok([
             'user' => new MeResource($user),
             'abilities' => $snapshot['permissions'] ?? [],
             'permissions' => $snapshot['permissions'] ?? [],
+            'report_access' => $snapshot['report_access'] ?? $this->reportPortalAccess->snapshot($user),
             'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
             'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
             'can_edit_user_management' => (bool) ($snapshot['can_edit_user_management'] ?? false),

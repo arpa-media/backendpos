@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources\Api\V1\Sales;
 
+use App\Support\TransactionDate;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -37,7 +38,9 @@ class SaleListResource extends JsonResource
             'cancel_requests_pending_count' => isset($s->cancel_requests_pending_count) ? (int) $s->cancel_requests_pending_count : 0,
             'has_cancel_request_pending' => ((int) ($s->cancel_requests_pending_count ?? 0)) > 0,
 
-            'created_at' => optional($s->created_at)->format('Y-m-d H:i:s'),
+            'created_at' => TransactionDate::toIso($s->created_at, optional($s->outlet)->timezone),
+            'created_at_text' => TransactionDate::formatLocal($s->created_at, optional($s->outlet)->timezone),
+            'outlet_timezone' => (string) (optional($s->outlet)->timezone ?: config('app.timezone', 'Asia/Jakarta')),
         ];
     }
 }

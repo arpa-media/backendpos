@@ -15,8 +15,9 @@ class LoginRequest extends FormRequest
     public function rules(): array
     {
         return [
-            // NISJ (Nomor Induk Squad Jaya), contoh: 10012501000, 10012501001, ...
-            'nisj' => ['required', 'string', 'max:32', 'regex:/^\d+$/'],
+            'login' => ['nullable', 'string', 'max:100'],
+            'username' => ['nullable', 'string', 'max:100'],
+            'nisj' => ['nullable', 'string', 'max:100'],
             'password' => ['required', 'string', 'min:6', 'max:255'],
             'login_as' => ['nullable', 'string', 'in:BACKOFFICE,POS'],
             // For POS (Capacitor device name). Required when login_as=POS

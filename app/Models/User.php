@@ -20,6 +20,7 @@ class User extends Authenticatable
     protected $fillable = [
         'name',
         'nisj',
+        'username',
         'email',
         'password',
         'outlet_id',
@@ -57,4 +58,10 @@ class User extends Authenticatable
     {
         return $this->hasOne(UserAccessAssignment::class);
     }
+
+    public function reportOutletAssignments()
+    {
+        return $this->hasMany(UserReportOutletAssignment::class);
+    }
 }
+

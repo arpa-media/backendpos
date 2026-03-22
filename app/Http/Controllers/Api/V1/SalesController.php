@@ -31,6 +31,7 @@ class SalesController extends Controller
 
         $q = Sale::query()
             ->when($outletId, fn ($qq) => $qq->where('outlet_id', $outletId))
+            ->with(['outlet:id,timezone'])
             ->withCount('items')
             ->withCount([
                 'cancelRequests as cancel_requests_pending_count' => fn ($cq) => $cq->where('status', \App\Models\SaleCancelRequest::STATUS_PENDING),
@@ -95,7 +96,7 @@ class SalesController extends Controller
         $sale = Sale::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
             ->where('id', $id)
-            ->with(['items.product.category', 'payments', 'customer'])
+            ->with(['items.product.category', 'payments', 'customer', 'outlet'])
             ->first();
 
         if (!$sale) {
@@ -121,7 +122,7 @@ class SalesController extends Controller
         $sale->status = 'CANCELLED';
         $sale->save();
 
-        return ApiResponse::ok(new SaleDetailResource($sale->load(['items.product.category','payments','customer'])), 'Sale cancelled');
+        return ApiResponse::ok(new SaleDetailResource($sale->load(['items.product.category','payments','customer','outlet'])), 'Sale cancelled');
     }
 
     public function destroy(Request $request, string $id)

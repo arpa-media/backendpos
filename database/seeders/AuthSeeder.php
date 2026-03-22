@@ -56,6 +56,18 @@ class AuthSeeder extends Seeder
                 'sale.view',
                 'report.view',
             ],
+            'stakeholder' => [
+                'auth.me',
+                'dashboard.view',
+                'sale.view',
+                'report.view',
+            ],
+            'observer' => [
+                'auth.me',
+                'dashboard.view',
+                'sale.view',
+                'report.view',
+            ],
             'squad' => [
                 'auth.me',
                 'dashboard.view',

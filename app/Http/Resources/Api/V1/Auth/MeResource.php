@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources\Api\V1\Auth;
 
+use App\Services\ReportPortalAccessService;
 use App\Services\UserManagementService;
 use App\Support\Auth\UserAuthContextResolver;
 use Illuminate\Http\Resources\Json\JsonResource;
@@ -21,6 +22,7 @@ class MeResource extends JsonResource
             'id' => (string) $user->id,
             'name' => (string) $user->name,
             'nisj' => $user->nisj ? (string) $user->nisj : null,
+            'username' => $user->username ? (string) $user->username : null,
             'email' => (string) $user->email,
             'is_active' => (bool) ($user->is_active ?? true),
             'outlet_id' => $resolvedOutlet?->id ? (string) $resolvedOutlet->id : null,
@@ -60,6 +62,7 @@ class MeResource extends JsonResource
             'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
             'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
             'can_edit_user_management' => (bool) ($snapshot['can_edit_user_management'] ?? false),
+            'report_access' => $snapshot['report_access'] ?? app(ReportPortalAccessService::class)->snapshot($user),
         ];
     }
 }

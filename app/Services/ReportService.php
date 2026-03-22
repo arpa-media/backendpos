@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Sale;
+use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Query\Builder as QueryBuilder;
@@ -10,6 +11,18 @@ use Illuminate\Support\Facades\DB;
 
 class ReportService
 {
+    private function resolveRangeUtc(?string $dateFrom, ?string $dateTo): array
+    {
+        [$from, $to] = $this->resolveRange($dateFrom, $dateTo);
+
+        return [$from, $to, $from->utc(), $to->utc()];
+    }
+
+    private function formatCreatedAt($value): ?string
+    {
+        return TransactionDate::formatLocal($value);
+    }
+
     private function resolveRange(?string $dateFrom, ?string $dateTo): array
     {
         $today = CarbonImmutable::now()->startOfDay();
@@ -45,7 +58,7 @@ class ReportService
 
     private function buildLedgerReport(array $params, ?string $outletId, bool $markedOnly = false): array
     {
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = (int) ($params['per_page'] ?? 20);
         $page = (int) ($params['page'] ?? 1);
 
@@ -57,7 +70,7 @@ class ReportService
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
-            ->whereBetween('s.created_at', [$from, $to])
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
             ->where('s.status', '=', 'PAID');
 
         if (!empty($outletId)) {
@@ -110,9 +123,7 @@ class ReportService
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
                 'marking' => (int) ($r->marking ?? 1),
-                'created_at' => is_string($r->created_at)
-                    ? str_replace('T', ' ', preg_replace('/\..*$/', '', $r->created_at))
-                    : (optional($r->created_at)->format('Y-m-d H:i:s') ?? null),
+                'created_at' => $this->formatCreatedAt($r->created_at),
             ];
         })->values()->all();
 
@@ -121,7 +132,7 @@ class ReportService
                 $join->on('spm.sale_id', '=', 's.id');
             })
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
-            ->whereBetween('s.created_at', [$from, $to])
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
             ->where('s.status', '=', 'PAID');
 
         if (!empty($outletId)) $sumQ->where('s.outlet_id', '=', $outletId);
@@ -167,14 +178,14 @@ class ReportService
 
     public function recentSales(array $params, ?string $outletId): array
     {
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = (int) ($params['per_page'] ?? 20);
         $page = (int) ($params['page'] ?? 1);
 
         $q = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
-            ->whereBetween('s.created_at', [$from, $to]);
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc]);
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
 
@@ -201,9 +212,7 @@ class ReportService
                 'items_sold' => (int) ($r->items_sold ?? 0),
                 'total' => (int) ($r->total ?? 0),
                 'paid' => (int) ($r->paid ?? 0),
-                'created_at' => is_string($r->created_at)
-                    ? str_replace('T', ' ', preg_replace('/\..*$/', '', $r->created_at))
-                    : (optional($r->created_at)->format('Y-m-d H:i:s') ?? null),
+                'created_at' => $this->formatCreatedAt($r->created_at),
             ];
         })->values()->all();
 
@@ -224,13 +233,13 @@ class ReportService
 
     public function itemSold(array $params, ?string $outletId): array
     {
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = (int) ($params['per_page'] ?? 50);
         $page = (int) ($params['page'] ?? 1);
 
         $q = DB::table('sales as s')
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
-            ->whereBetween('s.created_at', [$from, $to])
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
             ->where('s.status', '=', 'PAID');
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
@@ -264,13 +273,13 @@ class ReportService
 
     public function itemByProduct(array $params, ?string $outletId): array
     {
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = (int) ($params['per_page'] ?? 50);
         $page = (int) ($params['page'] ?? 1);
 
         $q = DB::table('sales as s')
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
-            ->whereBetween('s.created_at', [$from, $to])
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
             ->where('s.status', '=', 'PAID');
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
@@ -309,7 +318,7 @@ class ReportService
 
     public function rounding(array $params, ?string $outletId): array
     {
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = (int) ($params['per_page'] ?? 20);
         $page = (int) ($params['page'] ?? 1);
 
@@ -319,7 +328,7 @@ class ReportService
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
-            ->whereBetween('s.created_at', [$from, $to])
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
             ->where('s.status', '=', 'PAID')
             ->where('s.rounding_total', '!=', 0);
 
@@ -350,9 +359,7 @@ class ReportService
                 'total_before_rounding' => (int) ($r->total_before_rounding ?? 0),
                 'rounding' => (int) ($r->rounding ?? 0),
                 'total' => (int) ($r->total ?? 0),
-                'created_at' => is_string($r->created_at)
-                    ? str_replace('T', ' ', preg_replace('/\..*$/', '', $r->created_at))
-                    : (optional($r->created_at)->format('Y-m-d H:i:s') ?? null),
+                'created_at' => $this->formatCreatedAt($r->created_at),
             ];
         })->values()->all();
 
@@ -360,7 +367,7 @@ class ReportService
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
-            ->whereBetween('s.created_at', [$from, $to])
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
             ->where('s.status', '=', 'PAID')
             ->where('s.rounding_total', '!=', 0);
 
@@ -386,7 +393,7 @@ class ReportService
 
     public function tax(array $params, ?string $outletId): array
     {
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = (int) ($params['per_page'] ?? 20);
         $page = (int) ($params['page'] ?? 1);
 
@@ -396,7 +403,7 @@ class ReportService
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
-            ->whereBetween('s.created_at', [$from, $to])
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
             ->where('s.status', '=', 'PAID');
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
@@ -432,9 +439,7 @@ class ReportService
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
                 'tax' => (int) ($r->tax ?? 0),
-                'created_at' => is_string($r->created_at)
-                    ? str_replace('T', ' ', preg_replace('/\..*$/', '', $r->created_at))
-                    : (optional($r->created_at)->format('Y-m-d H:i:s') ?? null),
+                'created_at' => $this->formatCreatedAt($r->created_at),
             ];
         })->values()->all();
 
@@ -447,7 +452,7 @@ class ReportService
 
     public function discount(array $params, ?string $outletId): array
     {
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = (int) ($params['per_page'] ?? 20);
         $page = (int) ($params['page'] ?? 1);
 
@@ -457,7 +462,7 @@ class ReportService
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
-            ->whereBetween('s.created_at', [$from, $to])
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
             ->where('s.status', '=', 'PAID')
             ->where('s.discount_amount', '>', 0);
 
@@ -494,9 +499,7 @@ class ReportService
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
                 'discount' => (int) ($r->discount ?? 0),
-                'created_at' => is_string($r->created_at)
-                    ? str_replace('T', ' ', preg_replace('/\..*$/', '', $r->created_at))
-                    : (optional($r->created_at)->format('Y-m-d H:i:s') ?? null),
+                'created_at' => $this->formatCreatedAt($r->created_at),
             ];
         })->values()->all();
 
@@ -526,8 +529,8 @@ class ReportService
             'status' => (string) ($sale->status ?? '-'),
             'cashier_id' => $sale->cashier_id ? (string) $sale->cashier_id : null,
             'cashier_name' => (string) ($sale->cashier_name ?? '-'),
-            'paid_at' => optional($sale->created_at)->format('Y-m-d H:i:s'),
-            'created_at' => optional($sale->created_at)->format('Y-m-d H:i:s'),
+            'paid_at' => TransactionDate::formatLocal($sale->created_at),
+            'created_at' => TransactionDate::formatLocal($sale->created_at),
             'subtotal' => (int) ($sale->subtotal ?? 0),
             'discount_total' => (int) ($sale->discount_total ?? 0),
             'tax_total' => (int) ($sale->tax_total ?? 0),
@@ -561,11 +564,11 @@ class ReportService
     public function cashierReport(array $params, ?string $outletId): array
     {
         $params = $this->normalizeCashierReportParams($params);
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $salesQuery = Sale::query()
             ->with(['items', 'payments'])
-            ->whereBetween('created_at', [$from, $to])
+            ->whereBetween('created_at', [$fromUtc, $toUtc])
             ->where('status', '=', 'PAID')
             ->orderBy('created_at')
             ->orderBy('sale_number');
