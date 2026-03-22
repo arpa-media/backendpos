@@ -21,6 +21,8 @@ class TaxController extends Controller
 
     public function index(IndexTaxRequest $request)
     {
+        $this->taxService->ensureFallbackDefault();
+
         $q = Tax::query();
 
         if ($request->filled('q')) {
@@ -62,7 +64,7 @@ class TaxController extends Controller
         $tax->fill($request->validated());
         $tax->save();
 
-        $tax = $this->taxService->enforceDefaultInvariant($tax);
+        $tax = $this->taxService->stabilize($tax);
 
         return ApiResponse::ok(new TaxResource($tax), 'Created', 201);
     }
@@ -92,15 +94,30 @@ class TaxController extends Controller
         $tax->fill($validated);
         $tax->save();
 
-        $tax = $this->taxService->enforceDefaultInvariant($tax);
+        $tax = $this->taxService->stabilize($tax);
 
         return ApiResponse::ok(new TaxResource($tax), 'Updated');
+    }
+
+    public function updateStatus(Request $request, string $id)
+    {
+        $tax = Tax::query()->findOrFail($id);
+
+        $validated = $request->validate([
+            'is_active' => ['required', 'boolean'],
+        ]);
+
+        $tax = $this->taxService->updateActiveStatus($tax, (bool) $validated['is_active']);
+
+        return ApiResponse::ok(new TaxResource($tax), 'Status updated');
     }
 
     public function destroy(string $id)
     {
         $tax = Tax::query()->findOrFail($id);
         $tax->delete();
+        $this->taxService->ensureFallbackDefault();
+
         return ApiResponse::ok(null, 'Deleted');
     }
 

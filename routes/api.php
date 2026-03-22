@@ -114,23 +114,23 @@ Route::prefix('v1')->group(function () {
 
         // Patch-8 (extra): Admin cancel bill and confirm delete
         Route::post('/sales/{id}/cancel', [SalesController::class, 'cancel'])
-            ->middleware('permission:sale.cancel.approve');
+            ->middleware('permission_or_snapshot:sale.cancel.approve');
 
         Route::delete('/sales/{id}', [SalesController::class, 'destroy'])
-            ->middleware('permission:sale.cancel.approve');
+            ->middleware('permission_or_snapshot:sale.cancel.approve');
 
         // Patch-8: Cancel bill request flow
         Route::post('/sales/{id}/cancel-requests', [SaleCancelRequestController::class, 'store'])
-            ->middleware('permission:sale.cancel.request');
+            ->middleware('permission_or_snapshot:sale.cancel.request');
 
         Route::get('/cancel-requests', [SaleCancelRequestController::class, 'index'])
-            ->middleware('permission:sale.cancel.approve');
+            ->middleware('permission_or_snapshot:sale.cancel.approve');
 
         Route::post('/cancel-requests/{id}/decide', [SaleCancelRequestController::class, 'decide'])
-            ->middleware('permission:sale.cancel.approve');
+            ->middleware('permission_or_snapshot:sale.cancel.approve');
 
         Route::post('/cancel-requests/{id}/confirm-delete', [SaleCancelRequestController::class, 'confirmDelete'])
-            ->middleware('permission:sale.cancel.approve');
+            ->middleware('permission_or_snapshot:sale.cancel.approve');
 
         /**
          * REPORTS

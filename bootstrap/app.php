@@ -11,6 +11,7 @@ use App\Http\Middleware\ApiRequestId;
 use App\Http\Middleware\ApiRequestLogging;
 use App\Http\Middleware\ApiSecurityHeaders;
 use App\Http\Middleware\ResolveOutletScope;
+use App\Http\Middleware\PermissionOrSnapshot;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
@@ -28,6 +29,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'role' => RoleMiddleware::class,
             'permission' => PermissionMiddleware::class,
+            'permission_or_snapshot' => PermissionOrSnapshot::class,
             'role_or_permission' => RoleOrPermissionMiddleware::class,
             // Run AFTER auth:sanctum so $request->user() is available.
             'outlet_scope' => ResolveOutletScope::class,

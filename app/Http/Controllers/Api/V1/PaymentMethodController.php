@@ -87,7 +87,11 @@ class PaymentMethodController extends Controller
             return ApiResponse::error('Payment method not found', 'NOT_FOUND', 404);
         }
 
-        return ApiResponse::ok(new PaymentMethodResource($method->load(['outlets'])), 'OK');
+        $this->service->ensureOutletPivotCoverage((string) $outletId, $method);
+
+        return ApiResponse::ok(new PaymentMethodResource($method->load(['outlets' => function ($query) use ($outletId) {
+            $query->where('outlets.id', (string) $outletId);
+        }])), 'OK');
     }
 
     public function update(UpdatePaymentMethodRequest $request, string $id)
@@ -123,7 +127,7 @@ class PaymentMethodController extends Controller
             'is_active' => ['required', 'boolean'],
         ]);
 
-        $method = $this->service->setOutletActive((string) $outletId, $method, (bool) $validated['is_active']);
+        $method = $this->service->setActiveForOutlet((string) $outletId, $method, (bool) $validated['is_active']);
 
         return ApiResponse::ok(new PaymentMethodResource($method), 'Payment method outlet status updated');
     }

@@ -14,6 +14,7 @@ use App\Models\SalePayment;
 use App\Models\Tax;
 use App\Models\User;
 use App\Support\PaymentMethodTypes;
+use App\Support\SaleRounding;
 use App\Support\SalesChannels;
 use App\Support\SaleStatuses;
 use Illuminate\Support\Facades\DB;
@@ -503,7 +504,10 @@ class PosCheckoutService
             $taxTotal = (int) floor(($taxableBase * $taxPercent) / 100);
             $serviceChargeTotal = 0;
 
-            $grandTotal = max(0, $taxableBase + $taxTotal + $serviceChargeTotal);
+            $roundingSnapshot = SaleRounding::apply((int) ($taxableBase + $taxTotal + $serviceChargeTotal));
+            $roundingTotal = (int) ($roundingSnapshot['rounding_total'] ?? 0);
+            $grandTotalBeforeRounding = (int) ($roundingSnapshot['before_rounding'] ?? 0);
+            $grandTotal = (int) ($roundingSnapshot['after_rounding'] ?? 0);
             $marking = app(MarkingService::class)->determineNextMarking($outletId);
 
             // 8) Payment rule
@@ -567,6 +571,7 @@ class PosCheckoutService
                 'tax_total' => $taxTotal,
 
                 'service_charge_total' => $serviceChargeTotal,
+                'rounding_total' => $roundingTotal,
                 'grand_total' => $grandTotal,
                 'paid_total' => $paid,
                 'change_total' => $change,
@@ -594,7 +599,7 @@ class PosCheckoutService
                 'reference' => $payment['reference'] ?? null,
             ]);
 
-            return $sale->load(['items', 'payments', 'customer']);
+            return $sale->load(['items', 'payments', 'customer', 'outlet']);
         });
     }
 

@@ -12,6 +12,9 @@ class PaymentMethodService
 {
     public function paginateForOutlet(string $outletId, array $filters): LengthAwarePaginator
     {
+        $this->assertOutletExists($outletId);
+        $this->ensureOutletPivotCoverage($outletId);
+
         $q = $filters['q'] ?? null;
         $type = $filters['type'] ?? null;
         $isActive = array_key_exists('is_active', $filters) ? (bool) $filters['is_active'] : null;
@@ -107,6 +110,7 @@ class PaymentMethodService
     {
         return DB::transaction(function () use ($outletId, $method, $data) {
             $this->assertOutletExists($outletId);
+            $this->ensureOutletPivotCoverage($outletId, $method);
 
             if (array_key_exists('name', $data)) {
                 $name = trim($data['name']);
@@ -140,6 +144,7 @@ class PaymentMethodService
     public function setActiveForOutlet(string $outletId, PaymentMethod $method, bool $isActive): PaymentMethod
     {
         $this->assertOutletExists($outletId);
+        $this->ensureOutletPivotCoverage($outletId, $method);
 
         DB::table('outlet_payment_method')->updateOrInsert(
             ['payment_method_id' => (string) $method->id, 'outlet_id' => (string) $outletId],
@@ -151,6 +156,48 @@ class PaymentMethodService
         }]);
     }
 
+    public function ensureOutletPivotCoverage(string $outletId, ?PaymentMethod $onlyMethod = null): void
+    {
+        $this->assertOutletExists($outletId);
+
+        $methodIds = $onlyMethod
+            ? [(string) $onlyMethod->id]
+            : PaymentMethod::query()->pluck('id')->map(fn ($id) => (string) $id)->all();
+
+        if (empty($methodIds)) {
+            return;
+        }
+
+        $existing = DB::table('outlet_payment_method')
+            ->where('outlet_id', (string) $outletId)
+            ->whereIn('payment_method_id', $methodIds)
+            ->pluck('payment_method_id')
+            ->map(fn ($id) => (string) $id)
+            ->all();
+
+        $existingMap = array_fill_keys($existing, true);
+        $now = now();
+        $rows = [];
+
+        foreach ($methodIds as $methodId) {
+            if (isset($existingMap[$methodId])) {
+                continue;
+            }
+
+            $rows[] = [
+                'outlet_id' => (string) $outletId,
+                'payment_method_id' => (string) $methodId,
+                'is_active' => false,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+
+        if (!empty($rows)) {
+            DB::table('outlet_payment_method')->insert($rows);
+        }
+    }
+
     private function ensureOutletPivotExists(string $outletId, PaymentMethod $method): void
     {
         $exists = DB::table('outlet_payment_method')
@@ -158,7 +205,7 @@ class PaymentMethodService
             ->where('outlet_id', (string) $outletId)
             ->exists();
 
-        if (!$exists) {
+        if (! $exists) {
             DB::table('outlet_payment_method')->insert([
                 'payment_method_id' => (string) $method->id,
                 'outlet_id' => (string) $outletId,
@@ -187,12 +234,18 @@ class PaymentMethodService
         }
     }
 
-    private function assertOutletExists(string $outletId): void
+    public function ensureOutletExists(string $outletId): void
     {
-        if (!Outlet::query()->whereKey($outletId)->exists()) {
+        if (! Outlet::query()->whereKey($outletId)->exists()) {
             throw ValidationException::withMessages([
                 'outlet_id' => ['Outlet not found.'],
             ]);
         }
     }
+
+    private function assertOutletExists(string $outletId): void
+    {
+        $this->ensureOutletExists($outletId);
+    }
 }
+

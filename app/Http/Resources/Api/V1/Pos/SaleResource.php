@@ -78,6 +78,7 @@ class SaleResource extends JsonResource
             'tax_total' => (int) $s->tax_total,
 
             'service_charge_total' => (int) $s->service_charge_total,
+            'total_before_rounding' => max(0, (int) $s->grand_total - (int) ($s->rounding_total ?? 0)),
             'rounding_total' => (int) ($s->rounding_total ?? 0),
             'grand_total' => (int) $s->grand_total,
             'paid_total' => (int) $s->paid_total,

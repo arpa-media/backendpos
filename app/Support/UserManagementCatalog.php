@@ -52,7 +52,7 @@ final class UserManagementCatalog
             ['portal_code' => 'finance', 'code' => 'finance-dashboard', 'name' => 'Dashboard', 'path' => '/portal/finance/dashboard', 'sort_order' => 10],
             ['portal_code' => 'finance', 'code' => 'sales-list', 'name' => 'Sales', 'path' => '/sales', 'sort_order' => 20, 'permission_view' => 'sale.view'],
             ['portal_code' => 'finance', 'code' => 'sales-report', 'name' => 'Report', 'path' => '/reports', 'sort_order' => 30, 'permission_view' => 'report.view'],
-            ['portal_code' => 'finance', 'code' => 'sales-cancel', 'name' => 'Cancel Bill', 'path' => '/cancel-requests', 'sort_order' => 40, 'permission_view' => 'sale.cancel.approve'],
+            ['portal_code' => 'finance', 'code' => 'sales-cancel', 'name' => 'Cancel Bill', 'path' => '/cancel-requests', 'sort_order' => 40, 'permission_view' => 'sale.cancel.approve', 'permission_create' => 'sale.cancel.request', 'permission_update' => 'sale.cancel.approve', 'permission_delete' => 'sale.cancel.approve'],
             ['portal_code' => 'bank', 'code' => 'bank-dashboard', 'name' => 'Dashboard', 'path' => '/portal/bank/dashboard', 'sort_order' => 10],
             ['portal_code' => 'purchasing', 'code' => 'purchasing-dashboard', 'name' => 'Dashboard', 'path' => '/portal/purchasing/dashboard', 'sort_order' => 10],
         ];

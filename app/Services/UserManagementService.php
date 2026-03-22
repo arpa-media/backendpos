@@ -159,16 +159,12 @@ class UserManagementService
 
         $permissionNames = collect(['auth.me']);
         foreach ($access['menus'] as $menu) {
-            if (!($menu['can_view'] ?? false)) {
-                continue;
-            }
-
             $accessMenu = AccessMenu::query()->find($menu['id']);
             if (!$accessMenu) {
                 continue;
             }
 
-            if ($accessMenu->permission_view) {
+            if (($menu['can_view'] ?? false) && $accessMenu->permission_view) {
                 $permissionNames->push($accessMenu->permission_view);
             }
             if (($menu['can_create'] ?? false) && $accessMenu->permission_create) {

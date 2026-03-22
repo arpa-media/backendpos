@@ -142,7 +142,7 @@ return new class extends Migration {
             ['portal' => 'sales', 'code' => 'sales-dashboard', 'name' => 'Dashboard', 'path' => '/dashboard', 'sort' => 10, 'view' => 'dashboard.view'],
             ['portal' => 'sales', 'code' => 'sales-list', 'name' => 'Sales', 'path' => '/sales', 'sort' => 20, 'view' => 'sale.view'],
             ['portal' => 'sales', 'code' => 'sales-report', 'name' => 'Report', 'path' => '/reports', 'sort' => 30, 'view' => 'report.view'],
-            ['portal' => 'sales', 'code' => 'sales-cancel', 'name' => 'Cancel Bill', 'path' => '/cancel-requests', 'sort' => 40, 'view' => 'sale.cancel.approve'],
+            ['portal' => 'sales', 'code' => 'sales-cancel', 'name' => 'Cancel Bill', 'path' => '/cancel-requests', 'sort' => 40, 'view' => 'sale.cancel.approve', 'create' => 'sale.cancel.request', 'update' => 'sale.cancel.approve', 'delete' => 'sale.cancel.approve'],
             ['portal' => 'sales', 'code' => 'sales-category', 'name' => 'Categories', 'path' => '/categories', 'sort' => 50, 'view' => 'category.view', 'create' => 'category.create', 'update' => 'category.update', 'delete' => 'category.delete'],
             ['portal' => 'sales', 'code' => 'sales-product', 'name' => 'Product', 'path' => '/products', 'sort' => 60, 'view' => 'product.view', 'create' => 'product.create', 'update' => 'product.update', 'delete' => 'product.delete'],
             ['portal' => 'sales', 'code' => 'sales-payment-method', 'name' => 'Payment Method', 'path' => '/payment-methods', 'sort' => 70, 'view' => 'payment_method.view', 'create' => 'payment_method.create', 'update' => 'payment_method.update', 'delete' => 'payment_method.delete'],
