@@ -349,6 +349,15 @@ class UserManagementService
                 'permission_view' => 'outlet.view',
                 'permission_update' => 'outlet.update',
             ],
+            [
+                'portal_code' => 'pos',
+                'code' => 'pos-offline-transactions',
+                'legacy_codes' => ['sales-offline-sync', 'offline-transactions'],
+                'name' => 'Unsync Transactions',
+                'path' => '/c/offline-transactions',
+                'sort_order' => 35,
+                'permission_view' => 'pos.offline_sync.view',
+            ],
         ];
 
         foreach ($menuSeeds as $seed) {

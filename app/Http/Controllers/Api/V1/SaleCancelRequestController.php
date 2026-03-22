@@ -15,6 +15,18 @@ use Illuminate\Validation\Rule;
 
 class SaleCancelRequestController extends Controller
 {
+    private function resolveScopedOutletId(Request $request): ?string
+    {
+        $canAdjustScope = (bool) $request->attributes->get('outlet_scope_can_adjust', false);
+        $requestAllOutlets = $request->boolean('all_outlets');
+
+        if ($canAdjustScope && $requestAllOutlets) {
+            return null;
+        }
+
+        return OutletScope::id($request);
+    }
+
     /**
      * Cashier requests to cancel a bill (sale).
      */
@@ -31,7 +43,7 @@ class SaleCancelRequestController extends Controller
             ->whereKey($saleId)
             ->first();
 
-        if (!$sale) {
+        if (! $sale) {
             return ApiResponse::error('Sale not found', 'NOT_FOUND', 404);
         }
 
@@ -40,12 +52,11 @@ class SaleCancelRequestController extends Controller
         }
 
         $user = $request->user();
-        if (!$user) {
+        if (! $user) {
             return ApiResponse::error('Unauthorized', 'UNAUTHORIZED', 401);
         }
 
         $req = DB::transaction(function () use ($sale, $user, $validated) {
-            // enforce one pending per sale
             $existing = SaleCancelRequest::query()
                 ->where('sale_id', $sale->id)
                 ->where('status', SaleCancelRequest::STATUS_PENDING)
@@ -77,29 +88,34 @@ class SaleCancelRequestController extends Controller
             'q' => ['nullable', 'string', 'max:120'],
             'page' => ['nullable', 'integer', 'min:1'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'all_outlets' => ['nullable', 'boolean'],
         ]);
 
-        $outletId = OutletScope::id($request); // null => ALL
+        $outletId = $this->resolveScopedOutletId($request); // null => ALL
 
         $q = SaleCancelRequest::query()
             ->when($outletId, fn ($qq) => $qq->where('outlet_id', $outletId))
             ->orderByDesc('created_at');
 
-        if (!empty($validated['status'])) {
+        if (! empty($validated['status'])) {
             $q->where('status', $validated['status']);
         }
 
-        if (!empty($validated['q'])) {
+        if (! empty($validated['q'])) {
             $kw = trim((string) $validated['q']);
             $q->where(function ($w) use ($kw) {
                 $w->where('requested_by_name', 'like', "%{$kw}%")
                     ->orWhere('reason', 'like', "%{$kw}%")
-                    ->orWhereHas('sale', fn ($s) => $s->where('sale_number', 'like', "%{$kw}%"));
+                    ->orWhereHas('sale', fn ($s) => $s->where('sale_number', 'like', "%{$kw}%"))
+                    ->orWhereHas('outlet', function ($outletQuery) use ($kw) {
+                        $outletQuery->where('name', 'like', "%{$kw}%")
+                            ->orWhere('code', 'like', "%{$kw}%");
+                    });
             });
         }
 
         $perPage = (int) ($validated['per_page'] ?? 15);
-        $p = $q->with(['sale'])->paginate($perPage)->withQueryString();
+        $p = $q->with(['sale', 'outlet'])->paginate($perPage)->withQueryString();
 
         return ApiResponse::ok([
             'items' => SaleCancelRequestResource::collection($p->items()),
@@ -120,14 +136,15 @@ class SaleCancelRequestController extends Controller
         $validated = $request->validate([
             'decision' => ['required', 'string', Rule::in(['APPROVE', 'REJECT'])],
             'note' => ['nullable', 'string', 'max:500'],
+            'all_outlets' => ['nullable', 'boolean'],
         ]);
 
         $user = $request->user();
-        if (!$user) {
+        if (! $user) {
             return ApiResponse::error('Unauthorized', 'UNAUTHORIZED', 401);
         }
 
-        $outletId = OutletScope::id($request); // null => ALL
+        $outletId = $this->resolveScopedOutletId($request); // null => ALL
 
         $req = SaleCancelRequest::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
@@ -135,7 +152,7 @@ class SaleCancelRequestController extends Controller
             ->whereKey($id)
             ->first();
 
-        if (!$req) {
+        if (! $req) {
             return ApiResponse::error('Request not found', 'NOT_FOUND', 404);
         }
 
@@ -171,20 +188,20 @@ class SaleCancelRequestController extends Controller
 
     /**
      * Admin/manager: confirm cancel request AND delete sale from database.
-     * Phase-1 UX: cashier requests cancel, admin confirms -> sale permanently removed.
      */
     public function confirmDelete(Request $request, string $id)
     {
         $validated = $request->validate([
             'note' => ['nullable', 'string', 'max:500'],
+            'all_outlets' => ['nullable', 'boolean'],
         ]);
 
         $user = $request->user();
-        if (!$user) {
+        if (! $user) {
             return ApiResponse::error('Unauthorized', 'UNAUTHORIZED', 401);
         }
 
-        $outletId = OutletScope::id($request); // null => ALL
+        $outletId = $this->resolveScopedOutletId($request); // null => ALL
 
         $req = SaleCancelRequest::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
@@ -192,7 +209,7 @@ class SaleCancelRequestController extends Controller
             ->whereKey($id)
             ->first();
 
-        if (!$req) {
+        if (! $req) {
             return ApiResponse::error('Request not found', 'NOT_FOUND', 404);
         }
 

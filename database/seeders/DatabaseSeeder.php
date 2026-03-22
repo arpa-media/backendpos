@@ -33,6 +33,8 @@ class DatabaseSeeder extends Seeder
 
         $this->call([
             ManualAssignmentOverrideSeeder::class,
+            KutaCatalogSeeder::class,
+            KutaSquadSeeder::class,
         ]);
     }
 }

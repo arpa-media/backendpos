@@ -33,6 +33,7 @@ class PosCheckoutService
     public function checkout(User $user, string $outletId, array $payload): Sale
     {
         $payloadChannel = $payload['channel'] ?? null;
+        $clientSyncId = isset($payload['client_sync_id']) ? trim((string) $payload['client_sync_id']) : null;
         $billName = isset($payload['bill_name']) ? trim((string) $payload['bill_name']) : null;
         $customerId = $payload['customer_id'] ?? null;
         $tableChamber = strtoupper(trim((string) ($payload['table_chamber'] ?? '')));
@@ -128,6 +129,17 @@ class PosCheckoutService
             // 0) Optional: validate customer globally.
             // Customer master is now treated as cross-outlet for POS selection,
             // while the sale/payment still belongs to the active outlet.
+            if ($clientSyncId !== null && $clientSyncId !== '') {
+                $existingSale = Sale::query()
+                    ->where('client_sync_id', $clientSyncId)
+                    ->where('outlet_id', $outletId)
+                    ->first();
+
+                if ($existingSale) {
+                    return $existingSale->load(['items', 'payments', 'customer', 'outlet']);
+                }
+            }
+
             $customer = null;
             if (!empty($customerId)) {
                 $customer = Customer::query()
@@ -533,6 +545,7 @@ class PosCheckoutService
                 'cashier_id' => (string) $user->id,
                 'cashier_name' => (string) ($user->name ?? ''),
 
+                'client_sync_id' => $clientSyncId ?: null,
                 'sale_number' => $this->generateSaleNumber($outletId),
                 'channel' => (string) $saleChannel,
                 'status' => SaleStatuses::PAID,

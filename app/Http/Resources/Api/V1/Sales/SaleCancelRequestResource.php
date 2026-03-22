@@ -27,10 +27,20 @@ class SaleCancelRequestResource extends JsonResource
             ];
         }
 
+        $outlet = null;
+        if ($r->relationLoaded('outlet') && $r->outlet) {
+            $outlet = [
+                'id' => (string) $r->outlet->id,
+                'code' => (string) ($r->outlet->code ?? ''),
+                'name' => (string) ($r->outlet->name ?? ''),
+            ];
+        }
+
         return [
             'id' => (string) $r->id,
             'sale_id' => (string) $r->sale_id,
             'outlet_id' => (string) $r->outlet_id,
+            'outlet' => $outlet,
 
             'status' => (string) $r->status,
 

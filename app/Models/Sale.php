@@ -17,6 +17,7 @@ class Sale extends Model
         'outlet_id',
         'cashier_id',
         'cashier_name',
+        'client_sync_id',
         'sale_number',
         'channel',
         'status',
