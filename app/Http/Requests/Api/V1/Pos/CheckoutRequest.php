@@ -23,6 +23,7 @@ class CheckoutRequest extends FormRequest
             // Backward compat: if items.*.channel not provided, use this channel.
             // Patch-6: allow mixed transaction (DINE_IN + TAKEAWAY) by sending channel=MIXED and item-level channels.
             'channel' => ['required', 'string', Rule::in(SalesChannels::ALL)],
+            'online_order_source' => ['nullable', 'string', Rule::in(['ONLINE', 'GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'])],
 
             // Bill name/customer (touchscreen POS)
             'bill_name' => ['required', 'string', 'min:1', 'max:120'],
@@ -43,6 +44,7 @@ class CheckoutRequest extends FormRequest
 
             'discounts' => ['nullable', 'array', 'max:10'],
             'discounts.*.discount_id' => ['required_with:discounts', 'string', 'max:50'],
+            'discount_squad_nisj' => ['nullable', 'string', 'max:100'],
 
             // Backward compat (old payload)
             'discount_reason' => ['nullable', 'string', Rule::in(['member', 'promo', 'squad'])],

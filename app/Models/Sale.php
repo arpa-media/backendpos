@@ -20,6 +20,7 @@ class Sale extends Model
         'client_sync_id',
         'sale_number',
         'channel',
+        'online_order_source',
         'status',
 
         'bill_name',
@@ -38,6 +39,10 @@ class Sale extends Model
         'discount_name_snapshot',
         'discount_applies_to_snapshot',
         'discounts_snapshot',
+        'discount_squad_user_id',
+        'discount_squad_nisj',
+        'discount_squad_name',
+        'discount_squad_period_key',
         'tax_id',
         'tax_name_snapshot',
         'tax_percent_snapshot',

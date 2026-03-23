@@ -264,8 +264,22 @@ class ReportService
             'total' => (int) ($r->total ?? 0),
         ])->values()->all();
 
+        $sumQ = DB::table('sales as s')
+            ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
+            ->whereBetween('s.created_at', [$fromUtc, $toUtc])
+            ->where('s.status', '=', 'PAID');
+
+        if (!empty($outletId)) $sumQ->where('s.outlet_id', '=', $outletId);
+
+        $summary = $sumQ->selectRaw('COUNT(DISTINCT CONCAT(COALESCE(si.product_name, ""), "||", COALESCE(si.variant_name, ""))) as item_count, COALESCE(SUM(si.qty),0) as qty_total, COALESCE(SUM(si.line_total),0) as grand_total')->first();
+
         return [
             'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
+            'summary' => [
+                'item_count' => (int) ($summary->item_count ?? 0),
+                'qty_total' => (int) ($summary->qty_total ?? 0),
+                'grand_total' => (int) ($summary->grand_total ?? 0),
+            ],
             'data' => $items,
             'meta' => ['current_page' => $p->currentPage(), 'per_page' => $p->perPage(), 'last_page' => $p->lastPage(), 'total' => $p->total()],
         ];
@@ -510,6 +524,95 @@ class ReportService
         ];
     }
 
+    private function formatLocalTime($value): ?string
+    {
+        return TransactionDate::formatLocal($value, null, 'H:i');
+    }
+
+    private function resolveSalePaymentMethodName(Sale $sale, $payment = null): string
+    {
+        $candidate = null;
+
+        if ($payment) {
+            $candidate = $payment->paymentMethod->name ?? null;
+            if (!$candidate) {
+                $candidate = $payment->payment_method_name ?? null;
+            }
+        }
+
+        if (!$candidate) {
+            $candidate = $sale->payment_method_name ?? null;
+        }
+
+        return (string) ($candidate ?: '-');
+    }
+
+    private function summarizePaymentMethods($sales): array
+    {
+        $totals = [];
+
+        foreach ($sales as $sale) {
+            $payments = $sale->payments ?? collect();
+            if ($payments instanceof \Illuminate\Support\Collection && $payments->isNotEmpty()) {
+                foreach ($payments as $payment) {
+                    $name = $this->resolveSalePaymentMethodName($sale, $payment);
+                    if (!isset($totals[$name])) {
+                        $totals[$name] = [
+                            'name' => $name,
+                            'total' => 0,
+                            'transaction_count' => 0,
+                        ];
+                    }
+                    $totals[$name]['total'] += (int) ($payment->amount ?? 0);
+                    $totals[$name]['transaction_count'] += 1;
+                }
+                continue;
+            }
+
+            $name = $this->resolveSalePaymentMethodName($sale, null);
+            if (!isset($totals[$name])) {
+                $totals[$name] = [
+                    'name' => $name,
+                    'total' => 0,
+                    'transaction_count' => 0,
+                ];
+            }
+            $totals[$name]['total'] += (int) (($sale->paid_total ?? 0) > 0 ? $sale->paid_total : ($sale->grand_total ?? 0));
+            $totals[$name]['transaction_count'] += 1;
+        }
+
+        return collect($totals)
+            ->sortByDesc('total')
+            ->values()
+            ->map(fn ($row) => [
+                'name' => (string) ($row['name'] ?? '-'),
+                'total' => (int) ($row['total'] ?? 0),
+                'transaction_count' => (int) ($row['transaction_count'] ?? 0),
+            ])
+            ->all();
+    }
+
+    private function summarizeCashierGroup($group): array
+    {
+        $sorted = collect($group)->sortBy('created_at')->values();
+        $first = $sorted->first();
+        $last = $sorted->last();
+
+        return [
+            'cashier_id' => $first?->cashier_id ? (string) $first->cashier_id : 'unknown',
+            'cashier_name' => (string) ($first?->cashier_name ?? 'Unknown Cashier'),
+            'transaction_count' => $sorted->count(),
+            'grand_total' => (int) $sorted->sum('grand_total'),
+            'paid_total' => (int) $sorted->sum('paid_total'),
+            'items_sold' => (int) $sorted->sum(fn ($sale) => $sale->items->sum('qty')),
+            'first_transaction_at' => TransactionDate::formatLocal($first?->created_at),
+            'first_transaction_time' => $this->formatLocalTime($first?->created_at),
+            'last_transaction_at' => TransactionDate::formatLocal($last?->created_at),
+            'last_transaction_time' => $this->formatLocalTime($last?->created_at),
+            'payment_methods' => $this->summarizePaymentMethods($sorted),
+        ];
+    }
+
     private function normalizeCashierReportParams(array $params): array
     {
         if (!empty($params['date']) && empty($params['date_from']) && empty($params['date_to'])) {
@@ -526,23 +629,26 @@ class ReportService
             'id' => (string) $sale->id,
             'sale_number' => (string) $sale->sale_number,
             'channel' => (string) ($sale->channel ?? '-'),
+            'online_order_source' => (string) ($sale->online_order_source ?? ''),
             'status' => (string) ($sale->status ?? '-'),
             'cashier_id' => $sale->cashier_id ? (string) $sale->cashier_id : null,
             'cashier_name' => (string) ($sale->cashier_name ?? '-'),
             'paid_at' => TransactionDate::formatLocal($sale->created_at),
+            'time_only' => $this->formatLocalTime($sale->created_at),
             'created_at' => TransactionDate::formatLocal($sale->created_at),
             'subtotal' => (int) ($sale->subtotal ?? 0),
             'discount_total' => (int) ($sale->discount_total ?? 0),
             'tax_total' => (int) ($sale->tax_total ?? 0),
             'service_charge_total' => (int) ($sale->service_charge_total ?? 0),
+            'rounding_total' => (int) ($sale->rounding_total ?? 0),
             'grand_total' => (int) ($sale->grand_total ?? 0),
             'paid_total' => (int) ($sale->paid_total ?? 0),
             'change_total' => (int) ($sale->change_total ?? 0),
-            'payment_method_name' => (string) ($sale->payment_method_name ?? '-'),
+            'payment_method_name' => $this->resolveSalePaymentMethodName($sale),
             'payments' => $sale->payments->map(fn ($payment) => [
                 'id' => (string) $payment->id,
                 'payment_method_id' => $payment->payment_method_id ? (string) $payment->payment_method_id : null,
-                'payment_method_name' => (string) ($sale->payment_method_name ?? '-'),
+                'payment_method_name' => $this->resolveSalePaymentMethodName($sale, $payment),
                 'amount' => (int) ($payment->amount ?? 0),
                 'reference' => $payment->reference,
             ])->values()->all(),
@@ -567,7 +673,7 @@ class ReportService
         [$from, $to, $fromUtc, $toUtc] = $this->resolveRangeUtc($params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $salesQuery = Sale::query()
-            ->with(['items', 'payments'])
+            ->with(['items', 'payments.paymentMethod'])
             ->whereBetween('created_at', [$fromUtc, $toUtc])
             ->where('status', '=', 'PAID')
             ->orderBy('created_at')
@@ -578,7 +684,11 @@ class ReportService
         }
 
         if (!empty($params['cashier_id'])) {
-            $salesQuery->where('cashier_id', '=', $params['cashier_id']);
+            if ((string) $params['cashier_id'] === 'unknown') {
+                $salesQuery->whereNull('cashier_id');
+            } else {
+                $salesQuery->where('cashier_id', '=', $params['cashier_id']);
+            }
         }
 
         $sales = $salesQuery->get();
@@ -593,15 +703,7 @@ class ReportService
 
         $cashiers = $sales
             ->groupBy(fn ($sale) => $sale->cashier_id ?: 'unknown')
-            ->map(function ($group) {
-                $first = $group->first();
-                return [
-                    'cashier_id' => $first?->cashier_id ? (string) $first->cashier_id : 'unknown',
-                    'cashier_name' => (string) ($first?->cashier_name ?? 'Unknown Cashier'),
-                    'transaction_count' => $group->count(),
-                    'grand_total' => (int) $group->sum('grand_total'),
-                ];
-            })
+            ->map(fn ($group) => $this->summarizeCashierGroup($group))
             ->values()
             ->sortBy('cashier_name', SORT_NATURAL | SORT_FLAG_CASE)
             ->values()
@@ -609,10 +711,19 @@ class ReportService
 
         $cashier = null;
         if (!empty($params['cashier_id'])) {
-            $first = $sales->first();
-            $cashier = [
-                'id' => !empty($params['cashier_id']) ? (string) $params['cashier_id'] : null,
-                'name' => (string) ($first?->cashier_name ?? 'Unknown Cashier'),
+            $selected = $sales->groupBy(fn ($sale) => $sale->cashier_id ?: 'unknown')->first();
+            $cashier = $selected ? $this->summarizeCashierGroup($selected) : [
+                'cashier_id' => (string) $params['cashier_id'],
+                'cashier_name' => 'Unknown Cashier',
+                'transaction_count' => 0,
+                'grand_total' => 0,
+                'paid_total' => 0,
+                'items_sold' => 0,
+                'first_transaction_at' => null,
+                'first_transaction_time' => null,
+                'last_transaction_at' => null,
+                'last_transaction_time' => null,
+                'payment_methods' => [],
             ];
         }
 

@@ -236,6 +236,8 @@ class PosAuthContextSnapshotBuilder
                 'timezone' => $outlet->timezone,
                 'address' => $outlet->address,
                 'phone' => $outlet->phone ?? null,
+                'ig_1' => $outlet->ig_1 ?? null,
+                'ig_2' => $outlet->ig_2 ?? null,
                 'latitude' => $outlet->latitude,
                 'longitude' => $outlet->longitude,
                 'radius_m' => $outlet->radius_m,

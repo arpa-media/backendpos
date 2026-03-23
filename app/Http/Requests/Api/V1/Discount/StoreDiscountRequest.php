@@ -17,7 +17,7 @@ class StoreDiscountRequest extends FormRequest
         return [
             'code' => ['required', 'string', 'max:40'],
             'name' => ['required', 'string', 'max:120'],
-            'applies_to' => ['required', 'in:GLOBAL,PRODUCT,CUSTOMER'],
+            'applies_to' => ['required', 'in:GLOBAL,PRODUCT,CUSTOMER,SQUAD'],
             'discount_type' => ['required', 'in:PERCENT,FIXED'],
             'discount_value' => ['required', 'integer', 'min:0'],
             'is_active' => ['sometimes', 'boolean'],
@@ -41,6 +41,14 @@ class StoreDiscountRequest extends FormRequest
             }
             if ($applies === 'CUSTOMER' && empty($this->input('customer_ids'))) {
                 $v->errors()->add('customer_ids', 'customer_ids is required when applies_to=CUSTOMER.');
+            }
+            if ($applies === 'SQUAD') {
+                if (!empty($this->input('product_ids'))) {
+                    $v->errors()->add('product_ids', 'product_ids must be empty when applies_to=SQUAD.');
+                }
+                if (!empty($this->input('customer_ids'))) {
+                    $v->errors()->add('customer_ids', 'customer_ids must be empty when applies_to=SQUAD.');
+                }
             }
 
             $type = strtoupper((string) $this->input('discount_type'));

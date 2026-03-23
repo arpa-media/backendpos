@@ -48,4 +48,9 @@ class Discount extends Model
         return $this->belongsToMany(Customer::class, 'customer_discount')
             ->withTimestamps();
     }
+
+    public function squadUsages()
+    {
+        return $this->hasMany(DiscountSquadUsage::class);
+    }
 }

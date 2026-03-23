@@ -18,6 +18,8 @@ class Outlet extends Model
         'type',
         'address',
         'phone',
+        'ig_1',
+        'ig_2',
         'timezone',
         'latitude',
         'longitude',

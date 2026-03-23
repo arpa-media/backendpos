@@ -53,8 +53,8 @@ class DiscountService
                 'code' => strtoupper(trim((string) $data['code'])),
                 'name' => trim((string) $data['name']),
                 'applies_to' => strtoupper((string) $data['applies_to']),
-                'discount_type' => strtoupper((string) $data['discount_type']),
-                'discount_value' => (int) $data['discount_value'],
+                'discount_type' => strtoupper((string) (($data['applies_to'] ?? 'GLOBAL') === 'SQUAD' ? 'PERCENT' : $data['discount_type'])),
+                'discount_value' => (int) (strtoupper((string) ($data['applies_to'] ?? 'GLOBAL')) === 'SQUAD' ? 20 : $data['discount_value']),
                 'is_active' => (bool) ($data['is_active'] ?? true),
                 'starts_at' => $data['starts_at'] ?? null,
                 'ends_at' => $data['ends_at'] ?? null,
@@ -89,6 +89,11 @@ class DiscountService
             }
             if (array_key_exists('discount_value', $payload)) {
                 $payload['discount_value'] = (int) $payload['discount_value'];
+            }
+            $nextAppliesTo = strtoupper((string) ($payload['applies_to'] ?? $discount->applies_to));
+            if ($nextAppliesTo === 'SQUAD') {
+                $payload['discount_type'] = 'PERCENT';
+                $payload['discount_value'] = 20;
             }
 
             $discount->fill($payload)->save();
@@ -147,7 +152,7 @@ class DiscountService
             return;
         }
 
-        // GLOBAL: clear all pivots
+        // GLOBAL / SQUAD: clear all pivots
         $discount->products()->sync([]);
         $discount->customers()->sync([]);
     }

@@ -24,15 +24,24 @@ class SaleItem extends Model
         'qty',
         'unit_price',
         'line_total',
+        'original_unit_price_before_void',
+        'original_line_total_before_void',
+        'voided_at',
+        'voided_by_user_id',
+        'voided_by_name',
+        'void_reason',
     ];
 
     protected $casts = [
         'qty' => 'integer',
         'unit_price' => 'integer',
         'line_total' => 'integer',
+        'original_unit_price_before_void' => 'integer',
+        'original_line_total_before_void' => 'integer',
+        'voided_at' => 'datetime',
     ];
 
-        public function addons()
+    public function addons()
     {
         return $this->hasMany(SaleItemAddon::class, 'sale_item_id');
     }
@@ -45,5 +54,10 @@ class SaleItem extends Model
     public function sale()
     {
         return $this->belongsTo(Sale::class);
+    }
+
+    public function isVoided(): bool
+    {
+        return ! is_null($this->voided_at);
     }
 }

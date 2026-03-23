@@ -68,8 +68,7 @@ class ReportController extends Controller
     {
         $payload = $service->applyMode(
             (string) OutletScope::id($request),
-            (string) $request->input('status'),
-            $request->filled('interval') ? (int) $request->input('interval') : null,
+            $request->validated(),
         );
 
         return response()->json(['data' => $payload]);
@@ -79,8 +78,7 @@ class ReportController extends Controller
     {
         $payload = $service->applyMode(
             $outletId,
-            (string) $request->input('status'),
-            $request->filled('interval') ? (int) $request->input('interval') : null,
+            $request->validated(),
         );
 
         return response()->json(['data' => [

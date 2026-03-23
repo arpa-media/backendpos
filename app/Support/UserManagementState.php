@@ -70,6 +70,8 @@ class UserManagementState
                 'abilities' => ['view' => ['sale.view']]],
             ['id' => 'menu-report', 'portal_id' => 'portal-finance', 'code' => 'report', 'name' => 'Report', 'path' => '/reports', 'sort_order' => 20, 'is_active' => true,
                 'abilities' => ['view' => ['report.view']]],
+            ['id' => 'menu-finance-cashier-report', 'portal_id' => 'portal-finance', 'code' => 'finance-cashier-report', 'name' => 'Cashier Report', 'path' => '/finance/cashier-report', 'sort_order' => 25, 'is_active' => true,
+                'abilities' => ['view' => ['report.view']]],
             ['id' => 'menu-cancel-bill', 'portal_id' => 'portal-finance', 'code' => 'cancel-bill', 'name' => 'Cancel Bill', 'path' => '/cancel-requests', 'sort_order' => 30, 'is_active' => true,
                 'abilities' => ['view' => ['sale.cancel.approve', 'sale.cancel.view'], 'create' => ['sale.cancel.request'], 'edit' => ['sale.cancel.approve'], 'delete' => ['sale.cancel.approve']]],
             ['id' => 'menu-product', 'portal_id' => 'portal-pos-outlet', 'code' => 'product', 'name' => 'Product', 'path' => '/products', 'sort_order' => 10, 'is_active' => true,

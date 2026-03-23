@@ -13,11 +13,15 @@ class OutletMarkingSetting extends Model
         'outlet_id',
         'status',
         'interval_value',
+        'show_count',
+        'hide_count',
         'sequence_counter',
     ];
 
     protected $casts = [
         'interval_value' => 'integer',
+        'show_count' => 'integer',
+        'hide_count' => 'integer',
         'sequence_counter' => 'integer',
     ];
 

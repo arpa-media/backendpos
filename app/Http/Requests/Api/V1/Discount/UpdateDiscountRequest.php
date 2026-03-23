@@ -17,7 +17,7 @@ class UpdateDiscountRequest extends FormRequest
         return [
             'code' => ['sometimes', 'string', 'max:40'],
             'name' => ['sometimes', 'string', 'max:120'],
-            'applies_to' => ['sometimes', 'in:GLOBAL,PRODUCT,CUSTOMER'],
+            'applies_to' => ['sometimes', 'in:GLOBAL,PRODUCT,CUSTOMER,SQUAD'],
             'discount_type' => ['sometimes', 'in:PERCENT,FIXED'],
             'discount_value' => ['sometimes', 'integer', 'min:0'],
             'is_active' => ['sometimes', 'boolean'],
@@ -41,6 +41,14 @@ class UpdateDiscountRequest extends FormRequest
             }
             if ($applies === 'CUSTOMER' && $this->has('customer_ids') && empty($this->input('customer_ids'))) {
                 $v->errors()->add('customer_ids', 'customer_ids cannot be empty when applies_to=CUSTOMER.');
+            }
+            if ($applies === 'SQUAD') {
+                if ($this->has('product_ids') && !empty($this->input('product_ids'))) {
+                    $v->errors()->add('product_ids', 'product_ids must be empty when applies_to=SQUAD.');
+                }
+                if ($this->has('customer_ids') && !empty($this->input('customer_ids'))) {
+                    $v->errors()->add('customer_ids', 'customer_ids must be empty when applies_to=SQUAD.');
+                }
             }
 
             $type = strtoupper((string) ($this->input('discount_type') ?? ''));

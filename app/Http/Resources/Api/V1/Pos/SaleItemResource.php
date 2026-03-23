@@ -24,6 +24,13 @@ class SaleItemResource extends JsonResource
             'qty' => (int) $i->qty,
             'unit_price' => (int) $i->unit_price,
             'line_total' => (int) $i->line_total,
+            'is_voided' => ! is_null($i->voided_at),
+            'voided_at' => optional($i->voided_at)->toISOString(),
+            'voided_by_user_id' => $i->voided_by_user_id ? (string) $i->voided_by_user_id : null,
+            'voided_by_name' => $i->voided_by_name ?: null,
+            'void_reason' => $i->void_reason ?: null,
+            'original_unit_price_before_void' => (int) ($i->original_unit_price_before_void ?? 0),
+            'original_line_total_before_void' => (int) ($i->original_line_total_before_void ?? 0),
 
             'note' => $i->note ?? null,
             'addons' => SaleItemAddonResource::collection($this->whenLoaded('addons')),

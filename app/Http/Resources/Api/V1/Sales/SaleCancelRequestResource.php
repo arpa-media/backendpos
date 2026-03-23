@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources\Api\V1\Sales;
 
+use App\Models\SaleCancelRequest;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -36,20 +37,27 @@ class SaleCancelRequestResource extends JsonResource
             ];
         }
 
+        $requestType = strtoupper((string) ($r->request_type ?: SaleCancelRequest::REQUEST_TYPE_CANCEL_BILL));
+        $voidItemsSnapshot = is_array($r->void_items_snapshot) ? array_values($r->void_items_snapshot) : [];
+
         return [
             'id' => (string) $r->id,
             'sale_id' => (string) $r->sale_id,
             'outlet_id' => (string) $r->outlet_id,
             'outlet' => $outlet,
 
+            'request_type' => $requestType,
+            'request_type_label' => $requestType === SaleCancelRequest::REQUEST_TYPE_VOID_ITEMS ? 'Void' : 'Cancel Bill',
             'status' => (string) $r->status,
 
-            // PATCH-9: include sale snapshot for admin confirm modal
             'sale' => $sale,
 
             'requested_by_user_id' => (string) $r->requested_by_user_id,
             'requested_by_name' => $r->requested_by_name,
             'reason' => $r->reason,
+            'void_item_ids' => is_array($r->void_item_ids) ? array_values($r->void_item_ids) : [],
+            'void_items_count' => count($voidItemsSnapshot),
+            'void_items_snapshot' => $voidItemsSnapshot,
 
             'decided_by_user_id' => $r->decided_by_user_id ? (string) $r->decided_by_user_id : null,
             'decided_by_name' => $r->decided_by_name,

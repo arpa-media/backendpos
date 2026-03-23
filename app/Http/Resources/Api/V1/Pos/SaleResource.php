@@ -37,6 +37,7 @@ class SaleResource extends JsonResource
             'cashier_id' => (string) $s->cashier_id,
             'sale_number' => (string) $s->sale_number,
             'channel' => (string) $s->channel,
+            'online_order_source' => $s->online_order_source ? (string) $s->online_order_source : null,
             'channels' => $channelsInSale,
             'status' => (string) $s->status,
 
@@ -56,6 +57,9 @@ class SaleResource extends JsonResource
                     'id' => (string) $s->outlet->id,
                     'name' => (string) $s->outlet->name,
                     'address' => (string) ($s->outlet->address ?? ''),
+                    'phone' => (string) ($s->outlet->phone ?? ''),
+                    'ig_1' => $s->outlet->ig_1 ?? null,
+                    'ig_2' => $s->outlet->ig_2 ?? null,
                     'timezone' => (string) ($s->outlet->timezone ?? config('app.timezone', 'Asia/Jakarta')),
                 ]
                 : null,
@@ -67,6 +71,10 @@ class SaleResource extends JsonResource
             'discount_value' => (int) ($s->discount_value ?? 0),
             'discount_amount' => (int) ($s->discount_amount ?? 0),
             'discount_reason' => $s->discount_reason,
+            'discount_squad_user_id' => $s->discount_squad_user_id ? (string) $s->discount_squad_user_id : null,
+            'discount_squad_nisj' => $s->discount_squad_nisj ? (string) $s->discount_squad_nisj : null,
+            'discount_squad_name' => $s->discount_squad_name ? (string) $s->discount_squad_name : null,
+            'discount_squad_period_key' => $s->discount_squad_period_key ? (string) $s->discount_squad_period_key : null,
 
             // Backward compat
             'discount_total' => (int) $s->discount_total,

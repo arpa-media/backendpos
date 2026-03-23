@@ -21,6 +21,8 @@ class DiscountResource extends JsonResource
             'applies_to' => (string) $this->applies_to, // GLOBAL|PRODUCT|CUSTOMER
             'discount_type' => (string) $this->discount_type, // PERCENT|FIXED
             'discount_value' => (int) $this->discount_value,
+            'requires_squad_nisj' => strtoupper((string) $this->applies_to) === 'SQUAD',
+            'squad_monthly_quota' => strtoupper((string) $this->applies_to) === 'SQUAD' ? 1 : null,
 
             'is_active' => (bool) $this->is_active,
             'starts_at' => $this->starts_at?->toISOString(),

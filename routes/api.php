@@ -90,6 +90,9 @@ Route::prefix('v1')->group(function () {
             Route::get('/discounts', [PosController::class, 'discounts'])
                 ->middleware('permission:discount.view');
 
+            Route::get('/squad-users', [PosController::class, 'squadUsers'])
+                ->middleware('permission:discount.view');
+
             Route::post('/checkout', [PosController::class, 'checkout'])
                 ->middleware('permission:pos.checkout');
         });
@@ -170,7 +173,10 @@ Route::prefix('v1')->group(function () {
             Route::get('/ledger', [ReportController::class, 'ledger']);
             Route::get('/marking', [ReportController::class, 'marking']);
             Route::get('/marking/config', [ReportController::class, 'markingConfig']);
+            Route::get('/marking/configs', [ReportController::class, 'markingConfigs']);
+            Route::get('/marking/config/{outletId}', [ReportController::class, 'markingConfigByOutlet']);
             Route::post('/marking/config', [ReportController::class, 'updateMarkingConfig']);
+            Route::post('/marking/config/{outletId}', [ReportController::class, 'updateMarkingConfigByOutlet']);
             Route::post('/marking/{saleId}/toggle', [ReportController::class, 'toggleMarking']);
             Route::get('/item-sold', [ReportController::class, 'itemSold']);
             Route::get('/recent-sales', [ReportController::class, 'recentSales']);

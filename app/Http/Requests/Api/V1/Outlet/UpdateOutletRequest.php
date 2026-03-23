@@ -18,6 +18,8 @@ class UpdateOutletRequest extends FormRequest
             'name' => ['required', 'string', 'max:150'],
             'address' => ['nullable', 'string', 'max:5000'],
             'phone' => ['nullable', 'string', 'max:50'],
+            'ig_1' => ['nullable', 'string', 'max:150'],
+            'ig_2' => ['nullable', 'string', 'max:150'],
             'timezone' => ['nullable', 'string', 'max:64'],
         ];
     }

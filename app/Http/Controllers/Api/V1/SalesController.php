@@ -96,7 +96,7 @@ class SalesController extends Controller
         $sale = Sale::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
             ->where('id', $id)
-            ->with(['items.product.category', 'payments', 'customer', 'outlet'])
+            ->with(['items.product.category', 'payments', 'customer', 'outlet', 'cancelRequests' => fn ($q) => $q->with(['outlet', 'sale'])->orderByDesc('created_at')])
             ->first();
 
         if (!$sale) {

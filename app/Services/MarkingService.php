@@ -31,11 +31,12 @@ class MarkingService
             [
                 'status' => self::STATUS_NORMAL,
                 'interval_value' => null,
+                'show_count' => 3,
+                'hide_count' => 1,
                 'sequence_counter' => 0,
             ]
         );
     }
-
 
     public function getConfigPayloadForOutlet(string $outletId): array
     {
@@ -87,11 +88,7 @@ class MarkingService
                     'type' => (string) ($outlet->type ?? 'outlet'),
                     'is_active' => (bool) ($outlet->is_active ?? true),
                 ],
-                'config' => [
-                    'status' => (string) ($setting?->status ?? self::STATUS_NORMAL),
-                    'interval' => $setting?->interval_value ? (int) $setting->interval_value : null,
-                    'sequence_counter' => (int) ($setting?->sequence_counter ?? 0),
-                ],
+                'config' => $this->buildConfigPayload($setting),
             ];
         })->values()->all();
     }
@@ -100,11 +97,7 @@ class MarkingService
     {
         $setting = $this->getSetting($outletId);
 
-        return [
-            'status' => (string) $setting->status,
-            'interval' => $setting->interval_value ? (int) $setting->interval_value : null,
-            'sequence_counter' => (int) ($setting->sequence_counter ?? 0),
-        ];
+        return $this->buildConfigPayload($setting);
     }
 
     public function determineNextMarking(string $outletId): int
@@ -115,6 +108,8 @@ class MarkingService
                 'outlet_id' => $outletId,
                 'status' => self::STATUS_NORMAL,
                 'interval_value' => null,
+                'show_count' => 3,
+                'hide_count' => 1,
                 'sequence_counter' => 0,
             ]);
         }
@@ -125,14 +120,14 @@ class MarkingService
             return 0;
         }
 
-        if ($status === self::STATUS_NORMAL) {
+        if ($status !== self::STATUS_ACTIVE) {
             return 1;
         }
 
-        $interval = max(1, (int) ($setting->interval_value ?? 1));
+        $show = $this->resolveShowCount($setting);
+        $hide = $this->resolveHideCount($setting);
         $sequence = (int) ($setting->sequence_counter ?? 0);
-        $blockIndex = intdiv($sequence, $interval);
-        $marking = ($blockIndex % 2 === 0) ? 1 : 0;
+        $marking = $this->resolveMarkingByPattern($show, $hide, $sequence);
 
         $setting->sequence_counter = $sequence + 1;
         $setting->save();
@@ -140,34 +135,31 @@ class MarkingService
         return $marking;
     }
 
-    public function applyMode(string $outletId, string $status, ?int $interval = null): array
+    public function applyMode(string $outletId, array $payload): array
     {
-        $normalized = $this->normalizeStatus($status);
-        $interval = $normalized === self::STATUS_ACTIVE ? max(1, (int) ($interval ?? 1)) : null;
+        $requested = $this->normalizeIncomingPayload($payload);
 
-        if ($normalized === self::STATUS_ACTIVE && (int) $interval <= 0) {
-            throw ValidationException::withMessages([
-                'interval' => ['Interval must be greater than 0.'],
-            ]);
-        }
-
-        return DB::transaction(function () use ($outletId, $normalized, $interval) {
+        return DB::transaction(function () use ($outletId, $requested) {
             $setting = OutletMarkingSetting::query()->lockForUpdate()->firstOrCreate(
                 ['outlet_id' => $outletId],
-                ['status' => self::STATUS_NORMAL, 'interval_value' => null, 'sequence_counter' => 0]
+                [
+                    'status' => self::STATUS_NORMAL,
+                    'interval_value' => null,
+                    'show_count' => 3,
+                    'hide_count' => 1,
+                    'sequence_counter' => 0,
+                ]
             );
 
-            $setting->status = $normalized;
-            $setting->interval_value = $interval;
-            if ($normalized !== self::STATUS_ACTIVE) {
-                $setting->sequence_counter = 0;
-            }
+            $setting->status = $requested['status'];
+            $setting->interval_value = $requested['status'] === self::STATUS_ACTIVE ? $requested['show'] : null;
+            $setting->show_count = $requested['show'];
+            $setting->hide_count = $requested['hide'];
+            $setting->sequence_counter = 0;
             $setting->save();
 
             return [
-                'status' => $normalized,
-                'interval' => $interval,
-                'sequence_counter' => (int) ($setting->sequence_counter ?? 0),
+                ...$this->buildConfigPayload($setting),
                 'affected_transactions' => 0,
                 'marked_transactions' => 0,
                 'applies_to' => 'NEXT_TRANSACTIONS',
@@ -202,19 +194,84 @@ class MarkingService
         ];
     }
 
-    private function resolveMarkingByMode(string $status, ?int $interval, int $sequence): int
+    private function buildConfigPayload(?OutletMarkingSetting $setting): array
     {
-        if ($status === self::STATUS_NON_ACTIVE) {
-            return 0;
+        $status = $this->normalizeStatus($setting?->status);
+        $active = $status === self::STATUS_ACTIVE;
+        $show = $this->resolveShowCount($setting);
+        $hide = $this->resolveHideCount($setting);
+        $sequence = (int) ($setting?->sequence_counter ?? 0);
+
+        return [
+            'status' => $status,
+            'active' => $active,
+            'show' => $show,
+            'hide' => $hide,
+            'interval' => $show,
+            'sequence_counter' => $sequence,
+            'preview' => $active
+                ? sprintf('%d transaksi marking 1, lalu %d transaksi marking 0, berulang.', $show, $hide)
+                : 'Aktif mati. Semua transaksi baru marking 1.',
+        ];
+    }
+
+    private function normalizeIncomingPayload(array $payload): array
+    {
+        $status = array_key_exists('status', $payload)
+            ? $this->normalizeStatus((string) ($payload['status'] ?? ''))
+            : null;
+
+        $active = array_key_exists('active', $payload)
+            ? filter_var($payload['active'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE)
+            : null;
+
+        if ($active === true) {
+            $status = self::STATUS_ACTIVE;
+        } elseif ($active === false && $status !== self::STATUS_NON_ACTIVE) {
+            $status = self::STATUS_NORMAL;
         }
 
-        if ($status === self::STATUS_NORMAL) {
-            return 1;
+        $status = $status ?: self::STATUS_NORMAL;
+        $legacyInterval = isset($payload['interval']) ? max(1, (int) $payload['interval']) : null;
+        $show = isset($payload['show']) ? max(1, (int) $payload['show']) : $legacyInterval;
+        $hide = isset($payload['hide']) ? max(1, (int) $payload['hide']) : $legacyInterval;
+
+        if ($status === self::STATUS_ACTIVE) {
+            if (!$show || !$hide) {
+                throw ValidationException::withMessages([
+                    'show' => ['Show and hide are required when marking active.'],
+                    'hide' => ['Show and hide are required when marking active.'],
+                ]);
+            }
         }
 
-        $size = max(1, (int) ($interval ?? 1));
-        $blockIndex = intdiv($sequence, $size);
+        if ($status !== self::STATUS_ACTIVE) {
+            $show = $show ?: 3;
+            $hide = $hide ?: 1;
+        }
 
-        return ($blockIndex % 2 === 0) ? 1 : 0;
+        return [
+            'status' => $status,
+            'show' => max(1, (int) ($show ?: 3)),
+            'hide' => max(1, (int) ($hide ?: 1)),
+        ];
+    }
+
+    private function resolveShowCount(?OutletMarkingSetting $setting): int
+    {
+        return max(1, (int) ($setting?->show_count ?? $setting?->interval_value ?? 3));
+    }
+
+    private function resolveHideCount(?OutletMarkingSetting $setting): int
+    {
+        return max(1, (int) ($setting?->hide_count ?? $setting?->interval_value ?? 1));
+    }
+
+    private function resolveMarkingByPattern(int $show, int $hide, int $sequence): int
+    {
+        $cycle = max(1, $show + $hide);
+        $position = $sequence % $cycle;
+
+        return $position < $show ? 1 : 0;
     }
 }

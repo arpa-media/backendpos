@@ -8,14 +8,17 @@ use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Pos\SaleResource;
 use App\Models\Discount;
 use App\Models\Outlet;
+use App\Services\DiscountSquadService;
 use App\Services\PosCheckoutService;
 use App\Support\OutletScope;
 use Illuminate\Http\Request;
 
 class PosController extends Controller
 {
-    public function __construct(private readonly PosCheckoutService $service)
-    {
+    public function __construct(
+        private readonly PosCheckoutService $service,
+        private readonly DiscountSquadService $discountSquadService,
+    ) {
     }
 
     private function resolveOutletId(Request $request): ?string
@@ -73,12 +76,34 @@ class PosController extends Controller
                 'applies_to' => (string) $d->applies_to,
                 'discount_type' => (string) $d->discount_type,
                 'discount_value' => (int) $d->discount_value,
+                'requires_squad_nisj' => strtoupper((string) $d->applies_to) === 'SQUAD',
+                'squad_monthly_quota' => strtoupper((string) $d->applies_to) === 'SQUAD' ? 1 : null,
                 'product_ids' => $d->products->pluck('id')->map(fn ($x) => (string) $x)->values()->all(),
                 'customer_ids' => $d->customers->pluck('id')->map(fn ($x) => (string) $x)->values()->all(),
             ];
         })->values();
 
         return ApiResponse::ok(['items' => $items], 'OK');
+    }
+
+    public function squadUsers(Request $request)
+    {
+        $q = trim((string) (
+            $request->input('q')
+            ?? $request->input('query')
+            ?? $request->input('search')
+            ?? $request->input('nisj')
+            ?? ''
+        ));
+        $limit = max(1, min(10, (int) $request->integer('limit', 10)));
+
+        if ($q === '') {
+            return ApiResponse::ok(['items' => []], 'OK');
+        }
+
+        return ApiResponse::ok([
+            'items' => $this->discountSquadService->searchUsers($q, $limit)->all(),
+        ], 'OK');
     }
 
     public function checkout(CheckoutRequest $request)

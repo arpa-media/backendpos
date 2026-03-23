@@ -6,6 +6,14 @@ class SaleRounding
 {
     public const BASE = 1000;
 
+    public static function shouldApplyForChannel(?string $channel): bool
+    {
+        $normalized = strtoupper(trim((string) $channel));
+
+        return $normalized !== 'DELIVERY' && $normalized !== 'ONLINE';
+    }
+
+
     public static function calculateDelta(int $amount, int $base = self::BASE): int
     {
         $amount = max(0, (int) $amount);
