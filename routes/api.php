@@ -334,6 +334,9 @@ Route::put('/outlet', [OutletController::class, 'update'])
             Route::put('/{id}', [TaxController::class, 'update'])
                 ->middleware('permission:taxes.update');
 
+            Route::put('/{id}/status', [TaxController::class, 'updateStatus'])
+                ->middleware('permission:taxes.update');
+
             Route::delete('/{id}', [TaxController::class, 'destroy'])
                 ->middleware('permission:taxes.delete');
 

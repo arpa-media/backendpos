@@ -20,6 +20,7 @@ class UpdateTaxRequest extends FormRequest
             'is_active' => ['sometimes', 'boolean'],
             'is_default' => ['sometimes', 'boolean'],
             'sort_order' => ['nullable', 'integer', 'min:0'],
+            'outlet_id' => ['nullable', 'string', 'max:26'],
         ];
     }
 }

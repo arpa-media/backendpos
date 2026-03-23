@@ -18,6 +18,7 @@ class IndexTaxRequest extends FormRequest
             'is_active' => ['nullable', 'boolean'],
             'is_default' => ['nullable', 'boolean'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'outlet_id' => ['nullable', 'string', 'max:26'],
         ];
     }
 }

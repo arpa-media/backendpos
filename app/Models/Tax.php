@@ -28,4 +28,11 @@ class Tax extends Model
         'is_default' => 'boolean',
         'sort_order' => 'integer',
     ];
+
+    public function outlets()
+    {
+        return $this->belongsToMany(Outlet::class, 'outlet_tax')
+            ->withPivot(['is_active', 'is_default'])
+            ->withTimestamps();
+    }
 }

@@ -14,12 +14,13 @@ class StoreTaxRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'jenis_pajak' => ['required', 'string', 'max:80', 'unique:taxes,jenis_pajak'],
+            'jenis_pajak' => ['required', 'string', 'max:80'],
             'display_name' => ['required', 'string', 'max:120'],
             'percent' => ['required', 'integer', 'min:0', 'max:100'],
             'is_active' => ['nullable', 'boolean'],
             'is_default' => ['nullable', 'boolean'],
             'sort_order' => ['nullable', 'integer', 'min:0'],
+            'outlet_id' => ['nullable', 'string', 'max:26'],
         ];
     }
 }

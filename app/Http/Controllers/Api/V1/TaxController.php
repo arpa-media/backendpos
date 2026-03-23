@@ -8,10 +8,11 @@ use App\Http\Requests\Api\V1\Tax\StoreTaxRequest;
 use App\Http\Requests\Api\V1\Tax\UpdateTaxRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Tax\TaxResource;
+use App\Models\Outlet;
 use App\Models\Tax;
 use App\Services\TaxService;
+use App\Support\OutletScope;
 use Illuminate\Http\Request;
-use Illuminate\Validation\Rule;
 
 class TaxController extends Controller
 {
@@ -19,33 +20,43 @@ class TaxController extends Controller
     {
     }
 
+    private function resolveOutletId(Request $request): ?string
+    {
+        $outletId = OutletScope::id($request);
+        if ($outletId) {
+            return $outletId;
+        }
+
+        if (OutletScope::isLocked($request)) {
+            return null;
+        }
+
+        $candidate = $request->input('outlet_id') ?? $request->query('outlet_id');
+        if (! is_string($candidate) || trim($candidate) === '') {
+            return null;
+        }
+
+        $candidate = trim($candidate);
+        if (! Outlet::query()->whereKey($candidate)->exists()) {
+            return null;
+        }
+
+        return $candidate;
+    }
+
+    private function findTax(string $id): ?Tax
+    {
+        return Tax::query()->whereKey($id)->first();
+    }
+
     public function index(IndexTaxRequest $request)
     {
-        $this->taxService->ensureFallbackDefault();
-
-        $q = Tax::query();
-
-        if ($request->filled('q')) {
-            $kw = trim((string) $request->input('q'));
-            $q->where(function ($w) use ($kw) {
-                $w->where('jenis_pajak', 'like', "%{$kw}%")
-                    ->orWhere('display_name', 'like', "%{$kw}%");
-            });
+        $outletId = $this->resolveOutletId($request);
+        if (! $outletId) {
+            return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
         }
 
-        if ($request->has('is_active')) {
-            $q->where('is_active', (bool) $request->boolean('is_active'));
-        }
-
-        if ($request->has('is_default')) {
-            $q->where('is_default', (bool) $request->boolean('is_default'));
-        }
-
-        $q->orderByRaw('COALESCE(sort_order, 999999) ASC')
-            ->orderBy('display_name');
-
-        $perPage = (int) ($request->input('per_page') ?? 15);
-        $taxes = $q->paginate($perPage);
+        $taxes = $this->taxService->paginateForOutlet((string) $outletId, $request->validated());
 
         return ApiResponse::ok([
             'items' => TaxResource::collection($taxes->items()),
@@ -60,77 +71,115 @@ class TaxController extends Controller
 
     public function store(StoreTaxRequest $request)
     {
-        $tax = new Tax();
-        $tax->fill($request->validated());
-        $tax->save();
+        $outletId = $this->resolveOutletId($request);
+        if (! $outletId) {
+            return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
+        }
 
-        $tax = $this->taxService->stabilize($tax);
+        $tax = $this->taxService->create((string) $outletId, $request->validated());
 
         return ApiResponse::ok(new TaxResource($tax), 'Created', 201);
     }
 
-    public function show(string $id)
+    public function show(Request $request, string $id)
     {
-        $tax = Tax::query()->findOrFail($id);
-        return ApiResponse::ok(new TaxResource($tax));
+        $outletId = $this->resolveOutletId($request);
+        if (! $outletId) {
+            return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
+        }
+
+        $tax = $this->findTax($id);
+        if (! $tax) {
+            return ApiResponse::error('Tax not found', 'NOT_FOUND', 404);
+        }
+
+        $this->taxService->ensureOutletPivotCoverage((string) $outletId, $tax);
+
+        return ApiResponse::ok(new TaxResource($tax->load(['outlets' => function ($query) use ($outletId) {
+            $query->where('outlets.id', (string) $outletId);
+        }])));
     }
 
     public function update(UpdateTaxRequest $request, string $id)
     {
-        $tax = Tax::query()->findOrFail($id);
-
-        $validated = $request->validated();
-
-        if (array_key_exists('jenis_pajak', $validated)) {
-            $request->validate([
-                'jenis_pajak' => [
-                    'string',
-                    'max:80',
-                    Rule::unique('taxes', 'jenis_pajak')->ignore($tax->id),
-                ],
-            ]);
+        $outletId = $this->resolveOutletId($request);
+        if (! $outletId) {
+            return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
         }
 
-        $tax->fill($validated);
-        $tax->save();
+        $tax = $this->findTax($id);
+        if (! $tax) {
+            return ApiResponse::error('Tax not found', 'NOT_FOUND', 404);
+        }
 
-        $tax = $this->taxService->stabilize($tax);
+        $tax = $this->taxService->update((string) $outletId, $tax, $request->validated());
 
         return ApiResponse::ok(new TaxResource($tax), 'Updated');
     }
 
     public function updateStatus(Request $request, string $id)
     {
-        $tax = Tax::query()->findOrFail($id);
+        $outletId = $this->resolveOutletId($request);
+        if (! $outletId) {
+            return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
+        }
+
+        $tax = $this->findTax($id);
+        if (! $tax) {
+            return ApiResponse::error('Tax not found', 'NOT_FOUND', 404);
+        }
 
         $validated = $request->validate([
             'is_active' => ['required', 'boolean'],
         ]);
 
-        $tax = $this->taxService->updateActiveStatus($tax, (bool) $validated['is_active']);
+        $tax = $this->taxService->setActiveForOutlet((string) $outletId, $tax, (bool) $validated['is_active']);
 
         return ApiResponse::ok(new TaxResource($tax), 'Status updated');
     }
 
-    public function destroy(string $id)
+    public function destroy(Request $request, string $id)
     {
-        $tax = Tax::query()->findOrFail($id);
+        $outletId = $this->resolveOutletId($request);
+        if (! $outletId) {
+            return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
+        }
+
+        $tax = $this->findTax($id);
+        if (! $tax) {
+            return ApiResponse::error('Tax not found', 'NOT_FOUND', 404);
+        }
+
         $tax->delete();
-        $this->taxService->ensureFallbackDefault();
+        $this->taxService->ensureFallbackDefault((string) $outletId);
 
         return ApiResponse::ok(null, 'Deleted');
     }
 
     public function setDefault(Request $request, string $id)
     {
-        $tax = Tax::query()->findOrFail($id);
-        $tax = $this->taxService->setDefault($tax);
+        $outletId = $this->resolveOutletId($request);
+        if (! $outletId) {
+            return ApiResponse::error('Please select an outlet', 'OUTLET_REQUIRED', 422);
+        }
+
+        $tax = $this->findTax($id);
+        if (! $tax) {
+            return ApiResponse::error('Tax not found', 'NOT_FOUND', 404);
+        }
+
+        $tax = $this->taxService->setDefaultForOutlet((string) $outletId, $tax);
         return ApiResponse::ok(new TaxResource($tax), 'Default updated');
     }
 
-    public function default()
+    public function default(Request $request)
     {
-        $tax = $this->taxService->getActiveDefault();
+        $outletId = $this->resolveOutletId($request);
+        if (! $outletId) {
+            return ApiResponse::ok(null);
+        }
+
+        $tax = $this->taxService->getActiveDefaultForOutlet((string) $outletId);
         return ApiResponse::ok($tax ? new TaxResource($tax) : null);
     }
 }
