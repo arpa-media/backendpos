@@ -21,6 +21,28 @@ class UserAuthContextResolver
         $resolvedOutlet = $assignmentOutlet ?: $legacyOutlet;
         $outletType = strtolower((string) ($resolvedOutlet?->type ?: ''));
 
+        if ($this->isGlobalOutletScopeAdministrator($user) && $resolvedOutlet) {
+            return $this->payload($user, $employee, $assignment, $resolvedOutlet, 'seed-admin', 'ALL', false, true, (bool) $legacyOutlet && !$assignmentOutlet, $assignment ? 'hr' : 'legacy');
+        }
+
+        if ($this->isGlobalOutletScopeAdministrator($user) && ! $resolvedOutlet) {
+            return [
+                'is_active' => (bool) ($user->is_active ?? true),
+                'classification' => 'seed-admin',
+                'scope_mode' => 'ALL',
+                'scope_locked' => false,
+                'can_adjust_scope' => true,
+                'resolved_outlet_id' => null,
+                'resolved_outlet_code' => null,
+                'resolved_outlet_type' => 'outlet',
+                'is_legacy_fallback' => false,
+                'auth_source' => 'seed-admin',
+                'requires_legacy_bridge' => false,
+                'has_employee' => $employee !== null,
+                'has_assignment' => $assignment !== null,
+            ];
+        }
+
         if ($assignment && $resolvedOutlet) {
             // Business rule:
             // - assignment outlet type=outlet => locked to that outlet
@@ -87,6 +109,17 @@ class UserAuthContextResolver
 
         return $exists ? $requestedOutletId : '__INVALID__';
     }
+
+    private function isGlobalOutletScopeAdministrator(User $user): bool
+    {
+        $seedAdminNisj = trim((string) config('pos.seed_admin.nisj', '10012501000'));
+        if ($seedAdminNisj !== '' && (string) ($user->nisj ?? '') === $seedAdminNisj) {
+            return true;
+        }
+
+        return false;
+    }
+
 
     private function payload(
         User $user,
