@@ -3,7 +3,6 @@
 namespace App\Services;
 
 use App\Services\MarkingService;
-use App\Services\DiscountSquadService;
 use App\Models\Customer;
 use App\Models\Discount;
 use App\Models\PaymentMethod;
@@ -34,19 +33,11 @@ class PosCheckoutService
     public function checkout(User $user, string $outletId, array $payload): Sale
     {
         $payloadChannel = $payload['channel'] ?? null;
-        $normalizedPayloadChannel = strtoupper(trim((string) $payloadChannel));
         $clientSyncId = isset($payload['client_sync_id']) ? trim((string) $payload['client_sync_id']) : null;
         $billName = isset($payload['bill_name']) ? trim((string) $payload['bill_name']) : null;
         $customerId = $payload['customer_id'] ?? null;
         $tableChamber = strtoupper(trim((string) ($payload['table_chamber'] ?? '')));
         $tableNumber = trim((string) ($payload['table_number'] ?? ''));
-        $onlineOrderSource = null;
-
-        if ($normalizedPayloadChannel === SalesChannels::DELIVERY) {
-            $candidateOnlineSource = strtoupper(trim((string) ($payload['online_order_source'] ?? 'ONLINE')));
-            $allowedOnlineSources = ['ONLINE', 'GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'];
-            $onlineOrderSource = in_array($candidateOnlineSource, $allowedOnlineSources, true) ? $candidateOnlineSource : 'ONLINE';
-        }
 
         // Discount payload (backward compatible with Phase-1 fields)
         // - Manual (single): discount: { type, value, reason }
@@ -59,7 +50,6 @@ class PosCheckoutService
         $discountType = strtoupper((string) ($discount['type'] ?? 'NONE'));
         $discountValue = (int) ($discount['value'] ?? 0);
         $discountReason = $discount['reason'] ?? ($payload['discount_reason'] ?? null);
-        $discountSquadNisj = trim((string) ($payload['discount_squad_nisj'] ?? ''));
 
         // IMPORTANT: ignore tax_percent input (legacy Phase 1)
         $defaultTax = Tax::query()
@@ -131,12 +121,10 @@ class PosCheckoutService
             $discountReason,
             $discountId,
             $discounts,
-            $discountSquadNisj,
             $taxId,
             $taxName,
             $taxPercent,
-            $clientSyncId,
-            $onlineOrderSource
+            $clientSyncId
         ) {
 
             // 0) Optional: validate customer globally.
@@ -432,46 +420,11 @@ class PosCheckoutService
 
             // If packages are used, ignore manual discount inputs.
             $usePackages = $discountPackages->count() > 0;
-            $discountSquadService = app(DiscountSquadService::class);
-            $selectedSquadUser = null;
-            $selectedSquadPeriodKey = null;
 
             $discountSnapshots = [];
             $discountAmount = 0;
 
             if ($usePackages) {
-                $squadPackages = $discountPackages->filter(fn (Discount $pkg) => strtoupper((string) $pkg->applies_to) === 'SQUAD')->values();
-                if ($squadPackages->count() > 1) {
-                    throw ValidationException::withMessages([
-                        'discounts' => ['Maksimal satu paket discount squad yang boleh dipilih.'],
-                    ]);
-                }
-                if ($squadPackages->count() === 1 && $discountPackages->count() > 1) {
-                    throw ValidationException::withMessages([
-                        'discounts' => ['Discount squad tidak bisa digabung dengan paket discount lain.'],
-                    ]);
-                }
-                if ($squadPackages->count() === 1) {
-                    if ($discountSquadNisj === '') {
-                        throw ValidationException::withMessages([
-                            'discount_squad_nisj' => ['NISJ squad wajib dipilih untuk discount squad.'],
-                        ]);
-                    }
-
-                    $selectedSquadUser = $discountSquadService->findUserByNisj($discountSquadNisj);
-                    if (! $selectedSquadUser) {
-                        throw ValidationException::withMessages([
-                            'discount_squad_nisj' => ['NISJ squad tidak ditemukan atau tidak aktif.'],
-                        ]);
-                    }
-
-                    $selectedSquadPeriodKey = $discountSquadService->currentPeriodKey();
-                    if (! $discountSquadService->isAvailableForNisj((string) $selectedSquadUser->nisj, $selectedSquadPeriodKey)) {
-                        throw ValidationException::withMessages([
-                            'discount_squad_nisj' => ['Jatah discount squad untuk user tersebut sudah terpakai bulan ini.'],
-                        ]);
-                    }
-                }
                 foreach ($discountPackages as $pkg) {
                     $appliesTo = strtoupper((string) $pkg->applies_to);
 
@@ -499,13 +452,6 @@ class PosCheckoutService
                         }
                         // CUSTOMER => subtotal semua cart (per instruksi)
                         $base = $subtotal;
-                    } elseif ($appliesTo === 'SQUAD') {
-                        if (! $selectedSquadUser) {
-                            throw ValidationException::withMessages([
-                                'discount_squad_nisj' => ['NISJ squad wajib dipilih untuk discount squad.'],
-                            ]);
-                        }
-                        $base = $subtotal;
                     } else {
                         $base = $subtotal;
                     }
@@ -531,8 +477,6 @@ class PosCheckoutService
                         'discount_value' => (int) $v,
                         'base' => (int) $base,
                         'amount' => (int) $amt,
-                        'squad_nisj' => $appliesTo === 'SQUAD' && $selectedSquadUser ? (string) $selectedSquadUser->nisj : null,
-                        'squad_name' => $appliesTo === 'SQUAD' && $selectedSquadUser ? (string) ($selectedSquadUser->name ?? '') : null,
                     ];
 
                     $discountAmount += $amt;
@@ -573,15 +517,9 @@ class PosCheckoutService
             $taxTotal = (int) floor(($taxableBase * $taxPercent) / 100);
             $serviceChargeTotal = 0;
 
-            $grandTotalBeforeRounding = (int) ($taxableBase + $taxTotal + $serviceChargeTotal);
-            $roundingSnapshot = SaleRounding::shouldApplyForChannel((string) $saleChannel)
-                ? SaleRounding::apply($grandTotalBeforeRounding)
-                : [
-                    'before_rounding' => $grandTotalBeforeRounding,
-                    'rounding_total' => 0,
-                    'after_rounding' => $grandTotalBeforeRounding,
-                ];
+            $roundingSnapshot = SaleRounding::applyForPaymentType((int) ($taxableBase + $taxTotal + $serviceChargeTotal), (string) ($pm->type ?? ''));
             $roundingTotal = (int) ($roundingSnapshot['rounding_total'] ?? 0);
+            $grandTotalBeforeRounding = (int) ($roundingSnapshot['before_rounding'] ?? 0);
             $grandTotal = (int) ($roundingSnapshot['after_rounding'] ?? 0);
             $marking = app(MarkingService::class)->determineNextMarking($outletId);
 
@@ -611,7 +549,6 @@ class PosCheckoutService
                 'client_sync_id' => $clientSyncId ?: null,
                 'sale_number' => $this->generateSaleNumber($outletId),
                 'channel' => (string) $saleChannel,
-                'online_order_source' => strtoupper((string) $saleChannel) === SalesChannels::DELIVERY ? $onlineOrderSource : null,
                 'status' => SaleStatuses::PAID,
 
                 'bill_name' => (string) $billName,
@@ -635,10 +572,6 @@ class PosCheckoutService
 
                 // Multiple packages snapshot (json)
                 'discounts_snapshot' => $usePackages ? $discountSnapshots : null,
-                'discount_squad_user_id' => $selectedSquadUser ? (string) $selectedSquadUser->id : null,
-                'discount_squad_nisj' => $selectedSquadUser ? (string) ($selectedSquadUser->nisj ?? '') : null,
-                'discount_squad_name' => $selectedSquadUser ? (string) ($selectedSquadUser->name ?? '') : null,
-                'discount_squad_period_key' => $selectedSquadPeriodKey,
 
                 // Backward compat
                 'discount_total' => $discountAmount,
@@ -679,10 +612,6 @@ class PosCheckoutService
                 'amount' => $paid,
                 'reference' => $payment['reference'] ?? null,
             ]);
-
-            if ($selectedSquadUser && $discountPackage && strtoupper((string) $discountPackage->applies_to) === 'SQUAD') {
-                $discountSquadService->registerUsage($discountPackage, $sale, $selectedSquadUser);
-            }
 
             return $sale->load(['items', 'payments', 'customer', 'outlet']);
         });

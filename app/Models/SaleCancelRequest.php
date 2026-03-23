@@ -11,12 +11,17 @@ class SaleCancelRequest extends Model
     use HasFactory;
     use HasUlids;
 
+    public const REQUEST_TYPE_CANCEL = 'CANCEL';
+    public const REQUEST_TYPE_VOID = 'VOID';
+
+    public const REQUEST_TYPES = [
+        self::REQUEST_TYPE_CANCEL,
+        self::REQUEST_TYPE_VOID,
+    ];
+
     public const STATUS_PENDING = 'PENDING';
     public const STATUS_APPROVED = 'APPROVED';
     public const STATUS_REJECTED = 'REJECTED';
-
-    public const REQUEST_TYPE_CANCEL_BILL = 'CANCEL_BILL';
-    public const REQUEST_TYPE_VOID_ITEMS = 'VOID_ITEMS';
 
     public const STATUSES = [
         self::STATUS_PENDING,
@@ -24,31 +29,24 @@ class SaleCancelRequest extends Model
         self::STATUS_REJECTED,
     ];
 
-    public const REQUEST_TYPES = [
-        self::REQUEST_TYPE_CANCEL_BILL,
-        self::REQUEST_TYPE_VOID_ITEMS,
-    ];
-
     protected $fillable = [
         'sale_id',
         'outlet_id',
-        'request_type',
         'requested_by_user_id',
         'requested_by_name',
         'reason',
-        'void_item_ids',
-        'void_items_snapshot',
+        'request_type',
         'status',
         'decided_by_user_id',
         'decided_by_name',
         'decided_at',
         'decision_note',
+        'void_items_snapshot',
     ];
 
     protected $casts = [
-        'void_item_ids' => 'array',
-        'void_items_snapshot' => 'array',
         'decided_at' => 'datetime',
+        'void_items_snapshot' => 'array',
     ];
 
     public function sale()

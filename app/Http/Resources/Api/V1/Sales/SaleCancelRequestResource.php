@@ -2,7 +2,6 @@
 
 namespace App\Http\Resources\Api\V1\Sales;
 
-use App\Models\SaleCancelRequest;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -23,8 +22,25 @@ class SaleCancelRequestResource extends JsonResource
                 'sale_number' => (string) $s->sale_number,
                 'channel' => (string) $s->channel,
                 'status' => (string) $s->status,
+                'subtotal' => (int) ($s->subtotal ?? 0),
+                'discount_amount' => (int) ($s->discount_amount ?? 0),
+                'tax_amount' => (int) ($s->tax_total ?? 0),
                 'grand_total' => (int) $s->grand_total,
+                'bill_name' => (string) ($s->bill_name ?? ''),
                 'created_at' => optional($s->created_at)->format('Y-m-d H:i:s'),
+                'items' => $s->relationLoaded('items')
+                    ? $s->items->map(fn ($item) => [
+                        'id' => (string) $item->id,
+                        'product_name' => (string) ($item->product_name ?? ''),
+                        'variant_name' => (string) ($item->variant_name ?? ''),
+                        'note' => $item->note,
+                        'qty' => (int) ($item->qty ?? 0),
+                        'unit_price' => (int) ($item->unit_price ?? 0),
+                        'line_total' => (int) ($item->line_total ?? 0),
+                        'channel' => (string) ($item->channel ?? ''),
+                        'category_kind' => (string) ($item->category_kind_snapshot ?? optional(optional($item->product)->category)->kind ?? ''),
+                    ])->values()->all()
+                    : [],
             ];
         }
 
@@ -37,27 +53,22 @@ class SaleCancelRequestResource extends JsonResource
             ];
         }
 
-        $requestType = strtoupper((string) ($r->request_type ?: SaleCancelRequest::REQUEST_TYPE_CANCEL_BILL));
-        $voidItemsSnapshot = is_array($r->void_items_snapshot) ? array_values($r->void_items_snapshot) : [];
-
         return [
             'id' => (string) $r->id,
             'sale_id' => (string) $r->sale_id,
             'outlet_id' => (string) $r->outlet_id,
             'outlet' => $outlet,
 
-            'request_type' => $requestType,
-            'request_type_label' => $requestType === SaleCancelRequest::REQUEST_TYPE_VOID_ITEMS ? 'Void' : 'Cancel Bill',
             'status' => (string) $r->status,
+            'request_type' => (string) ($r->request_type ?? 'CANCEL'),
+            'void_items_snapshot' => $r->void_items_snapshot ?: [],
 
+            // PATCH-9: include sale snapshot for admin confirm modal
             'sale' => $sale,
 
             'requested_by_user_id' => (string) $r->requested_by_user_id,
             'requested_by_name' => $r->requested_by_name,
             'reason' => $r->reason,
-            'void_item_ids' => is_array($r->void_item_ids) ? array_values($r->void_item_ids) : [],
-            'void_items_count' => count($voidItemsSnapshot),
-            'void_items_snapshot' => $voidItemsSnapshot,
 
             'decided_by_user_id' => $r->decided_by_user_id ? (string) $r->decided_by_user_id : null,
             'decided_by_name' => $r->decided_by_name,

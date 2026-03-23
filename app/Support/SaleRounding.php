@@ -6,13 +6,16 @@ class SaleRounding
 {
     public const BASE = 1000;
 
-    public static function shouldApplyForChannel(?string $channel): bool
+    public static function shouldApplyForPaymentType(?string $paymentType): bool
     {
-        $normalized = strtoupper(trim((string) $channel));
+        $type = strtoupper(trim((string) $paymentType));
 
-        return $normalized !== 'DELIVERY' && $normalized !== 'ONLINE';
+        if ($type === '') {
+            return true;
+        }
+
+        return $type === PaymentMethodTypes::CASH;
     }
-
 
     public static function calculateDelta(int $amount, int $base = self::BASE): int
     {
@@ -41,5 +44,20 @@ class SaleRounding
             'rounding_total' => $rounding,
             'after_rounding' => max(0, $before + $rounding),
         ];
+    }
+
+    public static function applyForPaymentType(int $amount, ?string $paymentType, int $base = self::BASE): array
+    {
+        $before = max(0, (int) $amount);
+
+        if (!self::shouldApplyForPaymentType($paymentType)) {
+            return [
+                'before_rounding' => $before,
+                'rounding_total' => 0,
+                'after_rounding' => $before,
+            ];
+        }
+
+        return self::apply($before, $base);
     }
 }

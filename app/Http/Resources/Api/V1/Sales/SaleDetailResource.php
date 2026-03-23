@@ -30,7 +30,6 @@ class SaleDetailResource extends JsonResource
 
             'sale_number' => (string) $s->sale_number,
             'channel' => (string) $s->channel,
-            'online_order_source' => $s->online_order_source ? (string) $s->online_order_source : null,
             'status' => (string) $s->status,
 
             'bill_name' => (string) $s->bill_name,
@@ -52,9 +51,6 @@ class SaleDetailResource extends JsonResource
                     'id' => (string) $s->outlet->id,
                     'name' => (string) $s->outlet->name,
                     'address' => (string) ($s->outlet->address ?? ''),
-                    'phone' => (string) ($s->outlet->phone ?? ''),
-                    'ig_1' => $s->outlet->ig_1 ?? null,
-                    'ig_2' => $s->outlet->ig_2 ?? null,
                     'timezone' => (string) ($s->outlet->timezone ?? config('app.timezone', 'Asia/Jakarta')),
                 ]
                 : null,
@@ -88,8 +84,10 @@ class SaleDetailResource extends JsonResource
 
             'items' => SaleItemResource::collection($this->whenLoaded('items')),
             'payments' => SalePaymentResource::collection($this->whenLoaded('payments')),
-            'cancel_requests' => \App\Http\Resources\Api\V1\Sales\SaleCancelRequestResource::collection($this->whenLoaded('cancelRequests')),
 
+            'latest_request_type' => method_exists($s, 'cancelRequests') && $s->relationLoaded('cancelRequests') && $s->cancelRequests->count()
+                ? (string) optional($s->cancelRequests->sortByDesc('created_at')->first())->request_type
+                : null,
             'created_at' => TransactionDate::toIso($s->created_at, optional($s->outlet)->timezone),
             'updated_at' => TransactionDate::toIso($s->updated_at, optional($s->outlet)->timezone),
             'created_at_text' => TransactionDate::formatLocal($s->created_at, optional($s->outlet)->timezone),
