@@ -36,8 +36,12 @@ class PosCheckoutService
         $clientSyncId = isset($payload['client_sync_id']) ? trim((string) $payload['client_sync_id']) : null;
         $billName = isset($payload['bill_name']) ? trim((string) $payload['bill_name']) : null;
         $customerId = $payload['customer_id'] ?? null;
-        $tableChamber = strtoupper(trim((string) ($payload['table_chamber'] ?? '')));
+        $tableChamber = trim((string) ($payload['table_chamber'] ?? ''));
         $tableNumber = trim((string) ($payload['table_number'] ?? ''));
+        $onlineOrderSource = strtoupper(trim((string) ($payload['online_order_source'] ?? 'ONLINE')));
+        if (!in_array($onlineOrderSource, ['ONLINE', 'GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'], true)) {
+            $onlineOrderSource = 'ONLINE';
+        }
 
         // Discount payload (backward compatible with Phase-1 fields)
         // - Manual (single): discount: { type, value, reason }
@@ -53,8 +57,14 @@ class PosCheckoutService
 
         // IMPORTANT: ignore tax_percent input (legacy Phase 1)
         $defaultTax = Tax::query()
-            ->where('is_active', true)
-            ->where('is_default', true)
+            ->whereHas('outlets', function ($query) use ($outletId) {
+                $query->where('outlets.id', $outletId)
+                    ->where('outlet_tax.is_active', true)
+                    ->where('outlet_tax.is_default', true);
+            })
+            ->with(['outlets' => function ($query) use ($outletId) {
+                $query->where('outlets.id', $outletId);
+            }])
             ->first();
 
         $taxId = $defaultTax ? (string) $defaultTax->id : null;
@@ -78,18 +88,6 @@ class PosCheckoutService
         if (!is_string($billName) || trim($billName) === '') {
             throw ValidationException::withMessages([
                 'bill_name' => ['Bill name is required.'],
-            ]);
-        }
-
-        if (!in_array($tableChamber, ['INDOOR', 'OUTDOOR'], true)) {
-            throw ValidationException::withMessages([
-                'table_chamber' => ['Table chamber is required.'],
-            ]);
-        }
-
-        if ($tableNumber === '') {
-            throw ValidationException::withMessages([
-                'table_number' => ['Table number is required.'],
             ]);
         }
 
@@ -124,7 +122,8 @@ class PosCheckoutService
             $taxId,
             $taxName,
             $taxPercent,
-            $clientSyncId
+            $clientSyncId,
+            $onlineOrderSource
         ) {
 
             // 0) Optional: validate customer globally.
@@ -549,12 +548,13 @@ class PosCheckoutService
                 'client_sync_id' => $clientSyncId ?: null,
                 'sale_number' => $this->generateSaleNumber($outletId),
                 'channel' => (string) $saleChannel,
+                'online_order_source' => (string) $onlineOrderSource,
                 'status' => SaleStatuses::PAID,
 
                 'bill_name' => (string) $billName,
                 'customer_id' => $customer ? (string) $customer->id : null,
-                'table_chamber' => $tableChamber,
-                'table_number' => $tableNumber,
+                'table_chamber' => $tableChamber !== '' ? $tableChamber : null,
+                'table_number' => $tableNumber !== '' ? $tableNumber : null,
 
                 'subtotal' => $subtotal,
 

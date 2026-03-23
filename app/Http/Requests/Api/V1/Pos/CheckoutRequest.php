@@ -26,10 +26,10 @@ class CheckoutRequest extends FormRequest
             'online_order_source' => ['nullable', 'string', Rule::in(['ONLINE', 'GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'])],
 
             // Bill name/customer (touchscreen POS)
-            'bill_name' => ['required', 'string', 'min:1', 'max:120'],
+            'bill_name' => ['nullable', 'string', 'min:1', 'max:120'],
             'customer_id' => ['nullable', 'string', 'max:30'],
-            'table_chamber' => ['required', 'string', Rule::in(['INDOOR', 'OUTDOOR'])],
-            'table_number' => ['required', 'string', 'max:30'],
+            'table_chamber' => ['nullable', 'string', 'max:50'],
+            'table_number' => ['nullable', 'string', 'max:30'],
 
             // Discount (cart-level)
             // Backward compatible payload:

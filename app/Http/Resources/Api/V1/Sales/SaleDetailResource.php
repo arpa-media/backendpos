@@ -30,6 +30,7 @@ class SaleDetailResource extends JsonResource
 
             'sale_number' => (string) $s->sale_number,
             'channel' => (string) $s->channel,
+            'online_order_source' => $s->online_order_source ? (string) $s->online_order_source : null,
             'status' => (string) $s->status,
 
             'bill_name' => (string) $s->bill_name,

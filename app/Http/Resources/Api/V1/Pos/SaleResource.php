@@ -37,6 +37,7 @@ class SaleResource extends JsonResource
             'cashier_id' => (string) $s->cashier_id,
             'sale_number' => (string) $s->sale_number,
             'channel' => (string) $s->channel,
+            'online_order_source' => $s->online_order_source ? (string) $s->online_order_source : null,
             'channels' => $channelsInSale,
             'status' => (string) $s->status,
 
