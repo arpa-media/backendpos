@@ -82,9 +82,18 @@ class ProductService
             ]);
         }
 
+        // POS frontend currently loads only page=1 and does not iterate pagination.
+        // To prevent active products from disappearing once an outlet has >100 sellable items
+        // (e.g. products later in alphabetical order such as Tiramisu), force POS mode to
+        // return the full outlet catalog in a single page.
+        $effectivePerPage = $perPage;
+        if ($forPos) {
+            $effectivePerPage = max(1, (clone $query)->count());
+        }
+
         return $query
             ->orderBy($sort, $dir)
-            ->paginate($perPage)
+            ->paginate($effectivePerPage)
             ->withQueryString();
     }
 
