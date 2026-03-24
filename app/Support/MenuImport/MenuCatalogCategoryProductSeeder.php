@@ -6,7 +6,6 @@ use App\Models\Category;
 use App\Models\Outlet;
 use App\Models\Product;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Str;
 
 class MenuCatalogCategoryProductSeeder
 {
@@ -38,9 +37,11 @@ class MenuCatalogCategoryProductSeeder
                 'create' => 0,
                 'skip_existing' => 0,
                 'restore' => 0,
+                'sync_category' => 0,
             ],
             'outlet_product' => [
                 'attach' => 0,
+                'reactivate' => 0,
                 'skip_existing' => 0,
                 'inactive_outlet' => 0,
                 'missing_outlet' => 0,
@@ -156,7 +157,7 @@ class MenuCatalogCategoryProductSeeder
                         $action = 'skip_existing';
                     }
 
-                    $operations['products'][] = [
+                    $operation = [
                         'slug' => $slug,
                         'name' => (string) $product->name,
                         'action' => $action,
@@ -164,6 +165,16 @@ class MenuCatalogCategoryProductSeeder
                         'category_id' => (string) ($product->category_id ?? ''),
                         'source_refs' => $productRow['source_refs'],
                     ];
+
+                    if ($categoryId && (string) $product->category_id !== (string) $categoryId) {
+                        $product->category_id = $categoryId;
+                        $product->save();
+                        $summary['products']['sync_category']++;
+                        $operation['action'] = $action === 'restore' ? 'restore_sync_category' : 'sync_category';
+                        $operation['category_id'] = (string) $product->category_id;
+                    }
+
+                    $operations['products'][] = $operation;
                 } else {
                     $product = Product::query()->create([
                         'category_id' => $categoryId,
@@ -210,19 +221,37 @@ class MenuCatalogCategoryProductSeeder
                         continue;
                     }
 
-                    $exists = DB::table('outlet_product')
+                    $existingPivot = DB::table('outlet_product')
                         ->where('product_id', (string) $product->id)
                         ->where('outlet_id', (string) $outlet->id)
-                        ->exists();
+                        ->first(['is_active']);
 
-                    if ($exists) {
-                        $summary['outlet_product']['skip_existing']++;
-                        $operations['outlet_product'][] = [
-                            'product_slug' => $slug,
-                            'product_name' => (string) $product->name,
-                            'outlet_code' => (string) $outlet->code,
-                            'action' => 'skip_existing',
-                        ];
+                    if ($existingPivot) {
+                        if (! (bool) $existingPivot->is_active) {
+                            DB::table('outlet_product')
+                                ->where('product_id', (string) $product->id)
+                                ->where('outlet_id', (string) $outlet->id)
+                                ->update([
+                                    'is_active' => true,
+                                    'updated_at' => now(),
+                                ]);
+
+                            $summary['outlet_product']['reactivate']++;
+                            $operations['outlet_product'][] = [
+                                'product_slug' => $slug,
+                                'product_name' => (string) $product->name,
+                                'outlet_code' => (string) $outlet->code,
+                                'action' => 'reactivate',
+                            ];
+                        } else {
+                            $summary['outlet_product']['skip_existing']++;
+                            $operations['outlet_product'][] = [
+                                'product_slug' => $slug,
+                                'product_name' => (string) $product->name,
+                                'outlet_code' => (string) $outlet->code,
+                                'action' => 'skip_existing',
+                            ];
+                        }
                         continue;
                     }
 
@@ -266,23 +295,11 @@ class MenuCatalogCategoryProductSeeder
     }
 
     /**
-     * @param array<int, Outlet> $outlets
+     * @param iterable<int, Outlet> $outlets
      * @return array<string, Outlet>
      */
-    private function buildOutletLookup(array $outlets): array
+    private function buildOutletLookup(iterable $outlets): array
     {
-        $lookup = [];
-
-        foreach ($outlets as $outlet) {
-            foreach (array_filter([
-                Str::slug((string) $outlet->name),
-                strtolower((string) $outlet->code),
-                Str::slug((string) $outlet->code),
-            ]) as $key) {
-                $lookup[$key] = $outlet;
-            }
-        }
-
-        return $lookup;
+        return MenuOutletLookup::build($outlets);
     }
 }

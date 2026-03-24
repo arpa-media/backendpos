@@ -10,6 +10,7 @@ use App\Models\ProductVariantPrice;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
+use App\Support\MenuImport\MenuOutletLookup;
 
 class MenuCatalogExistingMatcher
 {
@@ -246,26 +247,12 @@ class MenuCatalogExistingMatcher
     }
 
     /**
-     * @param EloquentCollection<int, Outlet> $outlets
+     * @param iterable<int, Outlet> $outlets
      * @return array<string, Outlet>
      */
-    private function buildOutletLookup(EloquentCollection $outlets): array
+    private function buildOutletLookup(iterable $outlets): array
     {
-        $lookup = [];
-
-        foreach ($outlets as $outlet) {
-            $keys = array_filter([
-                Str::slug((string) $outlet->name),
-                Str::lower((string) $outlet->code),
-                Str::slug((string) $outlet->code),
-            ]);
-
-            foreach ($keys as $key) {
-                $lookup[$key] = $outlet;
-            }
-        }
-
-        return $lookup;
+        return MenuOutletLookup::build($outlets);
     }
 
     private function variantLookupKey(string $outletId, string $productId, string $variantName): string

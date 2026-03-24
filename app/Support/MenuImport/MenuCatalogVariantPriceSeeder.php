@@ -9,6 +9,7 @@ use App\Models\ProductVariantPrice;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use App\Support\MenuImport\MenuOutletLookup;
 
 class MenuCatalogVariantPriceSeeder
 {
@@ -359,21 +360,9 @@ class MenuCatalogVariantPriceSeeder
      * @param Collection<int, Outlet> $outlets
      * @return array<string, Outlet>
      */
-    private function buildOutletLookup(Collection $outlets): array
+    private function buildOutletLookup(iterable $outlets): array
     {
-        $lookup = [];
-
-        foreach ($outlets as $outlet) {
-            foreach (array_filter([
-                Str::slug((string) $outlet->name),
-                Str::lower((string) $outlet->code),
-                Str::slug((string) $outlet->code),
-            ]) as $key) {
-                $lookup[$key] = $outlet;
-            }
-        }
-
-        return $lookup;
+        return MenuOutletLookup::build($outlets);
     }
 
     private function variantLookupKey(string $outletId, string $productId, string $variantName): string

@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use App\Support\MenuImport\MenuOutletLookup;
 
 class MenuCatalogPostImportAuditor
 {
@@ -389,24 +390,12 @@ class MenuCatalogPostImportAuditor
     }
 
     /**
-     * @param EloquentCollection<int, Outlet> $outlets
+     * @param iterable<int, Outlet> $outlets
      * @return array<string, Outlet>
      */
-    private function buildOutletLookup(EloquentCollection $outlets): array
+    private function buildOutletLookup(iterable $outlets): array
     {
-        $lookup = [];
-
-        foreach ($outlets as $outlet) {
-            foreach (array_filter([
-                Str::slug((string) $outlet->name),
-                Str::lower((string) $outlet->code),
-                Str::slug((string) $outlet->code),
-            ]) as $key) {
-                $lookup[$key] = $outlet;
-            }
-        }
-
-        return $lookup;
+        return MenuOutletLookup::build($outlets);
     }
 
     private function outletProductKey(string $outletId, string $productId): string
