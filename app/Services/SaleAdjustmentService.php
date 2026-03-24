@@ -123,13 +123,7 @@ class SaleAdjustmentService
         $serviceChargeTotal = max(0, (int) ($sale->service_charge_total ?? 0));
         $beforeRounding = (int) ($taxableBase + $taxTotal + $serviceChargeTotal);
 
-        $roundingSnapshot = SaleRounding::shouldApplyForChannel((string) $sale->channel)
-            ? SaleRounding::apply($beforeRounding)
-            : [
-                'before_rounding' => $beforeRounding,
-                'rounding_total' => 0,
-                'after_rounding' => $beforeRounding,
-            ];
+        $roundingSnapshot = SaleRounding::apply($beforeRounding);
 
         $sale->subtotal = $subtotal;
         $sale->discount_amount = $discountTotal;

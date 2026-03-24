@@ -511,12 +511,16 @@ class PosCheckoutService
                 $discountReason = !empty($codes) ? implode('+', $codes) : null;
             }
 
-            // 7) Tax (default tax)
+            // 7) Tax (default tax per outlet, except online/delivery which are always no-tax)
+            $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
+            $effectiveTaxId = $isOnlineNoTax ? null : $taxId;
+            $effectiveTaxName = $isOnlineNoTax ? 'Tax' : $taxName;
+            $effectiveTaxPercent = $isOnlineNoTax ? 0 : (int) $taxPercent;
 
-            $taxTotal = (int) floor(($taxableBase * $taxPercent) / 100);
+            $taxTotal = (int) floor(($taxableBase * $effectiveTaxPercent) / 100);
             $serviceChargeTotal = 0;
 
-            $roundingSnapshot = SaleRounding::applyForPaymentType((int) ($taxableBase + $taxTotal + $serviceChargeTotal), (string) ($pm->type ?? ''));
+            $roundingSnapshot = SaleRounding::apply((int) ($taxableBase + $taxTotal + $serviceChargeTotal));
             $roundingTotal = (int) ($roundingSnapshot['rounding_total'] ?? 0);
             $grandTotalBeforeRounding = (int) ($roundingSnapshot['before_rounding'] ?? 0);
             $grandTotal = (int) ($roundingSnapshot['after_rounding'] ?? 0);
@@ -577,9 +581,9 @@ class PosCheckoutService
                 'discount_total' => $discountAmount,
 
                 // Tax snapshot
-                'tax_id' => $taxId,
-                'tax_name_snapshot' => $taxName,
-                'tax_percent_snapshot' => $taxPercent,
+                'tax_id' => $effectiveTaxId,
+                'tax_name_snapshot' => $effectiveTaxName,
+                'tax_percent_snapshot' => $effectiveTaxPercent,
 
                 // Canonical tax amount in Phase 1 schema
                 'tax_total' => $taxTotal,

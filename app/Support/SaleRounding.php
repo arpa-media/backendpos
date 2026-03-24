@@ -6,15 +6,19 @@ class SaleRounding
 {
     public const BASE = 1000;
 
+    public static function shouldApply(): bool
+    {
+        return true;
+    }
+
     public static function shouldApplyForPaymentType(?string $paymentType): bool
     {
-        $type = strtoupper(trim((string) $paymentType));
+        return self::shouldApply();
+    }
 
-        if ($type === '') {
-            return true;
-        }
-
-        return $type === PaymentMethodTypes::CASH;
+    public static function shouldApplyForChannel(?string $channel): bool
+    {
+        return self::shouldApply();
     }
 
     public static function calculateDelta(int $amount, int $base = self::BASE): int
@@ -50,7 +54,7 @@ class SaleRounding
     {
         $before = max(0, (int) $amount);
 
-        if (!self::shouldApplyForPaymentType($paymentType)) {
+        if (!self::shouldApply()) {
             return [
                 'before_rounding' => $before,
                 'rounding_total' => 0,
