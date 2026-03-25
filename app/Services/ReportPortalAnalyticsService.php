@@ -15,6 +15,14 @@ class ReportPortalAnalyticsService
     {
     }
 
+    private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo): void
+    {
+        [$from, $to] = $this->resolveRange($dateFrom, $dateTo);
+
+        $query->whereDate($column, '>=', $from->toDateString())
+            ->whereDate($column, '<=', $to->toDateString());
+    }
+
     public function dashboard(array $scope, array $params): array
     {
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
@@ -23,8 +31,9 @@ class ReportPortalAnalyticsService
 
         $salesBase = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($salesBase, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($salesBase, $scope, 's');
 
@@ -40,8 +49,9 @@ class ReportPortalAnalyticsService
 
         $itemsSoldQuery = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($itemsSoldQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($itemsSoldQuery, $scope, 's');
 
@@ -84,8 +94,9 @@ class ReportPortalAnalyticsService
 
         $topVariantsQuery = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($topVariantsQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($topVariantsQuery, $scope, 's');
 
@@ -109,8 +120,9 @@ class ReportPortalAnalyticsService
 
         $topProductsQuery = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($topProductsQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($topProductsQuery, $scope, 's');
 
@@ -200,8 +212,9 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -244,8 +257,9 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -284,8 +298,9 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -326,8 +341,9 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -431,8 +447,9 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->whereBetween('s.created_at', [$from, $to])
             ->where('s.status', '=', 'PAID');
+
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -483,7 +500,7 @@ class ReportPortalAnalyticsService
 
     private function resolveRange(?string $dateFrom, ?string $dateTo): array
     {
-        $today = CarbonImmutable::now()->startOfDay();
+        $today = CarbonImmutable::today();
 
         $from = $dateFrom ? CarbonImmutable::parse($dateFrom)->startOfDay() : $today;
         $to = $dateTo ? CarbonImmutable::parse($dateTo)->startOfDay() : $today;

@@ -3,6 +3,7 @@
 namespace App\Support;
 
 use Carbon\Carbon;
+use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
 
 class TransactionDate
@@ -31,6 +32,47 @@ class TransactionDate
         }
 
         return $dt->copy()->setTimezone($timezone ?: self::appTimezone())->format($pattern);
+    }
+
+    public static function todayDateString(?string $timezone = null): string
+    {
+        return CarbonImmutable::now($timezone ?: self::appTimezone())->toDateString();
+    }
+
+    /**
+     * Resolve a local date range and its UTC equivalent for DB filtering.
+     *
+     * @return array{0: CarbonImmutable, 1: CarbonImmutable, 2: CarbonImmutable, 3: CarbonImmutable}
+     */
+    public static function dateRange(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        $tz = $timezone ?: self::appTimezone();
+        $today = CarbonImmutable::now($tz)->startOfDay();
+
+        try {
+            $from = $dateFrom ? CarbonImmutable::parse($dateFrom, $tz)->startOfDay() : $today;
+        } catch (\Throwable $e) {
+            $from = $today;
+        }
+
+        try {
+            $to = $dateTo ? CarbonImmutable::parse($dateTo, $tz)->startOfDay() : $today;
+        } catch (\Throwable $e) {
+            $to = $today;
+        }
+
+        if ($to->lessThan($from)) {
+            [$from, $to] = [$to, $from];
+        }
+
+        $to = $to->endOfDay();
+
+        return [
+            $from,
+            $to,
+            $from->setTimezone('UTC'),
+            $to->setTimezone('UTC'),
+        ];
     }
 
     private static function coerce($value): ?Carbon

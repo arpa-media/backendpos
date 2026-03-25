@@ -24,7 +24,8 @@ class DashboardService
         $salesBase = Sale::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
             ->where('status', $status)
-            ->whereBetween('created_at', [$from->startOfDay(), $to->endOfDay()]);
+            ->whereDate('created_at', '>=', $from->toDateString())
+            ->whereDate('created_at', '<=', $to->toDateString());
 
         $metrics = (clone $salesBase)
             ->selectRaw('COUNT(*) as trx_count')
@@ -40,7 +41,8 @@ class DashboardService
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
             ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
             ->where('sales.status', $status)
-            ->whereBetween('sales.created_at', [$from->startOfDay(), $to->endOfDay()])
+            ->whereDate('sales.created_at', '>=', $from->toDateString())
+            ->whereDate('sales.created_at', '<=', $to->toDateString())
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sum')
             ->value('qty_sum');
 
@@ -81,7 +83,8 @@ class DashboardService
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
             ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
             ->where('sales.status', $status)
-            ->whereBetween('sales.created_at', [$from->startOfDay(), $to->endOfDay()])
+            ->whereDate('sales.created_at', '>=', $from->toDateString())
+            ->whereDate('sales.created_at', '<=', $to->toDateString())
             ->select('sale_items.variant_id', 'sale_items.product_name', 'sale_items.variant_name')
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sold')
             ->selectRaw('COALESCE(SUM(sale_items.line_total),0) as revenue')
@@ -155,7 +158,7 @@ class DashboardService
 
     private function resolveRange(?string $dateFrom, ?string $dateTo): array
     {
-        $today = CarbonImmutable::now()->startOfDay();
+        $today = CarbonImmutable::today();
 
         $from = $dateFrom ? CarbonImmutable::parse($dateFrom)->startOfDay() : $today;
         $to = $dateTo ? CarbonImmutable::parse($dateTo)->startOfDay() : $today;
