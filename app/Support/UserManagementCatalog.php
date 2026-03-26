@@ -50,6 +50,7 @@ final class UserManagementCatalog
             ['portal_code' => 'warehouse', 'code' => 'warehouse-bill-of-material', 'name' => 'Bill of Material', 'path' => '/bill-of-material', 'sort_order' => 20],
 
             ['portal_code' => 'finance', 'code' => 'finance-dashboard', 'name' => 'Dashboard', 'path' => '/portal/finance/dashboard', 'sort_order' => 10],
+            ['portal_code' => 'finance', 'code' => 'finance-sales-collected', 'name' => 'Sales Collected', 'path' => '/finance/sales-collected', 'sort_order' => 15, 'permission_view' => 'sale.view'],
             ['portal_code' => 'finance', 'code' => 'sales-list', 'name' => 'Sales', 'path' => '/sales', 'sort_order' => 20, 'permission_view' => 'sale.view'],
             ['portal_code' => 'finance', 'code' => 'sales-report', 'name' => 'Report', 'path' => '/reports', 'sort_order' => 30, 'permission_view' => 'report.view'],
             ['portal_code' => 'finance', 'code' => 'finance-cashier-report', 'name' => 'Cashier Report', 'path' => '/finance/cashier-report', 'sort_order' => 35, 'permission_view' => 'report.view'],

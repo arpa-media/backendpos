@@ -12,6 +12,7 @@ use App\Http\Controllers\Api\V1\PosController;
 use App\Http\Controllers\Api\V1\ProductController;
 use App\Http\Controllers\Api\V1\SalesController;
 use App\Http\Controllers\Api\V1\SaleCancelRequestController;
+use App\Http\Controllers\Api\V1\Finance\SalesCollectedController;
 use App\Http\Controllers\Api\V1\AddonController;
 use App\Http\Controllers\Api\V1\TaxController;
 use App\Http\Controllers\Api\V1\ReportController;
@@ -139,6 +140,9 @@ Route::prefix('v1')->group(function () {
          * SALES
          */
         Route::get('/sales', [SalesController::class, 'index'])
+            ->middleware('permission:sale.view');
+
+        Route::get('/finance/sales-collected', [SalesCollectedController::class, 'index'])
             ->middleware('permission:sale.view');
 
         Route::get('/sales/{id}', [SalesController::class, 'show']);
