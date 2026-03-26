@@ -123,20 +123,24 @@ class DashboardService
                 'payment_method_type',
                 'created_at',
             ])
-            ->map(fn ($s) => [
-                'id' => (string) $s->id,
-                'outlet_id' => (string) $s->outlet_id,
-                'sale_number' => (string) $s->sale_number,
-                'channel' => (string) $s->channel,
-                'status' => (string) $s->status,
-                'cashier_name' => $s->cashier_name,
-                'payment_method_name' => $s->payment_method_name,
-                'payment_method_type' => $s->payment_method_type,
-                'grand_total' => (int) $s->grand_total,
-                'paid_total' => (int) $s->paid_total,
-                'change_total' => (int) $s->change_total,
-                'created_at' => TransactionDate::formatLocal($s->created_at, $timezone),
-            ])
+            ->map(function ($s) use ($timezone) {
+                $rawCreatedAt = method_exists($s, 'getRawOriginal') ? $s->getRawOriginal('created_at') : $s->created_at;
+
+                return [
+                    'id' => (string) $s->id,
+                    'outlet_id' => (string) $s->outlet_id,
+                    'sale_number' => (string) $s->sale_number,
+                    'channel' => (string) $s->channel,
+                    'status' => (string) $s->status,
+                    'cashier_name' => $s->cashier_name,
+                    'payment_method_name' => $s->payment_method_name,
+                    'payment_method_type' => $s->payment_method_type,
+                    'grand_total' => (int) $s->grand_total,
+                    'paid_total' => (int) $s->paid_total,
+                    'change_total' => (int) $s->change_total,
+                    'created_at' => TransactionDate::formatLocal($rawCreatedAt, $timezone),
+                ];
+            })
             ->values()
             ->all();
 

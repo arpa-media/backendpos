@@ -7,7 +7,6 @@ use App\Http\Requests\Api\V1\Finance\ListSalesCollectedRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Support\OutletScope;
 use App\Support\TransactionDate;
-use Carbon\Carbon;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
@@ -89,10 +88,10 @@ class SalesCollectedController extends Controller
 
         $items = $rows->map(function ($row) use ($itemsMap) {
             $transactionTimezone = $row->outlet_timezone ?: config('app.timezone', 'Asia/Jakarta');
-            $createdAt = $row->created_at
-                ? Carbon::parse($row->created_at, $transactionTimezone)
-                : null;
             $saleNumber = (string) ($row->sale_number ?? '');
+            $date = TransactionDate::formatLocal($row->created_at, $transactionTimezone, 'Y-m-d');
+            $time = TransactionDate::formatLocal($row->created_at, $transactionTimezone, 'H:i:s');
+            $createdAt = TransactionDate::toIso($row->created_at, $transactionTimezone);
 
             return [
                 'id' => (string) $row->id,
@@ -100,9 +99,9 @@ class SalesCollectedController extends Controller
                 'sale_number' => $saleNumber,
                 'sale_number_short' => mb_substr($saleNumber, -8),
                 'outlet' => (string) ($row->outlet_name ?? '-'),
-                'date' => $createdAt?->format('Y-m-d'),
-                'time' => $createdAt?->format('H:i:s'),
-                'created_at' => $createdAt?->toIso8601String(),
+                'date' => $date,
+                'time' => $time,
+                'created_at' => $createdAt,
                 'gross_sales' => (int) ($row->subtotal ?? 0),
                 'discount' => (int) ($row->discount_total ?? 0),
                 'net_sales' => (int) ($row->net_sales ?? 0),

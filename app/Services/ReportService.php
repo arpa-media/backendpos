@@ -568,9 +568,18 @@ class ReportService
         ];
     }
 
-    private function formatLocalTime($value): ?string
+    private function formatLocalTime($value, ?string $timezone = null): ?string
     {
-        return TransactionDate::formatLocal($value, null, 'H:i');
+        return TransactionDate::formatLocal($value, $timezone, 'H:i');
+    }
+
+    private function rawCreatedAtValue($value)
+    {
+        if ($value instanceof Sale && method_exists($value, 'getRawOriginal')) {
+            return $value->getRawOriginal('created_at') ?: $value->created_at;
+        }
+
+        return $value;
     }
 
     private function resolveSalePaymentMethodName(Sale $sale, $payment = null): string
@@ -686,15 +695,15 @@ class ReportService
             'grand_total' => (int) $sorted->sum('grand_total'),
             'paid_total' => (int) $sorted->sum('paid_total'),
             'items_sold' => (int) $sorted->sum(fn ($sale) => $sale->items->sum('qty')),
-            'first_transaction_at' => TransactionDate::formatLocal($first?->created_at),
-            'first_transaction_time' => $this->formatLocalTime($first?->created_at),
-            'last_transaction_at' => TransactionDate::formatLocal($last?->created_at),
-            'last_transaction_time' => $this->formatLocalTime($last?->created_at),
+            'first_transaction_at' => TransactionDate::formatLocal($this->rawCreatedAtValue($first)),
+            'first_transaction_time' => $this->formatLocalTime($this->rawCreatedAtValue($first)),
+            'last_transaction_at' => TransactionDate::formatLocal($this->rawCreatedAtValue($last)),
+            'last_transaction_time' => $this->formatLocalTime($this->rawCreatedAtValue($last)),
             'payment_methods' => $this->summarizePaymentMethods($sorted),
         ];
     }
 
-    private function normalizeCashierReportParams(array $params): array
+    private function normalizeCashierReportParams(array $params, ?string $outletId = null): array
     {
         if (!empty($params['date']) && empty($params['date_from']) && empty($params['date_to'])) {
             $params['date_from'] = $params['date'];
@@ -702,7 +711,7 @@ class ReportService
         }
 
         if (empty($params['date_from']) && empty($params['date_to'])) {
-            $today = TransactionDate::todayDateString(config('app.timezone', 'Asia/Jakarta'));
+            $today = TransactionDate::todayDateString($this->resolveTimezone($outletId));
             $params['date_from'] = $today;
             $params['date_to'] = $today;
         } elseif (empty($params['date_from']) && !empty($params['date_to'])) {
@@ -724,10 +733,10 @@ class ReportService
             'status' => (string) ($sale->status ?? '-'),
             'cashier_id' => $sale->cashier_id ? (string) $sale->cashier_id : null,
             'cashier_name' => (string) ($sale->cashier_name ?? '-'),
-            'paid_at' => TransactionDate::formatLocal($sale->created_at, $timezone),
-            'transaction_date' => TransactionDate::formatLocal($sale->created_at, $timezone, 'Y-m-d'),
-            'time_only' => $this->formatLocalTime($sale->created_at),
-            'created_at' => TransactionDate::formatLocal($sale->created_at, $timezone),
+            'paid_at' => TransactionDate::formatLocal($this->rawCreatedAtValue($sale), $timezone),
+            'transaction_date' => TransactionDate::formatLocal($this->rawCreatedAtValue($sale), $timezone, 'Y-m-d'),
+            'time_only' => $this->formatLocalTime($this->rawCreatedAtValue($sale), $timezone),
+            'created_at' => TransactionDate::formatLocal($this->rawCreatedAtValue($sale), $timezone),
             'subtotal' => (int) ($sale->subtotal ?? 0),
             'discount_total' => (int) ($sale->discount_total ?? 0),
             'tax_total' => (int) ($sale->tax_total ?? 0),
@@ -766,7 +775,7 @@ class ReportService
 
     public function cashierReport(array $params, ?string $outletId): array
     {
-        $params = $this->normalizeCashierReportParams($params);
+        $params = $this->normalizeCashierReportParams($params, $outletId);
         [$fromLocal, $toLocal, $fromUtc, $toUtc, $timezone] = $this->resolveOutletUtcRange(
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
