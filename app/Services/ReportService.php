@@ -63,6 +63,16 @@ class ReportService
             ->whereDate($column, '<=', $to->toDateString());
     }
 
+    private function applyOutletUtcDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo, ?string $outletId): array
+    {
+        [$fromLocal, $toLocal, $fromUtc, $toUtc] = $this->resolveOutletUtcRange($dateFrom, $dateTo, $outletId);
+
+        $query->where($column, '>=', $fromUtc->toDateTimeString())
+            ->where($column, '<', $toUtc->copy()->addSecond()->toDateTimeString());
+
+        return [$fromLocal, $toLocal, $fromUtc, $toUtc];
+    }
+
     private function paginate(QueryBuilder $q, int $perPage, int $page): LengthAwarePaginator
     {
         // paginate is available on query builder in Laravel
@@ -261,7 +271,7 @@ class ReportService
 
     public function itemSold(array $params, ?string $outletId): array
     {
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$fromLocal, $toLocal] = $this->resolveOutletUtcRange($params['date_from'] ?? null, $params['date_to'] ?? null, $outletId);
         $perPage = (int) ($params['per_page'] ?? 50);
         $page = (int) ($params['page'] ?? 1);
 
@@ -269,7 +279,7 @@ class ReportService
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($q, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyOutletUtcDateRange($q, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $outletId);
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
 
@@ -298,14 +308,14 @@ class ReportService
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($sumQ, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyOutletUtcDateRange($sumQ, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $outletId);
 
         if (!empty($outletId)) $sumQ->where('s.outlet_id', '=', $outletId);
 
         $summary = $sumQ->selectRaw('COUNT(DISTINCT CONCAT(COALESCE(si.product_name, ""), "||", COALESCE(si.variant_name, ""))) as item_count, COALESCE(SUM(si.qty),0) as qty_total, COALESCE(SUM(si.line_total),0) as grand_total')->first();
 
         return [
-            'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
+            'range' => ['date_from' => $fromLocal->toDateString(), 'date_to' => $toLocal->toDateString()],
             'summary' => [
                 'item_count' => (int) ($summary->item_count ?? 0),
                 'qty_total' => (int) ($summary->qty_total ?? 0),

@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Services\MarkingService;
+use Carbon\CarbonImmutable;
 use App\Models\Customer;
 use App\Models\Discount;
 use App\Models\PaymentMethod;
@@ -42,6 +43,8 @@ class PosCheckoutService
         if (!in_array($onlineOrderSource, ['ONLINE', 'GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'], true)) {
             $onlineOrderSource = 'ONLINE';
         }
+
+        $transactionAtLocal = $this->resolveEffectiveTransactionAt($outletId, $payload['transaction_at'] ?? null);
 
         // Discount payload (backward compatible with Phase-1 fields)
         // - Manual (single): discount: { type, value, reason }
@@ -123,7 +126,8 @@ class PosCheckoutService
             $taxName,
             $taxPercent,
             $clientSyncId,
-            $onlineOrderSource
+            $onlineOrderSource,
+            $transactionAtLocal
         ) {
 
             // 0) Optional: validate customer globally.
@@ -544,13 +548,15 @@ class PosCheckoutService
             }
 
             // 9) Create Sale
-            $sale = Sale::query()->create([
+            $saleTimestampUtc = $transactionAtLocal->setTimezone('UTC')->toDateTimeString();
+
+            $sale = new Sale([
                 'outlet_id' => $outletId,
                 'cashier_id' => (string) $user->id,
                 'cashier_name' => (string) ($user->name ?? ''),
 
                 'client_sync_id' => $clientSyncId ?: null,
-                'sale_number' => $this->generateSaleNumber($outletId),
+                'sale_number' => $this->generateSaleNumber($outletId, $transactionAtLocal),
                 'channel' => (string) $saleChannel,
                 'online_order_source' => (string) $onlineOrderSource,
                 'status' => SaleStatuses::PAID,
@@ -601,27 +607,57 @@ class PosCheckoutService
 
                 'note' => $payload['note'] ?? null,
             ]);
+            $sale->created_at = $saleTimestampUtc;
+            $sale->updated_at = $saleTimestampUtc;
+            $sale->save();
 
             // 10) Insert items
             foreach ($saleItems as $item) {
                 $item['sale_id'] = (string) $sale->id;
-                SaleItem::query()->create($item);
+                $saleItem = new SaleItem($item);
+                $saleItem->created_at = $saleTimestampUtc;
+                $saleItem->updated_at = $saleTimestampUtc;
+                $saleItem->save();
             }
 
             // 11) Insert payment (single)
-            SalePayment::query()->create([
+            $salePayment = new SalePayment([
                 'outlet_id' => $outletId,
                 'sale_id' => (string) $sale->id,
                 'payment_method_id' => (string) $pm->id,
                 'amount' => $paid,
                 'reference' => $payment['reference'] ?? null,
             ]);
+            $salePayment->created_at = $saleTimestampUtc;
+            $salePayment->updated_at = $saleTimestampUtc;
+            $salePayment->save();
 
             return $sale->load(['items', 'payments', 'customer', 'outlet']);
         });
     }
 
-    public function generateSaleNumber(string $outletId): string
+    private function resolveEffectiveTransactionAt(string $outletId, $rawTransactionAt = null): CarbonImmutable
+    {
+        $outletTimezone = (string) (DB::table('outlets')->where('id', $outletId)->value('timezone') ?: config('app.timezone', 'Asia/Jakarta'));
+        $nowLocal = CarbonImmutable::now($outletTimezone);
+
+        if (!is_string($rawTransactionAt) || trim($rawTransactionAt) === '') {
+            return $nowLocal;
+        }
+
+        try {
+            $parsed = CarbonImmutable::parse(trim($rawTransactionAt))->setTimezone($outletTimezone);
+            if ($parsed->lt($nowLocal->subDays(31)) || $parsed->gt($nowLocal->addDays(2))) {
+                return $nowLocal;
+            }
+
+            return $parsed;
+        } catch (\Throwable $e) {
+            return $nowLocal;
+        }
+    }
+
+    public function generateSaleNumber(string $outletId, ?CarbonImmutable $transactionAtLocal = null): string
     {
         $outletRow = DB::table('outlets')
             ->where('id', $outletId)
@@ -629,7 +665,9 @@ class PosCheckoutService
             ->first();
 
         $tz = $outletRow?->timezone ?: config('app.timezone', 'Asia/Jakarta');
-        $nowTz = now($tz);
+        $nowTz = $transactionAtLocal
+            ? $transactionAtLocal->setTimezone($tz)
+            : CarbonImmutable::now($tz);
         $today = $nowTz->format('Ymd');
 
         $outletCode = $outletRow?->code;

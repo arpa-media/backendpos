@@ -19,6 +19,7 @@ class CheckoutRequest extends FormRequest
         return [
             'outlet_id' => ['nullable', 'string', 'max:30'],
             'client_sync_id' => ['nullable', 'string', 'max:100'],
+            'transaction_at' => ['nullable', 'string', 'max:50'],
 
             // Backward compat: if items.*.channel not provided, use this channel.
             // Patch-6: allow mixed transaction (DINE_IN + TAKEAWAY) by sending channel=MIXED and item-level channels.
