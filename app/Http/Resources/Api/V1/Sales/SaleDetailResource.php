@@ -18,6 +18,8 @@ class SaleDetailResource extends JsonResource
     {
         $s = $this->resource;
 
+        $rawCreatedAt = method_exists($s, 'getRawOriginal') ? ($s->getRawOriginal('created_at') ?: $s->created_at) : $s->created_at;
+
         $memberCustomer = strtolower(trim((string) ($s->discount_reason ?? ''))) === 'member';
         $printCustomerName = trim((string) ($s->bill_name ?: optional($s->customer)->name ?: ''));
         if ($memberCustomer && $printCustomerName !== '' && stripos($printCustomerName, 'Member ') !== 0) {
@@ -89,9 +91,9 @@ class SaleDetailResource extends JsonResource
             'latest_request_type' => method_exists($s, 'cancelRequests') && $s->relationLoaded('cancelRequests') && $s->cancelRequests->count()
                 ? (string) optional($s->cancelRequests->sortByDesc('created_at')->first())->request_type
                 : null,
-            'created_at' => TransactionDate::toIso($s->created_at, optional($s->outlet)->timezone),
+            'created_at' => TransactionDate::toSaleIso($rawCreatedAt, optional($s->outlet)->timezone, (string) $s->sale_number),
             'updated_at' => TransactionDate::toIso($s->updated_at, optional($s->outlet)->timezone),
-            'created_at_text' => TransactionDate::formatLocal($s->created_at, optional($s->outlet)->timezone),
+            'created_at_text' => TransactionDate::formatSaleLocal($rawCreatedAt, optional($s->outlet)->timezone, (string) $s->sale_number),
             'updated_at_text' => TransactionDate::formatLocal($s->updated_at, optional($s->outlet)->timezone),
         ];
     }

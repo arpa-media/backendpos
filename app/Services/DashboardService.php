@@ -6,7 +6,6 @@ use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Support\SaleStatuses;
 use App\Support\TransactionDate;
-use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\DB;
 
 class DashboardService
@@ -18,20 +17,14 @@ class DashboardService
      */
     public function summary(?string $outletId, array $filters): array
     {
-        $timezone = $this->resolveTimezone($outletId);
-        [$from, $to, $fromQuery, $toQuery] = TransactionDate::dateRange(
-            $filters['date_from'] ?? null,
-            $filters['date_to'] ?? null,
-            $timezone
-        );
-
         $status = $filters['status'] ?? SaleStatuses::PAID;
         $recentLimit = (int) ($filters['recent_limit'] ?? 10);
 
         $salesBase = Sale::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
-            ->where('status', $status)
-            ->whereBetween('created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
+            ->where('status', $status);
+
+        [$from, $to, $fromQuery, $toQuery, $timezone] = $this->applyBusinessDateScope($salesBase, $outletId, $filters);
 
         $metrics = (clone $salesBase)
             ->selectRaw('COUNT(*) as trx_count')
@@ -43,11 +36,12 @@ class DashboardService
         $trxCount = (int) ($metrics->trx_count ?? 0);
         $grossSales = (int) ($metrics->gross_sales ?? 0);
 
-        $itemsSold = (int) SaleItem::query()
+        $itemsSoldQuery = SaleItem::query()
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
             ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
-            ->where('sales.status', $status)
-            ->whereBetween('sales.created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()])
+            ->where('sales.status', $status);
+        $this->applyBusinessDateScope($itemsSoldQuery, $outletId, $filters, 'sales.created_at', 'sales.sale_number');
+        $itemsSold = (int) $itemsSoldQuery
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sum')
             ->value('qty_sum');
 
@@ -84,11 +78,12 @@ class DashboardService
             ->values()
             ->all();
 
-        $topItems = SaleItem::query()
+        $topItemsQuery = SaleItem::query()
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
             ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
-            ->where('sales.status', $status)
-            ->whereBetween('sales.created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()])
+            ->where('sales.status', $status);
+        $this->applyBusinessDateScope($topItemsQuery, $outletId, $filters, 'sales.created_at', 'sales.sale_number');
+        $topItems = $topItemsQuery
             ->select('sale_items.variant_id', 'sale_items.product_name', 'sale_items.variant_name')
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sold')
             ->selectRaw('COALESCE(SUM(sale_items.line_total),0) as revenue')
@@ -123,22 +118,22 @@ class DashboardService
                 'payment_method_type',
                 'created_at',
             ])
-            ->map(function ($s) use ($timezone) {
-                $rawCreatedAt = method_exists($s, 'getRawOriginal') ? $s->getRawOriginal('created_at') : $s->created_at;
+            ->map(function ($sale) use ($timezone) {
+                $rawCreatedAt = method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('created_at') : $sale->created_at;
 
                 return [
-                    'id' => (string) $s->id,
-                    'outlet_id' => (string) $s->outlet_id,
-                    'sale_number' => (string) $s->sale_number,
-                    'channel' => (string) $s->channel,
-                    'status' => (string) $s->status,
-                    'cashier_name' => $s->cashier_name,
-                    'payment_method_name' => $s->payment_method_name,
-                    'payment_method_type' => $s->payment_method_type,
-                    'grand_total' => (int) $s->grand_total,
-                    'paid_total' => (int) $s->paid_total,
-                    'change_total' => (int) $s->change_total,
-                    'created_at' => TransactionDate::formatLocal($rawCreatedAt, $timezone),
+                    'id' => (string) $sale->id,
+                    'outlet_id' => (string) $sale->outlet_id,
+                    'sale_number' => (string) $sale->sale_number,
+                    'channel' => (string) $sale->channel,
+                    'status' => (string) $sale->status,
+                    'cashier_name' => $sale->cashier_name,
+                    'payment_method_name' => $sale->payment_method_name,
+                    'payment_method_type' => $sale->payment_method_type,
+                    'grand_total' => (int) $sale->grand_total,
+                    'paid_total' => (int) $sale->paid_total,
+                    'change_total' => (int) $sale->change_total,
+                    'created_at' => TransactionDate::formatSaleLocal($rawCreatedAt, $timezone, (string) $sale->sale_number),
                 ];
             })
             ->values()
@@ -164,18 +159,34 @@ class DashboardService
         ];
     }
 
-    private function resolveRange(?string $dateFrom, ?string $dateTo): array
+    private function applyBusinessDateScope($query, ?string $outletId, array $filters, string $createdAtColumn = 'created_at', string $saleNumberColumn = 'sale_number'): array
     {
-        $today = CarbonImmutable::today();
+        $timezone = $this->resolveTimezone($outletId);
+        [$fromLocal, $toLocal, $fromQuery, $toQuery] = TransactionDate::dateRange(
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone
+        );
+        $tokens = TransactionDate::dateTokens($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
 
-        $from = $dateFrom ? CarbonImmutable::parse($dateFrom)->startOfDay() : $today;
-        $to = $dateTo ? CarbonImmutable::parse($dateTo)->startOfDay() : $today;
+        $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $tokens, $fromQuery, $toQuery) {
+            $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
+                foreach ($tokens as $index => $token) {
+                    $method = $index === 0 ? 'where' : 'orWhere';
+                    $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
+                }
+            })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery) {
+                $fallbackScope
+                    ->where(function ($legacyScope) use ($saleNumberColumn) {
+                        $legacyScope
+                            ->whereNull($saleNumberColumn)
+                            ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
+                    })
+                    ->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
+            });
+        });
 
-        if ($to->lessThan($from)) {
-            [$from, $to] = [$to, $from];
-        }
-
-        return [$from, $to];
+        return [$fromLocal, $toLocal, $fromQuery, $toQuery, $timezone];
     }
 
     private function resolveTimezone(?string $outletId): string
@@ -188,6 +199,6 @@ class DashboardService
 
         $timezone = DB::table('outlets')->where('id', $outletId)->value('timezone');
 
-        return filled($timezone) ? (string) $timezone : $defaultTimezone;
+        return TransactionDate::normalizeTimezone(filled($timezone) ? (string) $timezone : $defaultTimezone, $defaultTimezone);
     }
 }

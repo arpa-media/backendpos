@@ -89,9 +89,9 @@ class SalesCollectedController extends Controller
         $items = $rows->map(function ($row) use ($itemsMap) {
             $transactionTimezone = $row->outlet_timezone ?: config('app.timezone', 'Asia/Jakarta');
             $saleNumber = (string) ($row->sale_number ?? '');
-            $date = TransactionDate::formatLocal($row->created_at, $transactionTimezone, 'Y-m-d');
-            $time = TransactionDate::formatLocal($row->created_at, $transactionTimezone, 'H:i:s');
-            $createdAt = TransactionDate::toIso($row->created_at, $transactionTimezone);
+            $date = TransactionDate::formatSaleLocal($row->created_at, $transactionTimezone, $saleNumber, 'Y-m-d');
+            $time = TransactionDate::formatSaleLocal($row->created_at, $transactionTimezone, $saleNumber, 'H:i:s');
+            $createdAt = TransactionDate::toSaleIso($row->created_at, $transactionTimezone, $saleNumber);
 
             return [
                 'id' => (string) $row->id,
@@ -203,7 +203,7 @@ class SalesCollectedController extends Controller
 
         return [
             'name' => (string) ($outlet->name ?? 'Outlet'),
-            'timezone' => (string) ($outlet->timezone ?: $defaultTimezone),
+            'timezone' => TransactionDate::normalizeTimezone((string) ($outlet->timezone ?: $defaultTimezone), $defaultTimezone),
         ];
     }
 
@@ -214,6 +214,34 @@ class SalesCollectedController extends Controller
         return [$fromLocal, $toLocal, $fromQuery, $toQuery];
     }
 
+
+private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void
+{
+    $tokens = TransactionDate::dateTokens($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
+
+    if (empty($tokens)) {
+        $query->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
+        return;
+    }
+
+    $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery, $tokens) {
+        $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
+            foreach ($tokens as $index => $token) {
+                $method = $index === 0 ? 'where' : 'orWhere';
+                $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
+            }
+        })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery) {
+            $fallbackScope
+                ->where(function ($legacyScope) use ($saleNumberColumn) {
+                    $legacyScope
+                        ->whereNull($saleNumberColumn)
+                        ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
+                })
+                ->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
+        });
+    });
+}
+
     private function buildBaseQuery(?string $outletId, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
     {
         $query = DB::table('sales as s')
@@ -222,8 +250,9 @@ class SalesCollectedController extends Controller
             ->leftJoinSub($this->channelMapSubquery(), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->whereBetween('s.created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()])
             ->when($outletId, fn ($q) => $q->where('s.outlet_id', $outletId));
+
+        $this->applyBusinessDateScope($query, $fromQuery, $toQuery, $filters, $outletId ? $this->resolveOutletScopeInfo($outletId)['timezone'] : config('app.timezone', 'Asia/Jakarta'));
 
         $this->applySaleNumberFilter($query, (string) ($filters['q'] ?? ''));
 

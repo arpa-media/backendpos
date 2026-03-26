@@ -22,7 +22,7 @@ class ReportService
 
         $timezone = DB::table('outlets')->where('id', $outletId)->value('timezone');
 
-        return filled($timezone) ? (string) $timezone : $defaultTimezone;
+        return TransactionDate::normalizeTimezone(filled($timezone) ? (string) $timezone : $defaultTimezone, $defaultTimezone);
     }
 
     private function resolveOutletUtcRange(?string $dateFrom, ?string $dateTo, ?string $outletId): array
@@ -50,27 +50,75 @@ class ReportService
         return [$fromLocal, $toLocal];
     }
 
-    private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo): array
-    {
-        [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange(
-            $dateFrom,
-            $dateTo,
-            config('app.timezone', 'Asia/Jakarta')
-        );
 
-        $query->whereBetween($column, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
+private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo): array
+{
+    $saleNumberColumn = preg_replace('/created_at$/', 'sale_number', $column);
 
+    return $this->applyBusinessDateScope(
+        $query,
+        is_string($saleNumberColumn) ? $saleNumberColumn : null,
+        $column,
+        $dateFrom,
+        $dateTo,
+        config('app.timezone', 'Asia/Jakarta')
+    );
+}
+
+private function applyOutletUtcDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo, ?string $outletId): array
+{
+    $saleNumberColumn = preg_replace('/created_at$/', 'sale_number', $column);
+    $timezone = $this->resolveTimezone($outletId);
+
+    return $this->applyBusinessDateScope(
+        $query,
+        is_string($saleNumberColumn) ? $saleNumberColumn : null,
+        $column,
+        $dateFrom,
+        $dateTo,
+        $timezone
+    );
+}
+
+
+private function dateTokensForScope(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+{
+    return TransactionDate::dateTokens($dateFrom, $dateTo, $timezone ?: config('app.timezone', 'Asia/Jakarta'));
+}
+
+private function applyBusinessDateScope(object $query, ?string $saleNumberColumn, string $createdAtColumn, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+{
+    [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange(
+        $dateFrom,
+        $dateTo,
+        $timezone ?: config('app.timezone', 'Asia/Jakarta')
+    );
+
+    $tokens = $this->dateTokensForScope($dateFrom, $dateTo, $timezone);
+    if (!$saleNumberColumn || empty($tokens)) {
+        $query->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
         return [$fromLocal, $toLocal, $fromUtc, $toUtc];
     }
 
-    private function applyOutletUtcDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo, ?string $outletId): array
-    {
-        [$fromLocal, $toLocal, $fromUtc, $toUtc] = $this->resolveOutletUtcRange($dateFrom, $dateTo, $outletId);
+    $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $tokens, $fromUtc, $toUtc) {
+        $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
+            foreach ($tokens as $index => $token) {
+                $method = $index === 0 ? 'where' : 'orWhere';
+                $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
+            }
+        })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromUtc, $toUtc) {
+            $fallbackScope
+                ->where(function ($legacyScope) use ($saleNumberColumn) {
+                    $legacyScope
+                        ->whereNull($saleNumberColumn)
+                        ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
+                })
+                ->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
+        });
+    });
 
-        $query->whereBetween($column, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
-
-        return [$fromLocal, $toLocal, $fromUtc, $toUtc];
-    }
+    return [$fromLocal, $toLocal, $fromUtc, $toUtc];
+}
 
     private function paginate(QueryBuilder $q, int $perPage, int $page): LengthAwarePaginator
     {
@@ -570,7 +618,7 @@ class ReportService
 
     private function formatLocalTime($value, ?string $timezone = null): ?string
     {
-        return TransactionDate::formatLocal($value, $timezone, 'H:i');
+        return TransactionDate::formatSaleLocal($value, $timezone, null, 'H:i');
     }
 
     private function rawCreatedAtValue($value)
@@ -682,7 +730,7 @@ class ReportService
             ->all();
     }
 
-    private function summarizeCashierGroup($group): array
+    private function summarizeCashierGroup($group, ?string $timezone = null): array
     {
         $sorted = collect($group)->sortBy('created_at')->values();
         $first = $sorted->first();
@@ -695,10 +743,10 @@ class ReportService
             'grand_total' => (int) $sorted->sum('grand_total'),
             'paid_total' => (int) $sorted->sum('paid_total'),
             'items_sold' => (int) $sorted->sum(fn ($sale) => $sale->items->sum('qty')),
-            'first_transaction_at' => TransactionDate::formatLocal($this->rawCreatedAtValue($first)),
-            'first_transaction_time' => $this->formatLocalTime($this->rawCreatedAtValue($first)),
-            'last_transaction_at' => TransactionDate::formatLocal($this->rawCreatedAtValue($last)),
-            'last_transaction_time' => $this->formatLocalTime($this->rawCreatedAtValue($last)),
+            'first_transaction_at' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($first), $timezone, $first?->sale_number),
+            'first_transaction_time' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($first), $timezone, $first?->sale_number, 'H:i'),
+            'last_transaction_at' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($last), $timezone, $last?->sale_number),
+            'last_transaction_time' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($last), $timezone, $last?->sale_number, 'H:i'),
             'payment_methods' => $this->summarizePaymentMethods($sorted),
         ];
     }
@@ -733,10 +781,10 @@ class ReportService
             'status' => (string) ($sale->status ?? '-'),
             'cashier_id' => $sale->cashier_id ? (string) $sale->cashier_id : null,
             'cashier_name' => (string) ($sale->cashier_name ?? '-'),
-            'paid_at' => TransactionDate::formatLocal($this->rawCreatedAtValue($sale), $timezone),
-            'transaction_date' => TransactionDate::formatLocal($this->rawCreatedAtValue($sale), $timezone, 'Y-m-d'),
-            'time_only' => $this->formatLocalTime($this->rawCreatedAtValue($sale), $timezone),
-            'created_at' => TransactionDate::formatLocal($this->rawCreatedAtValue($sale), $timezone),
+            'paid_at' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($sale), $timezone, (string) $sale->sale_number),
+            'transaction_date' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($sale), $timezone, (string) $sale->sale_number, 'Y-m-d'),
+            'time_only' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($sale), $timezone, (string) $sale->sale_number, 'H:i'),
+            'created_at' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($sale), $timezone, (string) $sale->sale_number),
             'subtotal' => (int) ($sale->subtotal ?? 0),
             'discount_total' => (int) ($sale->discount_total ?? 0),
             'tax_total' => (int) ($sale->tax_total ?? 0),
@@ -784,9 +832,9 @@ class ReportService
 
         $salesQuery = Sale::query()
             ->with(['items', 'payments.paymentMethod'])
-            ->where('status', '=', 'PAID')
-            ->where('created_at', '>=', $fromUtc->toDateTimeString())
-            ->where('created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString());
+            ->where('status', '=', 'PAID');
+
+        $this->applyBusinessDateScope($salesQuery, 'sale_number', 'created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone);
 
         $salesQuery
             ->orderBy('created_at')
@@ -817,7 +865,7 @@ class ReportService
 
         $cashiers = $sales
             ->groupBy(fn ($sale) => $sale->cashier_id ?: 'unknown')
-            ->map(fn ($group) => $this->summarizeCashierGroup($group))
+            ->map(fn ($group) => $this->summarizeCashierGroup($group, $timezone))
             ->values()
             ->sortBy('cashier_name', SORT_NATURAL | SORT_FLAG_CASE)
             ->values()
@@ -826,7 +874,7 @@ class ReportService
         $cashier = null;
         if (!empty($params['cashier_id'])) {
             $selected = $sales->groupBy(fn ($sale) => $sale->cashier_id ?: 'unknown')->first();
-            $cashier = $selected ? $this->summarizeCashierGroup($selected) : [
+            $cashier = $selected ? $this->summarizeCashierGroup($selected, $timezone) : [
                 'cashier_id' => (string) $params['cashier_id'],
                 'cashier_name' => 'Unknown Cashier',
                 'transaction_count' => 0,
