@@ -29,7 +29,9 @@ class ReportService
     {
         $timezone = $this->resolveTimezone($outletId);
 
-        return [...TransactionDate::dateRange($dateFrom, $dateTo, $timezone), $timezone];
+        [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
+
+        return [$fromLocal, $toLocal, $fromUtc, $toUtc, $timezone];
     }
 
     private function formatCreatedAt($value): ?string
@@ -39,36 +41,33 @@ class ReportService
 
     private function resolveRange(?string $dateFrom, ?string $dateTo): array
     {
-        $today = CarbonImmutable::today();
+        [$fromLocal, $toLocal] = TransactionDate::dateRange(
+            $dateFrom,
+            $dateTo,
+            config('app.timezone', 'Asia/Jakarta')
+        );
 
-        $from = $dateFrom
-            ? CarbonImmutable::createFromFormat('Y-m-d', CarbonImmutable::parse($dateFrom)->toDateString())->startOfDay()
-            : $today->startOfDay();
-        $to = $dateTo
-            ? CarbonImmutable::createFromFormat('Y-m-d', CarbonImmutable::parse($dateTo)->toDateString())->startOfDay()
-            : $today->startOfDay();
-
-        if ($to->lessThan($from)) {
-            [$from, $to] = [$to, $from];
-        }
-
-        return [$from, $to->endOfDay()];
+        return [$fromLocal, $toLocal];
     }
 
-    private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo): void
+    private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo): array
     {
-        [$from, $to] = $this->resolveRange($dateFrom, $dateTo);
+        [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange(
+            $dateFrom,
+            $dateTo,
+            config('app.timezone', 'Asia/Jakarta')
+        );
 
-        $query->whereDate($column, '>=', $from->toDateString())
-            ->whereDate($column, '<=', $to->toDateString());
+        $query->whereBetween($column, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
+
+        return [$fromLocal, $toLocal, $fromUtc, $toUtc];
     }
 
     private function applyOutletUtcDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo, ?string $outletId): array
     {
         [$fromLocal, $toLocal, $fromUtc, $toUtc] = $this->resolveOutletUtcRange($dateFrom, $dateTo, $outletId);
 
-        $query->where($column, '>=', $fromUtc->toDateTimeString())
-            ->where($column, '<', $toUtc->copy()->addSecond()->toDateTimeString());
+        $query->whereBetween($column, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
 
         return [$fromLocal, $toLocal, $fromUtc, $toUtc];
     }
@@ -700,6 +699,16 @@ class ReportService
         if (!empty($params['date']) && empty($params['date_from']) && empty($params['date_to'])) {
             $params['date_from'] = $params['date'];
             $params['date_to'] = $params['date'];
+        }
+
+        if (empty($params['date_from']) && empty($params['date_to'])) {
+            $today = TransactionDate::todayDateString(config('app.timezone', 'Asia/Jakarta'));
+            $params['date_from'] = $today;
+            $params['date_to'] = $today;
+        } elseif (empty($params['date_from']) && !empty($params['date_to'])) {
+            $params['date_from'] = $params['date_to'];
+        } elseif (empty($params['date_to']) && !empty($params['date_from'])) {
+            $params['date_to'] = $params['date_from'];
         }
 
         return $params;

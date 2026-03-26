@@ -19,7 +19,7 @@ class DashboardService
     public function summary(?string $outletId, array $filters): array
     {
         $timezone = $this->resolveTimezone($outletId);
-        [$from, $to, $fromUtc, $toUtc] = TransactionDate::dateRange(
+        [$from, $to, $fromQuery, $toQuery] = TransactionDate::dateRange(
             $filters['date_from'] ?? null,
             $filters['date_to'] ?? null,
             $timezone
@@ -31,8 +31,7 @@ class DashboardService
         $salesBase = Sale::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
             ->where('status', $status)
-            ->where('created_at', '>=', $fromUtc->toDateTimeString())
-            ->where('created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString());
+            ->whereBetween('created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
 
         $metrics = (clone $salesBase)
             ->selectRaw('COUNT(*) as trx_count')
@@ -48,8 +47,7 @@ class DashboardService
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
             ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
             ->where('sales.status', $status)
-            ->where('sales.created_at', '>=', $fromUtc->toDateTimeString())
-            ->where('sales.created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString())
+            ->whereBetween('sales.created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()])
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sum')
             ->value('qty_sum');
 
@@ -90,8 +88,7 @@ class DashboardService
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
             ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
             ->where('sales.status', $status)
-            ->where('sales.created_at', '>=', $fromUtc->toDateTimeString())
-            ->where('sales.created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString())
+            ->whereBetween('sales.created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()])
             ->select('sale_items.variant_id', 'sale_items.product_name', 'sale_items.variant_name')
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sold')
             ->selectRaw('COALESCE(SUM(sale_items.line_total),0) as revenue')

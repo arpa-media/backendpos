@@ -27,13 +27,13 @@ class SalesCollectedController extends Controller
         $outletInfo = $this->resolveOutletScopeInfo($outletId);
         $timezone = $outletInfo['timezone'];
 
-        [$fromLocal, $toLocal, $fromUtc, $toUtc] = $this->resolveLocalDateRange(
+        [$fromLocal, $toLocal, $fromQuery, $toQuery] = $this->resolveLocalDateRange(
             $v['date_from'] ?? null,
             $v['date_to'] ?? null,
             $timezone
         );
 
-        $summaryQuery = $this->buildBaseQuery($outletId, $fromUtc, $toUtc, $v, true, true);
+        $summaryQuery = $this->buildBaseQuery($outletId, $fromQuery, $toQuery, $v, true, true);
         $summary = (clone $summaryQuery)
             ->selectRaw('COALESCE(SUM(s.subtotal), 0) as total_gross_sales')
             ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
@@ -42,10 +42,10 @@ class SalesCollectedController extends Controller
             ->selectRaw('COALESCE(SUM(s.grand_total), 0) as total_collected')
             ->first();
 
-        $channelOptions = $this->resolveChannelOptions($outletId, $fromUtc, $toUtc, $v);
-        $paymentOptions = $this->resolvePaymentMethodOptions($outletId, $fromUtc, $toUtc, $v);
+        $channelOptions = $this->resolveChannelOptions($outletId, $fromQuery, $toQuery, $v);
+        $paymentOptions = $this->resolvePaymentMethodOptions($outletId, $fromQuery, $toQuery, $v);
 
-        $rowsQuery = $this->buildBaseQuery($outletId, $fromUtc, $toUtc, $v, true, true)
+        $rowsQuery = $this->buildBaseQuery($outletId, $fromQuery, $toQuery, $v, true, true)
             ->select([
                 's.id',
                 's.sale_number',
@@ -88,8 +88,9 @@ class SalesCollectedController extends Controller
         $itemsMap = $this->resolveItemsTextBySaleIds($saleIds);
 
         $items = $rows->map(function ($row) use ($itemsMap) {
+            $transactionTimezone = $row->outlet_timezone ?: config('app.timezone', 'Asia/Jakarta');
             $createdAt = $row->created_at
-                ? Carbon::parse($row->created_at, 'UTC')->setTimezone($row->outlet_timezone ?: config('app.timezone', 'Asia/Jakarta'))
+                ? Carbon::parse($row->created_at, $transactionTimezone)
                 : null;
             $saleNumber = (string) ($row->sale_number ?? '');
 
@@ -209,12 +210,12 @@ class SalesCollectedController extends Controller
 
     private function resolveLocalDateRange(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
     {
-        [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
+        [$fromLocal, $toLocal, $fromQuery, $toQuery] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
 
-        return [$fromLocal, $toLocal, $fromUtc, $toUtc];
+        return [$fromLocal, $toLocal, $fromQuery, $toQuery];
     }
 
-    private function buildBaseQuery(?string $outletId, CarbonInterface $fromUtc, CarbonInterface $toUtc, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
+    private function buildBaseQuery(?string $outletId, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
     {
         $query = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
@@ -222,8 +223,7 @@ class SalesCollectedController extends Controller
             ->leftJoinSub($this->channelMapSubquery(), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->where('s.created_at', '>=', $fromUtc->toDateTimeString())
-            ->where('s.created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString())
+            ->whereBetween('s.created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()])
             ->when($outletId, fn ($q) => $q->where('s.outlet_id', $outletId));
 
         $this->applySaleNumberFilter($query, (string) ($filters['q'] ?? ''));
@@ -250,9 +250,9 @@ class SalesCollectedController extends Controller
         return $query;
     }
 
-    private function buildFilteredSalesIdSubquery(?string $outletId, CarbonInterface $fromUtc, CarbonInterface $toUtc, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
+    private function buildFilteredSalesIdSubquery(?string $outletId, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
     {
-        return $this->buildBaseQuery($outletId, $fromUtc, $toUtc, $filters, $applyChannelFilter, $applyPaymentFilter)
+        return $this->buildBaseQuery($outletId, $fromQuery, $toQuery, $filters, $applyChannelFilter, $applyPaymentFilter)
             ->select('s.id')
             ->distinct();
     }

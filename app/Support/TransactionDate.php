@@ -40,7 +40,11 @@ class TransactionDate
     }
 
     /**
-     * Resolve a local date range and its UTC equivalent for DB filtering.
+     * Resolve a local date range and the exact database query boundaries.
+     *
+     * All transactional reports in POS use local outlet date scope, so the
+     * returned query boundaries intentionally stay in the same local timezone
+     * as the stored transaction timestamps.
      *
      * @return array{0: CarbonImmutable, 1: CarbonImmutable, 2: CarbonImmutable, 3: CarbonImmutable}
      */
@@ -70,8 +74,8 @@ class TransactionDate
         return [
             $from,
             $to,
-            $from->setTimezone('UTC'),
-            $to->setTimezone('UTC'),
+            $from,
+            $to,
         ];
     }
 
@@ -95,11 +99,13 @@ class TransactionDate
                 return Carbon::parse($value);
             }
 
+            $localTimezone = self::appTimezone();
+
             if (preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $value)) {
-                return Carbon::createFromFormat('Y-m-d H:i:s', $value, 'UTC');
+                return Carbon::createFromFormat('Y-m-d H:i:s', $value, $localTimezone);
             }
 
-            return Carbon::parse($value, 'UTC');
+            return Carbon::parse($value, $localTimezone);
         } catch (\Throwable $e) {
             return null;
         }
