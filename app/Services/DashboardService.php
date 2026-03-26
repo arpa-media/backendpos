@@ -5,7 +5,9 @@ namespace App\Services;
 use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Support\SaleStatuses;
+use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
+use Illuminate\Support\Facades\DB;
 
 class DashboardService
 {
@@ -16,7 +18,12 @@ class DashboardService
      */
     public function summary(?string $outletId, array $filters): array
     {
-        [$from, $to] = $this->resolveRange($filters['date_from'] ?? null, $filters['date_to'] ?? null);
+        $timezone = $this->resolveTimezone($outletId);
+        [$from, $to, $fromUtc, $toUtc] = TransactionDate::dateRange(
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone
+        );
 
         $status = $filters['status'] ?? SaleStatuses::PAID;
         $recentLimit = (int) ($filters['recent_limit'] ?? 10);
@@ -24,8 +31,8 @@ class DashboardService
         $salesBase = Sale::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
             ->where('status', $status)
-            ->whereDate('created_at', '>=', $from->toDateString())
-            ->whereDate('created_at', '<=', $to->toDateString());
+            ->where('created_at', '>=', $fromUtc->toDateTimeString())
+            ->where('created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString());
 
         $metrics = (clone $salesBase)
             ->selectRaw('COUNT(*) as trx_count')
@@ -41,8 +48,8 @@ class DashboardService
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
             ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
             ->where('sales.status', $status)
-            ->whereDate('sales.created_at', '>=', $from->toDateString())
-            ->whereDate('sales.created_at', '<=', $to->toDateString())
+            ->where('sales.created_at', '>=', $fromUtc->toDateTimeString())
+            ->where('sales.created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString())
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sum')
             ->value('qty_sum');
 
@@ -83,8 +90,8 @@ class DashboardService
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
             ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
             ->where('sales.status', $status)
-            ->whereDate('sales.created_at', '>=', $from->toDateString())
-            ->whereDate('sales.created_at', '<=', $to->toDateString())
+            ->where('sales.created_at', '>=', $fromUtc->toDateTimeString())
+            ->where('sales.created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString())
             ->select('sale_items.variant_id', 'sale_items.product_name', 'sale_items.variant_name')
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sold')
             ->selectRaw('COALESCE(SUM(sale_items.line_total),0) as revenue')
@@ -131,7 +138,7 @@ class DashboardService
                 'grand_total' => (int) $s->grand_total,
                 'paid_total' => (int) $s->paid_total,
                 'change_total' => (int) $s->change_total,
-                'created_at' => optional($s->created_at)->format('Y-m-d H:i:s'),
+                'created_at' => TransactionDate::formatLocal($s->created_at, $timezone),
             ])
             ->values()
             ->all();
@@ -168,5 +175,18 @@ class DashboardService
         }
 
         return [$from, $to];
+    }
+
+    private function resolveTimezone(?string $outletId): string
+    {
+        $defaultTimezone = config('app.timezone', 'Asia/Jakarta');
+
+        if (!$outletId) {
+            return $defaultTimezone;
+        }
+
+        $timezone = DB::table('outlets')->where('id', $outletId)->value('timezone');
+
+        return filled($timezone) ? (string) $timezone : $defaultTimezone;
     }
 }

@@ -12,6 +12,26 @@ use Illuminate\Support\Facades\DB;
 class ReportService
 {
 
+    private function resolveTimezone(?string $outletId): string
+    {
+        $defaultTimezone = config('app.timezone', 'Asia/Jakarta');
+
+        if (!$outletId) {
+            return $defaultTimezone;
+        }
+
+        $timezone = DB::table('outlets')->where('id', $outletId)->value('timezone');
+
+        return filled($timezone) ? (string) $timezone : $defaultTimezone;
+    }
+
+    private function resolveOutletUtcRange(?string $dateFrom, ?string $dateTo, ?string $outletId): array
+    {
+        $timezone = $this->resolveTimezone($outletId);
+
+        return [...TransactionDate::dateRange($dateFrom, $dateTo, $timezone), $timezone];
+    }
+
     private function formatCreatedAt($value): ?string
     {
         return TransactionDate::formatLocal($value);
@@ -562,6 +582,43 @@ class ReportService
         return (string) ($candidate ?: '-');
     }
 
+    private function isCashPaymentMethodName(?string $name): bool
+    {
+        $normalized = mb_strtolower(trim((string) $name));
+
+        if ($normalized === '') {
+            return false;
+        }
+
+        return str_contains($normalized, 'cash') || str_contains($normalized, 'tunai');
+    }
+
+    private function resolvePaymentSnapshotAmount(Sale $sale, $payment = null): int
+    {
+        $paymentName = $this->resolveSalePaymentMethodName($sale, $payment);
+        $amount = (int) ($payment?->amount ?? 0);
+        $changeTotal = max(0, (int) ($sale->change_total ?? 0));
+
+        if ($payment && $amount > 0) {
+            if ($this->isCashPaymentMethodName($paymentName) && $changeTotal > 0) {
+                return max(0, $amount - $changeTotal);
+            }
+
+            return $amount;
+        }
+
+        if (($sale->grand_total ?? 0) > 0) {
+            return (int) $sale->grand_total;
+        }
+
+        $paidTotal = (int) ($sale->paid_total ?? 0);
+        if ($this->isCashPaymentMethodName($paymentName) && $changeTotal > 0) {
+            return max(0, $paidTotal - $changeTotal);
+        }
+
+        return $paidTotal;
+    }
+
     private function summarizePaymentMethods($sales): array
     {
         $totals = [];
@@ -578,7 +635,7 @@ class ReportService
                             'transaction_count' => 0,
                         ];
                     }
-                    $totals[$name]['total'] += (int) ($payment->amount ?? 0);
+                    $totals[$name]['total'] += $this->resolvePaymentSnapshotAmount($sale, $payment);
                     $totals[$name]['transaction_count'] += 1;
                 }
                 continue;
@@ -592,7 +649,7 @@ class ReportService
                     'transaction_count' => 0,
                 ];
             }
-            $totals[$name]['total'] += (int) (($sale->paid_total ?? 0) > 0 ? $sale->paid_total : ($sale->grand_total ?? 0));
+            $totals[$name]['total'] += $this->resolvePaymentSnapshotAmount($sale, null);
             $totals[$name]['transaction_count'] += 1;
         }
 
@@ -638,7 +695,7 @@ class ReportService
         return $params;
     }
 
-    private function transformCashierReportSale(Sale $sale): array
+    private function transformCashierReportSaleWithTimezone(Sale $sale, ?string $timezone = null): array
     {
         return [
             'id' => (string) $sale->id,
@@ -648,10 +705,10 @@ class ReportService
             'status' => (string) ($sale->status ?? '-'),
             'cashier_id' => $sale->cashier_id ? (string) $sale->cashier_id : null,
             'cashier_name' => (string) ($sale->cashier_name ?? '-'),
-            'paid_at' => TransactionDate::formatLocal($sale->created_at),
-            'transaction_date' => TransactionDate::formatLocal($sale->created_at, null, 'Y-m-d'),
+            'paid_at' => TransactionDate::formatLocal($sale->created_at, $timezone),
+            'transaction_date' => TransactionDate::formatLocal($sale->created_at, $timezone, 'Y-m-d'),
             'time_only' => $this->formatLocalTime($sale->created_at),
-            'created_at' => TransactionDate::formatLocal($sale->created_at),
+            'created_at' => TransactionDate::formatLocal($sale->created_at, $timezone),
             'subtotal' => (int) ($sale->subtotal ?? 0),
             'discount_total' => (int) ($sale->discount_total ?? 0),
             'tax_total' => (int) ($sale->tax_total ?? 0),
@@ -665,7 +722,7 @@ class ReportService
                 'id' => (string) $payment->id,
                 'payment_method_id' => $payment->payment_method_id ? (string) $payment->payment_method_id : null,
                 'payment_method_name' => $this->resolveSalePaymentMethodName($sale, $payment),
-                'amount' => (int) ($payment->amount ?? 0),
+                'amount' => $this->resolvePaymentSnapshotAmount($sale, $payment),
                 'reference' => $payment->reference,
             ])->values()->all(),
             'items' => $sale->items->map(function ($item) {
@@ -683,16 +740,25 @@ class ReportService
         ];
     }
 
+    private function transformCashierReportSale(Sale $sale): array
+    {
+        return $this->transformCashierReportSaleWithTimezone($sale);
+    }
+
     public function cashierReport(array $params, ?string $outletId): array
     {
         $params = $this->normalizeCashierReportParams($params);
-        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        [$fromLocal, $toLocal, $fromUtc, $toUtc, $timezone] = $this->resolveOutletUtcRange(
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $outletId
+        );
 
         $salesQuery = Sale::query()
             ->with(['items', 'payments.paymentMethod'])
-            ->where('status', '=', 'PAID');
-
-        $this->applyDateRange($salesQuery, 'created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+            ->where('status', '=', 'PAID')
+            ->where('created_at', '>=', $fromUtc->toDateTimeString())
+            ->where('created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString());
 
         $salesQuery
             ->orderBy('created_at')
@@ -749,14 +815,14 @@ class ReportService
 
         return [
             'range' => [
-                'date_from' => $from->toDateString(),
-                'date_to' => $to->toDateString(),
-                'date' => $from->toDateString(),
+                'date_from' => $fromLocal->toDateString(),
+                'date_to' => $toLocal->toDateString(),
+                'date' => $fromLocal->toDateString(),
             ],
             'cashier' => $cashier,
             'summary' => $summary,
             'cashiers' => $cashiers,
-            'sales' => $sales->map(fn (Sale $sale) => $this->transformCashierReportSale($sale))->values()->all(),
+            'sales' => $sales->map(fn (Sale $sale) => $this->transformCashierReportSaleWithTimezone($sale, $timezone))->values()->all(),
         ];
     }
 

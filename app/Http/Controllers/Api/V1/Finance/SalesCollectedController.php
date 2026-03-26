@@ -7,9 +7,9 @@ use App\Http\Requests\Api\V1\Finance\ListSalesCollectedRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Support\OutletScope;
 use App\Support\TransactionDate;
+use Carbon\Carbon;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
 class SalesCollectedController extends Controller
@@ -27,7 +27,7 @@ class SalesCollectedController extends Controller
         $outletInfo = $this->resolveOutletScopeInfo($outletId);
         $timezone = $outletInfo['timezone'];
 
-        [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange(
+        [$fromLocal, $toLocal, $fromUtc, $toUtc] = $this->resolveLocalDateRange(
             $v['date_from'] ?? null,
             $v['date_to'] ?? null,
             $timezone
@@ -39,7 +39,7 @@ class SalesCollectedController extends Controller
             ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
             ->selectRaw('COALESCE(SUM(GREATEST(s.subtotal - s.discount_total, 0)), 0) as total_net_sales')
             ->selectRaw('COALESCE(SUM(s.tax_total), 0) as total_tax')
-            ->selectRaw('COALESCE(SUM(GREATEST(s.subtotal - s.discount_total, 0) + s.tax_total), 0) as total_collected')
+            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as total_collected')
             ->first();
 
         $channelOptions = $this->resolveChannelOptions($outletId, $fromUtc, $toUtc, $v);
@@ -62,7 +62,7 @@ class SalesCollectedController extends Controller
                 's.cashier_name',
             ])
             ->selectRaw('GREATEST(s.subtotal - s.discount_total, 0) as net_sales')
-            ->selectRaw('GREATEST(s.subtotal - s.discount_total, 0) + s.tax_total as total_collected')
+            ->selectRaw('s.grand_total as total_collected')
             ->selectRaw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel")
             ->selectRaw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display");
 
@@ -207,6 +207,13 @@ class SalesCollectedController extends Controller
         ];
     }
 
+    private function resolveLocalDateRange(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
+
+        return [$fromLocal, $toLocal, $fromUtc, $toUtc];
+    }
+
     private function buildBaseQuery(?string $outletId, CarbonInterface $fromUtc, CarbonInterface $toUtc, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
     {
         $query = DB::table('sales as s')
@@ -215,7 +222,8 @@ class SalesCollectedController extends Controller
             ->leftJoinSub($this->channelMapSubquery(), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->whereBetween('s.created_at', [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()])
+            ->where('s.created_at', '>=', $fromUtc->toDateTimeString())
+            ->where('s.created_at', '<', $toUtc->copy()->addSecond()->toDateTimeString())
             ->when($outletId, fn ($q) => $q->where('s.outlet_id', $outletId));
 
         $this->applySaleNumberFilter($query, (string) ($filters['q'] ?? ''));
@@ -266,9 +274,9 @@ class SalesCollectedController extends Controller
         });
     }
 
-    private function resolveChannelOptions(?string $outletId, CarbonInterface $fromUtc, CarbonInterface $toUtc, array $filters): array
+    private function resolveChannelOptions(?string $outletId, CarbonInterface $fromLocal, CarbonInterface $toLocal, array $filters): array
     {
-        return (clone $this->buildBaseQuery($outletId, $fromUtc, $toUtc, $filters, false, true))
+        return (clone $this->buildBaseQuery($outletId, $fromLocal, $toLocal, $filters, false, true))
             ->selectRaw("TRIM(COALESCE(NULLIF(channel_map.display_channel, ''), '')) as channel_value")
             ->distinct()
             ->orderBy('channel_value')
@@ -346,9 +354,9 @@ class SalesCollectedController extends Controller
             ->groupBy('si.sale_id');
     }
 
-    private function resolvePaymentMethodOptions(?string $outletId, CarbonInterface $fromUtc, CarbonInterface $toUtc, array $filters): array
+    private function resolvePaymentMethodOptions(?string $outletId, CarbonInterface $fromLocal, CarbonInterface $toLocal, array $filters): array
     {
-        $filteredSales = $this->buildFilteredSalesIdSubquery($outletId, $fromUtc, $toUtc, $filters, true, false);
+        $filteredSales = $this->buildFilteredSalesIdSubquery($outletId, $fromLocal, $toLocal, $filters, true, false);
 
         $snapshotOptions = DB::query()
             ->fromSub($filteredSales, 'fs')
