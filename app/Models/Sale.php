@@ -19,6 +19,7 @@ class Sale extends Model
         'cashier_name',
         'client_sync_id',
         'sale_number',
+        'queue_no',
         'channel',
         'online_order_source',
         'status',
