@@ -14,6 +14,7 @@ class SaleListResource extends JsonResource
     public function toArray($request): array
     {
         $s = $this->resource;
+        $rawCreatedAt = method_exists($s, 'getRawOriginal') ? ($s->getRawOriginal('created_at') ?: $s->created_at) : $s->created_at;
 
         return [
             'id' => (string) $s->id,
