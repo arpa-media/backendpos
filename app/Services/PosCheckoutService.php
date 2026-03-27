@@ -124,7 +124,8 @@ class PosCheckoutService
             $taxName,
             $taxPercent,
             $clientSyncId,
-            $onlineOrderSource
+            $onlineOrderSource,
+            $queueNo
         ) {
 
             // 0) Optional: validate customer globally.
