@@ -118,4 +118,36 @@ class PosController extends Controller
 
         return ApiResponse::ok(new SaleResource($sale), 'Checkout success', 201);
     }
+
+    public function offlineSyncAudit(CheckoutRequest $request)
+    {
+        $outletId = $this->resolveOutletId($request);
+
+        if (!$outletId) {
+            return ApiResponse::error('Outlet scope is required for POS offline audit', 'OUTLET_SCOPE_REQUIRED', 422);
+        }
+
+        return ApiResponse::ok(
+            $this->service->auditOfflinePayload($outletId, $request->validated()),
+            'Offline sync audit success'
+        );
+    }
+
+    public function offlineSyncRescue(CheckoutRequest $request)
+    {
+        $outletId = $this->resolveOutletId($request);
+
+        if (!$outletId) {
+            return ApiResponse::error('Outlet scope is required for POS offline rescue', 'OUTLET_SCOPE_REQUIRED', 422);
+        }
+
+        $rescuedPayload = $this->service->rescueOfflinePayload($outletId, $request->validated());
+        $sale = $this->service->checkout($request->user(), $outletId, $rescuedPayload);
+
+        return ApiResponse::ok([
+            'sale' => new SaleResource($sale),
+            'audit' => $this->service->auditOfflinePayload($outletId, $rescuedPayload),
+            'rescue_applied' => true,
+        ], 'Offline sync rescue success', 201);
+    }
 }

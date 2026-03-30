@@ -55,6 +55,11 @@ class PosCheckoutService
         $transactionAtTz = $this->resolveTransactionMoment($transactionAtInput !== '' ? $transactionAtInput : null, $outletTimezone);
         $transactionAtUtc = $transactionAtTz->copy()->utc();
         $offlineSnapshot = is_array($payload['offline_snapshot'] ?? null) ? $payload['offline_snapshot'] : [];
+        $rawItems = is_array($payload['items'] ?? null) ? $payload['items'] : [];
+        $hasItemSnapshotPricing = collect($rawItems)->contains(function ($row) {
+            return is_array($row)
+                && (array_key_exists('unit_price_snapshot', $row) || array_key_exists('line_total_snapshot', $row));
+        });
         $preferredSaleNumber = trim((string) ($offlineSnapshot['preferred_sale_number'] ?? ''));
 
         // Discount payload (backward compatible with Phase-1 fields)
@@ -179,7 +184,7 @@ class PosCheckoutService
                 }
             }
 
-            $useOfflineSnapshot = !empty($offlineSnapshot);
+            $useOfflineSnapshot = !empty($offlineSnapshot) || $hasItemSnapshotPricing;
 
             // 1) Validate payment method: global active + enabled in outlet via pivot
             $pm = PaymentMethod::query()
@@ -378,11 +383,18 @@ class PosCheckoutService
                     ]);
                 }
 
-                $snapshotUnitPrice = isset($row['unit_price_snapshot']) ? (int) $row['unit_price_snapshot'] : null;
-                $snapshotLineTotal = isset($row['line_total_snapshot']) ? (int) $row['line_total_snapshot'] : null;
+                $snapshotUnitPrice = is_numeric($row['unit_price_snapshot'] ?? null) ? (int) round((float) $row['unit_price_snapshot']) : null;
+                $snapshotLineTotal = is_numeric($row['line_total_snapshot'] ?? null) ? (int) round((float) $row['line_total_snapshot']) : null;
+                $hasSnapshotPricing = ($snapshotUnitPrice !== null && $snapshotUnitPrice >= 0)
+                    || ($snapshotLineTotal !== null && $snapshotLineTotal >= 0);
 
-                if ($useOfflineSnapshot && $snapshotUnitPrice !== null && $snapshotUnitPrice >= 0) {
-                    $unitPrice = $snapshotUnitPrice;
+                if ($hasSnapshotPricing) {
+                    if ($snapshotUnitPrice === null || $snapshotUnitPrice < 0) {
+                        $unitPrice = $qty > 0 ? (int) round($snapshotLineTotal / max(1, $qty)) : 0;
+                    } else {
+                        $unitPrice = $snapshotUnitPrice;
+                    }
+
                     $lineTotal = $snapshotLineTotal !== null && $snapshotLineTotal >= 0
                         ? $snapshotLineTotal
                         : ($unitPrice * $qty);
@@ -876,4 +888,244 @@ class PosCheckoutService
 
         return $maxSequence + 1;
     }
+
+
+    public function auditOfflinePayload(string $outletId, array $payload): array
+    {
+        $payloadChannel = strtoupper(trim((string) ($payload['channel'] ?? '')));
+        $clientSyncId = isset($payload['client_sync_id']) ? trim((string) $payload['client_sync_id']) : null;
+        $queueNo = trim((string) ($payload['queue_no'] ?? ''));
+        $outletRow = DB::table('outlets')
+            ->where('id', $outletId)
+            ->select(['id', 'code', 'name', 'timezone'])
+            ->first();
+
+        $outletTimezone = $outletRow?->timezone ?: config('app.timezone', 'Asia/Jakarta');
+        $transactionAtInput = isset($payload['transaction_at']) ? trim((string) $payload['transaction_at']) : '';
+        $transactionAtTz = $this->resolveTransactionMoment($transactionAtInput !== '' ? $transactionAtInput : null, $outletTimezone);
+
+        $existingSale = null;
+        if ($clientSyncId !== null && $clientSyncId !== '') {
+            $existingSale = Sale::query()
+                ->where('client_sync_id', $clientSyncId)
+                ->where('outlet_id', $outletId)
+                ->first(['id', 'sale_number', 'queue_no', 'created_at']);
+        }
+
+        $paymentMethodId = $payload['payment']['payment_method_id'] ?? null;
+        $paymentStrict = null;
+        $paymentLoose = null;
+        if ($paymentMethodId) {
+            $paymentStrict = PaymentMethod::query()
+                ->where('id', $paymentMethodId)
+                ->where('is_active', true)
+                ->whereHas('outlets', function ($q) use ($outletId) {
+                    $q->where('outlets.id', $outletId)
+                        ->where('outlet_payment_method.is_active', true);
+                })
+                ->first(['id', 'name', 'type', 'is_active']);
+
+            $paymentLoose = PaymentMethod::query()
+                ->where('id', $paymentMethodId)
+                ->first(['id', 'name', 'type', 'is_active']);
+        }
+
+        $items = is_array($payload['items'] ?? null) ? $payload['items'] : [];
+        $itemAudits = [];
+        $summary = [
+            'items_total' => count($items),
+            'items_missing_snapshot_price' => 0,
+            'items_missing_live_price' => 0,
+            'items_rescuable_from_live_price' => 0,
+        ];
+
+        foreach ($items as $idx => $row) {
+            $productId = (string) ($row['product_id'] ?? '');
+            $variantId = isset($row['variant_id']) && $row['variant_id'] !== null && $row['variant_id'] !== ''
+                ? (string) $row['variant_id']
+                : null;
+            $qty = max(1, (int) ($row['qty'] ?? 1));
+            $itemChannel = strtoupper(trim((string) ($row['channel'] ?? $payloadChannel)));
+            $snapshotUnitPrice = is_numeric($row['unit_price_snapshot'] ?? null) ? (int) round((float) $row['unit_price_snapshot']) : null;
+            $snapshotLineTotal = is_numeric($row['line_total_snapshot'] ?? null) ? (int) round((float) $row['line_total_snapshot']) : null;
+            $hasSnapshotPricing = ($snapshotUnitPrice !== null && $snapshotUnitPrice >= 0)
+                || ($snapshotLineTotal !== null && $snapshotLineTotal >= 0);
+
+            $variantResolution = 'provided';
+            if (!$variantId && $productId !== '') {
+                $variants = ProductVariant::query()
+                    ->where('outlet_id', $outletId)
+                    ->where('product_id', $productId)
+                    ->where('is_active', true)
+                    ->get(['id']);
+                if ($variants->count() === 1) {
+                    $variantId = (string) $variants->first()->id;
+                    $variantResolution = 'auto-single-variant';
+                } elseif ($variants->count() > 1) {
+                    $variantResolution = 'missing-multiple-variants';
+                } else {
+                    $variantResolution = 'missing-no-variant';
+                }
+            } elseif (!$variantId) {
+                $variantResolution = 'missing-product-and-variant';
+            }
+
+            $variant = null;
+            if ($variantId) {
+                $variant = ProductVariant::query()
+                    ->where('outlet_id', $outletId)
+                    ->where('id', $variantId)
+                    ->with(['product:id,name,category_id', 'product.category:id,name,slug,kind'])
+                    ->first();
+            }
+
+            $livePriceRow = null;
+            if ($variantId && in_array($itemChannel, [SalesChannels::DINE_IN, SalesChannels::TAKEAWAY, SalesChannels::DELIVERY], true)) {
+                $livePriceRow = ProductVariantPrice::query()
+                    ->where('outlet_id', $outletId)
+                    ->where('variant_id', $variantId)
+                    ->where('channel', $itemChannel)
+                    ->first(['price']);
+            }
+
+            $summary['items_missing_snapshot_price'] += $hasSnapshotPricing ? 0 : 1;
+            $summary['items_missing_live_price'] += $livePriceRow ? 0 : 1;
+            $summary['items_rescuable_from_live_price'] += (!$hasSnapshotPricing && $livePriceRow) ? 1 : 0;
+
+            $itemAudits[] = [
+                'index' => $idx,
+                'product_id' => $productId !== '' ? $productId : null,
+                'variant_id' => $variantId,
+                'qty' => $qty,
+                'channel' => $itemChannel !== '' ? $itemChannel : null,
+                'product_name' => $row['product_name'] ?? ($variant?->product?->name),
+                'variant_name' => $row['variant_name'] ?? ($variant?->name),
+                'variant_resolution' => $variantResolution,
+                'has_snapshot_pricing' => $hasSnapshotPricing,
+                'snapshot_unit_price' => $snapshotUnitPrice,
+                'snapshot_line_total' => $snapshotLineTotal,
+                'live_price_found' => (bool) $livePriceRow,
+                'live_unit_price' => $livePriceRow ? (int) $livePriceRow->price : null,
+                'rescue_possible' => (!$hasSnapshotPricing && $livePriceRow !== null),
+                'category_name' => $row['category_name_snapshot'] ?? ($variant?->product?->category?->name),
+                'category_kind' => $row['category_kind_snapshot'] ?? ($variant?->product?->category?->kind),
+            ];
+        }
+
+        return [
+            'outlet' => [
+                'id' => (string) $outletId,
+                'code' => $outletRow?->code,
+                'name' => $outletRow?->name,
+                'timezone' => $outletTimezone,
+            ],
+            'client_sync_id' => $clientSyncId,
+            'queue_no' => $queueNo !== '' ? $queueNo : null,
+            'transaction_at' => $transactionAtTz->toIso8601String(),
+            'existing_sale' => $existingSale ? [
+                'id' => (string) $existingSale->id,
+                'sale_number' => (string) $existingSale->sale_number,
+                'queue_no' => (string) ($existingSale->queue_no ?? ''),
+                'created_at' => optional($existingSale->created_at)->toIso8601String(),
+            ] : null,
+            'payment' => [
+                'payment_method_id' => $paymentMethodId ? (string) $paymentMethodId : null,
+                'strict_found' => (bool) $paymentStrict,
+                'loose_found' => (bool) $paymentLoose,
+                'name' => $paymentStrict?->name ?? $paymentLoose?->name,
+                'type' => $paymentStrict?->type ?? $paymentLoose?->type,
+                'strict_hint' => $paymentStrict ? 'active-in-outlet' : ($paymentLoose ? 'exists-but-disabled-for-outlet' : 'missing'),
+            ],
+            'summary' => [
+                ...$summary,
+                'rescue_candidates' => array_values(array_filter(array_map(function ($item) {
+                    return $item['rescue_possible'] ? $item['index'] : null;
+                }, $itemAudits), fn ($v) => $v !== null)),
+            ],
+            'items' => $itemAudits,
+        ];
+    }
+
+    public function rescueOfflinePayload(string $outletId, array $payload): array
+    {
+        $payloadChannel = strtoupper(trim((string) ($payload['channel'] ?? '')));
+        $items = is_array($payload['items'] ?? null) ? $payload['items'] : [];
+
+        foreach ($items as $idx => $row) {
+            $snapshotUnitPrice = is_numeric($row['unit_price_snapshot'] ?? null) ? (int) round((float) $row['unit_price_snapshot']) : null;
+            $snapshotLineTotal = is_numeric($row['line_total_snapshot'] ?? null) ? (int) round((float) $row['line_total_snapshot']) : null;
+            $hasSnapshotPricing = ($snapshotUnitPrice !== null && $snapshotUnitPrice >= 0)
+                || ($snapshotLineTotal !== null && $snapshotLineTotal >= 0);
+            if ($hasSnapshotPricing) {
+                continue;
+            }
+
+            $variantId = isset($row['variant_id']) && $row['variant_id'] !== null && $row['variant_id'] !== ''
+                ? (string) $row['variant_id']
+                : null;
+            $productId = isset($row['product_id']) ? (string) $row['product_id'] : '';
+            $qty = max(1, (int) ($row['qty'] ?? 1));
+            $itemChannel = strtoupper(trim((string) ($row['channel'] ?? $payloadChannel)));
+
+            if (!$variantId && $productId !== '') {
+                $variants = ProductVariant::query()
+                    ->where('outlet_id', $outletId)
+                    ->where('product_id', $productId)
+                    ->where('is_active', true)
+                    ->get(['id']);
+                if ($variants->count() === 1) {
+                    $variantId = (string) $variants->first()->id;
+                    $items[$idx]['variant_id'] = $variantId;
+                }
+            }
+
+            if (!$variantId || !in_array($itemChannel, [SalesChannels::DINE_IN, SalesChannels::TAKEAWAY, SalesChannels::DELIVERY], true)) {
+                continue;
+            }
+
+            $priceRow = ProductVariantPrice::query()
+                ->where('outlet_id', $outletId)
+                ->where('variant_id', $variantId)
+                ->where('channel', $itemChannel)
+                ->first(['price']);
+
+            if (!$priceRow) {
+                continue;
+            }
+
+            $variant = ProductVariant::query()
+                ->where('outlet_id', $outletId)
+                ->where('id', $variantId)
+                ->with(['product:id,name,category_id', 'product.category:id,name,slug,kind'])
+                ->first();
+
+            $unitPrice = (int) $priceRow->price;
+            $items[$idx]['unit_price_snapshot'] = $unitPrice;
+            $items[$idx]['line_total_snapshot'] = $unitPrice * $qty;
+            if (empty($items[$idx]['product_name']) && $variant?->product?->name) {
+                $items[$idx]['product_name'] = (string) $variant->product->name;
+            }
+            if (empty($items[$idx]['variant_name']) && $variant?->name) {
+                $items[$idx]['variant_name'] = (string) $variant->name;
+            }
+            if (empty($items[$idx]['category_id_snapshot']) && $variant?->product?->category_id) {
+                $items[$idx]['category_id_snapshot'] = (string) $variant->product->category_id;
+            }
+            if (empty($items[$idx]['category_kind_snapshot']) && $variant?->product?->category?->kind) {
+                $items[$idx]['category_kind_snapshot'] = (string) $variant->product->category->kind;
+            }
+            if (empty($items[$idx]['category_name_snapshot']) && $variant?->product?->category?->name) {
+                $items[$idx]['category_name_snapshot'] = (string) $variant->product->category->name;
+            }
+            if (empty($items[$idx]['category_slug_snapshot']) && $variant?->product?->category?->slug) {
+                $items[$idx]['category_slug_snapshot'] = (string) $variant->product->category->slug;
+            }
+        }
+
+        $payload['items'] = $items;
+        $payload['outlet_id'] = $payload['outlet_id'] ?? $outletId;
+
+        return $payload;
+    }
+
 }

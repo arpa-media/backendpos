@@ -103,6 +103,12 @@ Route::prefix('v1')->group(function () {
 
             Route::post('/checkout', [PosController::class, 'checkout'])
                 ->middleware('permission:pos.checkout');
+
+            Route::post('/offline-sync-audit', [PosController::class, 'offlineSyncAudit'])
+                ->middleware('permission:pos.checkout');
+
+            Route::post('/offline-sync-rescue', [PosController::class, 'offlineSyncRescue'])
+                ->middleware('permission:pos.checkout');
         });
 
 
