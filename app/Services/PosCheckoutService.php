@@ -637,7 +637,7 @@ class PosCheckoutService
 
                 'client_sync_id' => $clientSyncId ?: null,
                 'sale_number' => $this->resolveRequestedSaleNumber($outletId, $preferredSaleNumber, $transactionAtTz),
-                'queue_no' => $queueNo !== '' ? $queueNo : $this->generateQueueNumber($outletId, $transactionAtTz),
+                'queue_no' => $this->resolveRequestedQueueNumber($outletId, $queueNo !== '' ? $queueNo : null, $transactionAtTz, $clientSyncId),
                 'channel' => (string) $saleChannel,
                 'online_order_source' => (string) $onlineOrderSource,
                 'status' => SaleStatuses::PAID,
@@ -720,6 +720,47 @@ class PosCheckoutService
         $nextCount = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
 
         return str_pad((string) $nextCount, 3, '0', STR_PAD_LEFT);
+    }
+
+    private function resolveRequestedQueueNumber(string $outletId, ?string $requestedQueueNo, $transactionMoment = null, ?string $clientSyncId = null): string
+    {
+        $requested = strtoupper(trim((string) ($requestedQueueNo ?? '')));
+        $requested = preg_replace('/[^A-Z0-9-]+/', '', $requested) ?? '';
+        $requested = substr($requested, 0, 20);
+
+        if ($requested === '') {
+            return $this->generateQueueNumber($outletId, $transactionMoment);
+        }
+
+        $exists = Sale::query()
+            ->where('outlet_id', $outletId)
+            ->where('queue_no', $requested)
+            ->lockForUpdate()
+            ->exists();
+
+        if (!$exists) {
+            return $requested;
+        }
+
+        $context = $this->resolveSaleSequenceContext($outletId, $transactionMoment);
+        $nextCount = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
+        $counter = str_pad((string) $nextCount, 3, '0', STR_PAD_LEFT);
+        $base = preg_replace('/[^A-Z0-9]/', '', strtoupper((string) ($clientSyncId ?? '')));
+        $suffix = substr($base, 0, 4);
+        if ($suffix === '') {
+            $suffix = Str::upper(Str::random(4));
+        }
+
+        $candidate = sprintf('%s-%s', $counter, str_pad($suffix, 4, 'X'));
+        $candidate = substr($candidate, 0, 20);
+
+        $candidateExists = Sale::query()
+            ->where('outlet_id', $outletId)
+            ->where('queue_no', $candidate)
+            ->lockForUpdate()
+            ->exists();
+
+        return $candidateExists ? sprintf('%s-%s', $counter, Str::upper(Str::random(4))) : $candidate;
     }
 
     public function generateSaleNumber(string $outletId, $transactionMoment = null): string
