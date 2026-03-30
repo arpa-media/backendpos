@@ -15,6 +15,29 @@ use Illuminate\Http\Request;
 
 class PosController extends Controller
 {
+    private function shouldHydrateOfflinePayload(array $payload): bool
+    {
+        if (trim((string) ($payload['client_sync_id'] ?? '')) !== '') {
+            return true;
+        }
+
+        if (is_array($payload['offline_snapshot'] ?? null) && !empty($payload['offline_snapshot'])) {
+            return true;
+        }
+
+        $items = is_array($payload['items'] ?? null) ? $payload['items'] : [];
+        foreach ($items as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            if (array_key_exists('unit_price_snapshot', $row) || array_key_exists('line_total_snapshot', $row)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
     public function __construct(
         private readonly PosCheckoutService $service,
         private readonly DiscountSquadService $discountSquadService,
@@ -114,7 +137,12 @@ class PosController extends Controller
             return ApiResponse::error('Outlet scope is required for POS checkout', 'OUTLET_SCOPE_REQUIRED', 422);
         }
 
-        $sale = $this->service->checkout($request->user(), $outletId, $request->validated());
+        $payload = $request->validated();
+        if ($this->shouldHydrateOfflinePayload($payload)) {
+            $payload = $this->service->rescueOfflinePayload($outletId, $payload);
+        }
+
+        $sale = $this->service->checkout($request->user(), $outletId, $payload);
 
         return ApiResponse::ok(new SaleResource($sale), 'Checkout success', 201);
     }

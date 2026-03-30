@@ -24,6 +24,29 @@ use Illuminate\Validation\ValidationException;
 
 class PosCheckoutService
 {
+    private function isOfflineLikePayload(array $payload): bool
+    {
+        if (trim((string) ($payload['client_sync_id'] ?? '')) !== '') {
+            return true;
+        }
+
+        if (is_array($payload['offline_snapshot'] ?? null) && !empty($payload['offline_snapshot'])) {
+            return true;
+        }
+
+        $items = is_array($payload['items'] ?? null) ? $payload['items'] : [];
+        foreach ($items as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            if (array_key_exists('unit_price_snapshot', $row) || array_key_exists('line_total_snapshot', $row)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
     /**
      * Checkout (atomic).
      *
@@ -33,6 +56,10 @@ class PosCheckoutService
      */
     public function checkout(User $user, string $outletId, array $payload): Sale
     {
+        if ($this->isOfflineLikePayload($payload)) {
+            $payload = $this->rescueOfflinePayload($outletId, $payload);
+        }
+
         $payloadChannel = $payload['channel'] ?? null;
         $clientSyncId = isset($payload['client_sync_id']) ? trim((string) $payload['client_sync_id']) : null;
         $queueNo = trim((string) ($payload['queue_no'] ?? ''));
