@@ -32,6 +32,11 @@ class SaleResource extends JsonResource
             $printCustomerName = 'Member ' . $printCustomerName;
         }
 
+
+        $timezone = optional($s->outlet)->timezone;
+        $rawCreatedAt = method_exists($s, 'getRawOriginal') ? $s->getRawOriginal('created_at') : $s->created_at;
+        $rawUpdatedAt = method_exists($s, 'getRawOriginal') ? $s->getRawOriginal('updated_at') : $s->updated_at;
+
         return [
             'id' => (string) $s->id,
             'outlet_id' => (string) $s->outlet_id,
@@ -96,10 +101,10 @@ class SaleResource extends JsonResource
             'items' => SaleItemResource::collection($this->whenLoaded('items')),
             'payments' => SalePaymentResource::collection($this->whenLoaded('payments')),
 
-            'created_at' => TransactionDate::toIso($s->created_at, optional($s->outlet)->timezone),
-            'updated_at' => TransactionDate::toIso($s->updated_at, optional($s->outlet)->timezone),
-            'created_at_text' => TransactionDate::formatLocal($s->created_at, optional($s->outlet)->timezone),
-            'updated_at_text' => TransactionDate::formatLocal($s->updated_at, optional($s->outlet)->timezone),
+            'created_at' => TransactionDate::toSaleIso($rawCreatedAt, $timezone, (string) $s->sale_number),
+            'updated_at' => TransactionDate::toSaleIso($rawUpdatedAt, $timezone, (string) $s->sale_number),
+            'created_at_text' => TransactionDate::formatSaleLocal($rawCreatedAt, $timezone, (string) $s->sale_number),
+            'updated_at_text' => TransactionDate::formatSaleLocal($rawUpdatedAt, $timezone, (string) $s->sale_number),
             'deleted_at' => optional($s->deleted_at)->toISOString(),
         ];
     }

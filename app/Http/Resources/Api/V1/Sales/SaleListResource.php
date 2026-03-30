@@ -14,6 +14,10 @@ class SaleListResource extends JsonResource
     public function toArray($request): array
     {
         $s = $this->resource;
+        $saleTimezone = optional($s->outlet)->timezone;
+        $rawCreatedAt = method_exists($s, 'getRawOriginal')
+            ? ($s->getRawOriginal('created_at') ?: $s->created_at)
+            : $s->created_at;
 
         return [
             'id' => (string) $s->id,
@@ -39,9 +43,9 @@ class SaleListResource extends JsonResource
             'cancel_requests_pending_count' => isset($s->cancel_requests_pending_count) ? (int) $s->cancel_requests_pending_count : 0,
             'has_cancel_request_pending' => ((int) ($s->cancel_requests_pending_count ?? 0)) > 0,
 
-            'created_at' => TransactionDate::toIso($s->created_at, optional($s->outlet)->timezone),
-            'created_at_text' => TransactionDate::formatLocal($s->created_at, optional($s->outlet)->timezone),
-            'outlet_timezone' => (string) (optional($s->outlet)->timezone ?: config('app.timezone', 'Asia/Jakarta')),
+            'created_at' => TransactionDate::toSaleIso($rawCreatedAt, $saleTimezone, (string) $s->sale_number),
+            'created_at_text' => TransactionDate::formatSaleLocal($rawCreatedAt, $saleTimezone, (string) $s->sale_number),
+            'outlet_timezone' => (string) ($saleTimezone ?: config('app.timezone', 'Asia/Jakarta')),
         ];
     }
 }

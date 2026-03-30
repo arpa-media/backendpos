@@ -674,12 +674,15 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
     private function rawCreatedAtValue($value)
     {
         if ($value instanceof Sale) {
-            if ($value->created_at) {
-                return $value->created_at;
+            if (method_exists($value, 'getRawOriginal')) {
+                $raw = $value->getRawOriginal('created_at');
+                if ($raw !== null && $raw !== '') {
+                    return $raw;
+                }
             }
 
-            if (method_exists($value, 'getRawOriginal')) {
-                return $value->getRawOriginal('created_at');
+            if ($value->created_at) {
+                return $value->created_at;
             }
         }
 
