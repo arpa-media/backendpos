@@ -281,6 +281,29 @@ class PosCheckoutService
                     'variant_id' => $variantId ? (string) $variantId : null,
                     'qty' => $qty,
                     'note' => isset($row['note']) ? trim((string) $row['note']) : null,
+
+                    // Hotfix-001:
+                    // Preserve offline pricing/name/category snapshots during normalization.
+                    // Without this, offline sync payloads that already contain
+                    // unit_price_snapshot / line_total_snapshot lose those fields here,
+                    // then later fall back to live ProductVariantPrice lookup and can fail
+                    // with "Price not found for channel ...".
+                    'product_name' => isset($row['product_name']) ? trim((string) $row['product_name']) : null,
+                    'variant_name' => isset($row['variant_name']) ? trim((string) $row['variant_name']) : null,
+                    'unit_price_snapshot' => is_numeric($row['unit_price_snapshot'] ?? null)
+                        ? (int) round((float) $row['unit_price_snapshot'])
+                        : null,
+                    'line_total_snapshot' => is_numeric($row['line_total_snapshot'] ?? null)
+                        ? (int) round((float) $row['line_total_snapshot'])
+                        : null,
+                    'category_id_snapshot' => isset($row['category_id_snapshot']) && $row['category_id_snapshot'] !== null
+                        ? (string) $row['category_id_snapshot']
+                        : null,
+                    'category_kind_snapshot' => isset($row['category_kind_snapshot']) && $row['category_kind_snapshot'] !== null
+                        ? strtoupper(trim((string) $row['category_kind_snapshot']))
+                        : null,
+                    'category_name_snapshot' => isset($row['category_name_snapshot']) ? trim((string) $row['category_name_snapshot']) : null,
+                    'category_slug_snapshot' => isset($row['category_slug_snapshot']) ? trim((string) $row['category_slug_snapshot']) : null,
                 ];
             }
 
