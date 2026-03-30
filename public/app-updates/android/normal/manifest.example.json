@@ -5,7 +5,7 @@
   "released_at": "2026-03-30T09:00:00+07:00",
   "apk_file": "JayaPOS-normal-1.3.3.apk",
   "notes": [
-    "Perbaikan offline checkout",
+    "Resolver Unsync Transaction ",
     "Stabilisasi sinkronisasi transaksi"
   ]
 }
