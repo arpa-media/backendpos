@@ -43,8 +43,8 @@ class StoreDiscountRequest extends FormRequest
                 $v->errors()->add('customer_ids', 'customer_ids is required when applies_to=CUSTOMER.');
             }
             if ($applies === 'SQUAD') {
-                if (!empty($this->input('product_ids'))) {
-                    $v->errors()->add('product_ids', 'product_ids must be empty when applies_to=SQUAD.');
+                if (empty($this->input('product_ids'))) {
+                    $v->errors()->add('product_ids', 'product_ids is required when applies_to=SQUAD.');
                 }
                 if (!empty($this->input('customer_ids'))) {
                     $v->errors()->add('customer_ids', 'customer_ids must be empty when applies_to=SQUAD.');

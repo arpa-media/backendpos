@@ -20,6 +20,7 @@ class CheckoutRequest extends FormRequest
             'outlet_id' => ['nullable', 'string', 'max:30'],
             'client_sync_id' => ['nullable', 'string', 'max:100'],
             'queue_no' => ['nullable', 'string', 'max:20'],
+            'transaction_at' => ['nullable', 'date'],
 
             // Backward compat: if items.*.channel not provided, use this channel.
             // Patch-6: allow mixed transaction (DINE_IN + TAKEAWAY) by sending channel=MIXED and item-level channels.
@@ -59,12 +60,41 @@ class CheckoutRequest extends FormRequest
             'items.*.variant_id' => ['nullable', 'string', 'max:30'],
             'items.*.qty' => ['required', 'integer', 'min:1', 'max:999'],
             'items.*.note' => ['nullable', 'string', 'max:500'],
+            'items.*.product_name' => ['nullable', 'string', 'max:255'],
+            'items.*.variant_name' => ['nullable', 'string', 'max:255'],
+            'items.*.unit_price_snapshot' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'items.*.line_total_snapshot' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'items.*.category_id_snapshot' => ['nullable', 'string', 'max:30'],
+            'items.*.category_kind_snapshot' => ['nullable', 'string', 'max:50'],
+            'items.*.category_name_snapshot' => ['nullable', 'string', 'max:255'],
+            'items.*.category_slug_snapshot' => ['nullable', 'string', 'max:255'],
 
             // payment (single payment in Fase 1)
             'payment' => ['required', 'array'],
             'payment.payment_method_id' => ['required', 'string', 'max:30'],
             'payment.amount' => ['required', 'integer', 'min:0', 'max:9999999999'],
             'payment.reference' => ['nullable', 'string', 'max:120'],
+            'payment.payment_method_name_snapshot' => ['nullable', 'string', 'max:120'],
+            'payment.payment_method_type_snapshot' => ['nullable', 'string', 'max:50'],
+
+            'offline_snapshot' => ['nullable', 'array'],
+            'offline_snapshot.subtotal' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'offline_snapshot.discount_type' => ['nullable', 'string', Rule::in(['NONE', 'PERCENT', 'FIXED'])],
+            'offline_snapshot.discount_value' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'offline_snapshot.discount_reason' => ['nullable', 'string', 'max:255'],
+            'offline_snapshot.discount_amount' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'offline_snapshot.discounts_snapshot' => ['nullable', 'array', 'max:20'],
+            'offline_snapshot.tax_id' => ['nullable', 'string', 'max:30'],
+            'offline_snapshot.tax_name_snapshot' => ['nullable', 'string', 'max:120'],
+            'offline_snapshot.tax_percent_snapshot' => ['nullable', 'integer', 'min:0', 'max:100'],
+            'offline_snapshot.tax_total' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'offline_snapshot.rounding_total' => ['nullable', 'integer', 'min:-9999999999', 'max:9999999999'],
+            'offline_snapshot.grand_total' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'offline_snapshot.paid_total' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'offline_snapshot.change_total' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
+            'offline_snapshot.payment_method_name' => ['nullable', 'string', 'max:120'],
+            'offline_snapshot.payment_method_type' => ['nullable', 'string', 'max:50'],
+            'offline_snapshot.preferred_sale_number' => ['nullable', 'string', 'max:40'],
 
             'note' => ['nullable', 'string', 'max:500'],
         ];

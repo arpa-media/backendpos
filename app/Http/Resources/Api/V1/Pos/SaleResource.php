@@ -3,6 +3,7 @@
 namespace App\Http\Resources\Api\V1\Pos;
 
 use App\Http\Resources\Api\V1\Customers\CustomerResource;
+use App\Support\TransactionDate;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -58,7 +59,7 @@ class SaleResource extends JsonResource
                     'id' => (string) $s->outlet->id,
                     'name' => (string) $s->outlet->name,
                     'address' => (string) ($s->outlet->address ?? ''),
-                    'timezone' => (string) ($s->outlet->timezone ?? config('app.timezone', 'Asia/Jakarta')),
+                    'timezone' => (string) ($s->outlet->timezone ?? 'Asia/Jakarta'),
                 ]
                 : null,
 
@@ -95,8 +96,10 @@ class SaleResource extends JsonResource
             'items' => SaleItemResource::collection($this->whenLoaded('items')),
             'payments' => SalePaymentResource::collection($this->whenLoaded('payments')),
 
-            'created_at' => optional($s->created_at)->toISOString(),
-            'updated_at' => optional($s->updated_at)->toISOString(),
+            'created_at' => TransactionDate::toIso($s->created_at, optional($s->outlet)->timezone),
+            'updated_at' => TransactionDate::toIso($s->updated_at, optional($s->outlet)->timezone),
+            'created_at_text' => TransactionDate::formatLocal($s->created_at, optional($s->outlet)->timezone),
+            'updated_at_text' => TransactionDate::formatLocal($s->updated_at, optional($s->outlet)->timezone),
             'deleted_at' => optional($s->deleted_at)->toISOString(),
         ];
     }

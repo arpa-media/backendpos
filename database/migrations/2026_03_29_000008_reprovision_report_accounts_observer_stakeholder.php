@@ -174,7 +174,7 @@ return new class extends Migration
                 'role' => 'stakeholder',
                 'access_role_code' => 'STAKEHOLDER',
                 'portal_code' => 'omzet-report',
-                'outlet_codes' => ['BJ'],
+                'outlet_codes' => ['BJ', 'BD'],
             ],
             [
                 'legacy_username' => null,

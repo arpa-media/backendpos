@@ -113,10 +113,10 @@ class DiscountService
     {
         $appliesTo = strtoupper((string) ($data['applies_to'] ?? $discount->applies_to));
 
-        if ($appliesTo === 'PRODUCT') {
+        if (in_array($appliesTo, ['PRODUCT', 'SQUAD'], true)) {
             $ids = array_values(array_unique(array_filter($data['product_ids'] ?? [])));
             if (count($ids) === 0) {
-                throw ValidationException::withMessages(['product_ids' => ['product_ids is required for PRODUCT discount.']]);
+                throw ValidationException::withMessages(['product_ids' => ["product_ids is required for {$appliesTo} discount."]]);
             }
 
             $exists = Product::query()->whereIn('id', $ids)->pluck('id')->map(fn ($x) => (string) $x)->all();
@@ -152,7 +152,7 @@ class DiscountService
             return;
         }
 
-        // GLOBAL / SQUAD: clear all pivots
+        // GLOBAL: clear all pivots
         $discount->products()->sync([]);
         $discount->customers()->sync([]);
     }

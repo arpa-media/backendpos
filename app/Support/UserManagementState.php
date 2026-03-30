@@ -27,6 +27,7 @@ class UserManagementState
         }
 
         $state = array_replace_recursive($this->defaultState(), $decoded);
+        $this->synchronizeCatalogState($state, $decoded);
         $this->ensureUserAssignments($state);
         $this->save($state);
         return $state;
@@ -35,6 +36,199 @@ class UserManagementState
     public function save(array $state): void
     {
         Storage::disk('local')->put(self::STATE_FILE, json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    }
+
+
+    private function synchronizeCatalogState(array &$state, array $decoded = []): void
+    {
+        $default = $this->defaultState();
+
+        foreach (['user_types', 'roles', 'levels', 'portals', 'menus'] as $key) {
+            $state[$key] = $this->mergeRecordsById($default[$key] ?? [], $decoded[$key] ?? $state[$key] ?? []);
+        }
+
+        $state['portal_permissions'] = $this->mergePermissionRows(
+            $default['portal_permissions'] ?? [],
+            $decoded['portal_permissions'] ?? $state['portal_permissions'] ?? [],
+            'portal_id'
+        );
+
+        $state['menu_permissions'] = $this->mergePermissionRows(
+            $default['menu_permissions'] ?? [],
+            $decoded['menu_permissions'] ?? $state['menu_permissions'] ?? [],
+            'menu_id'
+        );
+
+        $this->backfillFinancePortalPermissions($state);
+        $this->backfillFinanceSummaryMenuPermissions($state);
+    }
+
+    private function backfillFinancePortalPermissions(array &$state): void
+    {
+        $portalId = collect($state['portals'] ?? [])->firstWhere('code', 'finance')['id'] ?? null;
+        if (!$portalId) {
+            return;
+        }
+
+        $menuIds = collect($state['menus'] ?? [])
+            ->filter(fn ($menu) => ($menu['portal_id'] ?? null) === $portalId)
+            ->pluck('id')
+            ->filter()
+            ->values();
+
+        if ($menuIds->isEmpty()) {
+            return;
+        }
+
+        $portalRows = collect($state['portal_permissions'] ?? []);
+        $menuRows = collect($state['menu_permissions'] ?? []);
+
+        $grouped = $menuRows
+            ->filter(fn ($row) => $menuIds->contains($row['menu_id'] ?? null))
+            ->groupBy(fn ($row) => ($row['access_role_id'] ?? '') . '|' . ($row['access_level_id'] ?? ''));
+
+        foreach ($grouped as $groupKey => $rows) {
+            [$roleId, $levelId] = array_pad(explode('|', (string) $groupKey, 2), 2, null);
+            $existing = $portalRows->first(function ($row) use ($portalId, $roleId, $levelId) {
+                return ($row['portal_id'] ?? null) === $portalId
+                    && ($row['access_role_id'] ?? null) === $roleId
+                    && (string) ($row['access_level_id'] ?? '') === (string) ($levelId ?? '');
+            });
+
+            if ($existing) {
+                continue;
+            }
+
+            $canView = $rows->contains(fn ($row) => (bool) ($row['can_view'] ?? false));
+            $state['portal_permissions'][] = [
+                'id' => (string) Str::ulid(),
+                'access_role_id' => $roleId,
+                'access_level_id' => $levelId ?: null,
+                'portal_id' => $portalId,
+                'can_view' => $canView,
+            ];
+        }
+    }
+
+    private function backfillFinanceSummaryMenuPermissions(array &$state): void
+    {
+        $menusByCode = collect($state['menus'] ?? [])->keyBy('code');
+
+        $targetSourceMap = [
+            'finance-sales-summary' => ['sales', 'finance-sales-collected'],
+            'finance-category-summary' => ['report', 'finance-cashier-report'],
+        ];
+
+        $existingRows = collect($state['menu_permissions'] ?? []);
+
+        foreach ($targetSourceMap as $targetCode => $sourceCodes) {
+            $targetMenuId = $menusByCode->get($targetCode)['id'] ?? null;
+            if (!$targetMenuId) {
+                continue;
+            }
+
+            $sourceMenuIds = collect($sourceCodes)
+                ->map(fn ($code) => $menusByCode->get($code)['id'] ?? null)
+                ->filter()
+                ->values();
+
+            if ($sourceMenuIds->isEmpty()) {
+                continue;
+            }
+
+            foreach ($sourceMenuIds as $sourceMenuId) {
+                $sourceRows = $existingRows->filter(fn ($row) => ($row['menu_id'] ?? null) === $sourceMenuId);
+
+                foreach ($sourceRows as $sourceRow) {
+                    $exists = $existingRows->first(function ($row) use ($targetMenuId, $sourceRow) {
+                        return ($row['menu_id'] ?? null) === $targetMenuId
+                            && ($row['access_role_id'] ?? null) === ($sourceRow['access_role_id'] ?? null)
+                            && (string) ($row['access_level_id'] ?? '') === (string) ($sourceRow['access_level_id'] ?? '');
+                    });
+
+                    if ($exists) {
+                        continue;
+                    }
+
+                    $newRow = $sourceRow;
+                    $newRow['id'] = (string) Str::ulid();
+                    $newRow['menu_id'] = $targetMenuId;
+                    $state['menu_permissions'][] = $newRow;
+                    $existingRows->push($newRow);
+                }
+            }
+        }
+    }
+
+    private function mergeRecordsById(array $defaults, array $existing): array
+    {
+        $merged = [];
+        $order = [];
+
+        foreach ($defaults as $record) {
+            $id = (string) ($record['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            $merged[$id] = $record;
+            $order[] = $id;
+        }
+
+        foreach ($existing as $record) {
+            $id = (string) ($record['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            if (!array_key_exists($id, $merged)) {
+                $order[] = $id;
+                $merged[$id] = [];
+            }
+            $merged[$id] = array_replace_recursive($merged[$id], $record);
+        }
+
+        return array_values(array_map(fn ($id) => $merged[$id], $order));
+    }
+
+    private function mergePermissionRows(array $defaults, array $existing, string $entityKey): array
+    {
+        $merged = [];
+        $order = [];
+
+        foreach ($defaults as $row) {
+            $key = $this->permissionRowKey($row, $entityKey);
+            if ($key === null) {
+                continue;
+            }
+            $merged[$key] = $row;
+            $order[] = $key;
+        }
+
+        foreach ($existing as $row) {
+            $key = $this->permissionRowKey($row, $entityKey);
+            if ($key === null) {
+                continue;
+            }
+            if (!array_key_exists($key, $merged)) {
+                $order[] = $key;
+                $merged[$key] = [];
+            }
+            $merged[$key] = array_replace_recursive($merged[$key], $row);
+        }
+
+        return array_values(array_map(fn ($key) => $merged[$key], $order));
+    }
+
+    private function permissionRowKey(array $row, string $entityKey): ?string
+    {
+        $roleId = (string) ($row['access_role_id'] ?? '');
+        $levelId = (string) ($row['access_level_id'] ?? '');
+        $entityId = (string) ($row[$entityKey] ?? '');
+
+        if ($roleId === '' || $entityId === '') {
+            return null;
+        }
+
+        return implode('|', [$roleId, $levelId, $entityId]);
     }
 
     public function defaultState(): array
@@ -68,6 +262,10 @@ class UserManagementState
         $menus = [
             ['id' => 'menu-sales', 'portal_id' => 'portal-finance', 'code' => 'sales', 'name' => 'Sales', 'path' => '/sales', 'sort_order' => 10, 'is_active' => true,
                 'abilities' => ['view' => ['sale.view']]],
+            ['id' => 'menu-finance-sales-summary', 'portal_id' => 'portal-finance', 'code' => 'finance-sales-summary', 'name' => 'Sales Summary', 'path' => '/finance/sales-summary', 'sort_order' => 12, 'is_active' => true,
+                'abilities' => ['view' => ['sale.view']]],
+            ['id' => 'menu-finance-category-summary', 'portal_id' => 'portal-finance', 'code' => 'finance-category-summary', 'name' => 'Category Summary', 'path' => '/finance/category-summary', 'sort_order' => 14, 'is_active' => true,
+                'abilities' => ['view' => ['report.view']]],
             ['id' => 'menu-report', 'portal_id' => 'portal-finance', 'code' => 'report', 'name' => 'Report', 'path' => '/reports', 'sort_order' => 20, 'is_active' => true,
                 'abilities' => ['view' => ['report.view']]],
             ['id' => 'menu-finance-cashier-report', 'portal_id' => 'portal-finance', 'code' => 'finance-cashier-report', 'name' => 'Cashier Report', 'path' => '/finance/cashier-report', 'sort_order' => 25, 'is_active' => true,

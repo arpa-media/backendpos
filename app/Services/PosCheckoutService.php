@@ -17,6 +17,7 @@ use App\Support\PaymentMethodTypes;
 use App\Support\SaleRounding;
 use App\Support\SalesChannels;
 use App\Support\SaleStatuses;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -43,6 +44,18 @@ class PosCheckoutService
         if (!in_array($onlineOrderSource, ['ONLINE', 'GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'], true)) {
             $onlineOrderSource = 'ONLINE';
         }
+
+        $outletRow = DB::table('outlets')
+            ->where('id', $outletId)
+            ->select(['code', 'timezone'])
+            ->first();
+
+        $outletTimezone = $outletRow?->timezone ?: config('app.timezone', 'Asia/Jakarta');
+        $transactionAtInput = isset($payload['transaction_at']) ? trim((string) $payload['transaction_at']) : '';
+        $transactionAtTz = $this->resolveTransactionMoment($transactionAtInput !== '' ? $transactionAtInput : null, $outletTimezone);
+        $transactionAtUtc = $transactionAtTz->copy()->utc();
+        $offlineSnapshot = is_array($payload['offline_snapshot'] ?? null) ? $payload['offline_snapshot'] : [];
+        $preferredSaleNumber = trim((string) ($offlineSnapshot['preferred_sale_number'] ?? ''));
 
         // Discount payload (backward compatible with Phase-1 fields)
         // - Manual (single): discount: { type, value, reason }
@@ -125,7 +138,12 @@ class PosCheckoutService
             $taxPercent,
             $clientSyncId,
             $onlineOrderSource,
-            $queueNo
+            $queueNo,
+            $offlineSnapshot,
+            $preferredSaleNumber,
+            $transactionAtTz,
+            $transactionAtUtc,
+            $outletTimezone
         ) {
 
             // 0) Optional: validate customer globally.
@@ -161,6 +179,8 @@ class PosCheckoutService
                 }
             }
 
+            $useOfflineSnapshot = !empty($offlineSnapshot);
+
             // 1) Validate payment method: global active + enabled in outlet via pivot
             $pm = PaymentMethod::query()
                 ->where('id', $payment['payment_method_id'])
@@ -170,6 +190,12 @@ class PosCheckoutService
                         ->where('outlet_payment_method.is_active', true);
                 })
                 ->first();
+
+            if (!$pm && $useOfflineSnapshot) {
+                $pm = PaymentMethod::query()
+                    ->where('id', $payment['payment_method_id'])
+                    ->first();
+            }
 
             if (!$pm) {
                 throw ValidationException::withMessages([
@@ -244,16 +270,18 @@ class PosCheckoutService
 
             // 2a) Ensure products are active for this outlet (pivot outlet_product)
             $productIds = array_values(array_unique($productIds));
-            $activeProductCount = (int) DB::table('outlet_product')
-                ->where('outlet_id', $outletId)
-                ->whereIn('product_id', $productIds)
-                ->where('is_active', true)
-                ->count();
+            if (!$useOfflineSnapshot) {
+                $activeProductCount = (int) DB::table('outlet_product')
+                    ->where('outlet_id', $outletId)
+                    ->whereIn('product_id', $productIds)
+                    ->where('is_active', true)
+                    ->count();
 
-            if ($activeProductCount !== count($productIds)) {
-                throw ValidationException::withMessages([
-                    'items' => ['One or more products not active for this outlet.'],
-                ]);
+                if ($activeProductCount !== count($productIds)) {
+                    throw ValidationException::withMessages([
+                        'items' => ['One or more products not active for this outlet.'],
+                    ]);
+                }
             }
 
             if (!empty($missingVariantByProduct)) {
@@ -295,10 +323,15 @@ class PosCheckoutService
                 ]);
             }
 
-            $variants = ProductVariant::query()
+            $variantsQuery = ProductVariant::query()
                 ->where('outlet_id', $outletId)
-                ->where('is_active', true)
-                ->whereIn('id', $variantIds)
+                ->whereIn('id', $variantIds);
+
+            if (!$useOfflineSnapshot) {
+                $variantsQuery->where('is_active', true);
+            }
+
+            $variants = $variantsQuery
                 ->with(['product', 'product.category'])
                 ->get()
                 ->keyBy('id');
@@ -310,12 +343,14 @@ class PosCheckoutService
             }
 
             // 4) Load prices for required channels (Patch-6: per-item channel)
-            $prices = ProductVariantPrice::query()
-                ->where('outlet_id', $outletId)
-                ->whereIn('variant_id', $variantIds)
-                ->whereIn('channel', $channelsInSale)
-                ->get()
-                ->keyBy(fn ($row) => (string) $row->variant_id.'|'.(string) $row->channel);
+            $prices = $useOfflineSnapshot
+                ? collect()
+                : ProductVariantPrice::query()
+                    ->where('outlet_id', $outletId)
+                    ->whereIn('variant_id', $variantIds)
+                    ->whereIn('channel', $channelsInSale)
+                    ->get()
+                    ->keyBy(fn ($row) => (string) $row->variant_id.'|'.(string) $row->channel);
 
             // 5) Compute subtotal + build sale items
             $subtotal = 0;
@@ -343,15 +378,25 @@ class PosCheckoutService
                     ]);
                 }
 
-                $priceRow = $prices->get($variantId.'|'.$itemChannel);
-                if (!$priceRow) {
-                    throw ValidationException::withMessages([
-                        "items.$idx.variant_id" => ["Price not found for channel $itemChannel."],
-                    ]);
-                }
+                $snapshotUnitPrice = isset($row['unit_price_snapshot']) ? (int) $row['unit_price_snapshot'] : null;
+                $snapshotLineTotal = isset($row['line_total_snapshot']) ? (int) $row['line_total_snapshot'] : null;
 
-                $unitPrice = (int) $priceRow->price;
-                $lineTotal = $unitPrice * $qty;
+                if ($useOfflineSnapshot && $snapshotUnitPrice !== null && $snapshotUnitPrice >= 0) {
+                    $unitPrice = $snapshotUnitPrice;
+                    $lineTotal = $snapshotLineTotal !== null && $snapshotLineTotal >= 0
+                        ? $snapshotLineTotal
+                        : ($unitPrice * $qty);
+                } else {
+                    $priceRow = $prices->get($variantId.'|'.$itemChannel);
+                    if (!$priceRow) {
+                        throw ValidationException::withMessages([
+                            "items.$idx.variant_id" => ["Price not found for channel $itemChannel."],
+                        ]);
+                    }
+
+                    $unitPrice = (int) $priceRow->price;
+                    $lineTotal = $unitPrice * $qty;
+                }
 
                 $subtotal += $lineTotal;
 
@@ -360,9 +405,9 @@ class PosCheckoutService
                     'product_id' => (string) $variant->product_id,
                     'variant_id' => (string) $variant->id,
                     'channel' => $itemChannel,
-                    'product_name' => (string) optional($variant->product)->name,
-                    'variant_name' => (string) $variant->name,
-                    'category_kind_snapshot' => (string) (optional(optional($variant->product)->category)->kind ?? 'OTHER'),
+                    'product_name' => (string) ($row['product_name'] ?? optional($variant->product)->name ?? ''),
+                    'variant_name' => (string) ($row['variant_name'] ?? $variant->name ?? ''),
+                    'category_kind_snapshot' => (string) ($row['category_kind_snapshot'] ?? optional(optional($variant->product)->category)->kind ?? 'OTHER'),
                     'note' => $note,
                     'qty' => $qty,
                     'unit_price' => $unitPrice,
@@ -393,7 +438,7 @@ class PosCheckoutService
             $packageIds = array_values(array_unique(array_filter($packageIds)));
 
             $discountPackages = collect();
-            if (count($packageIds) > 0) {
+            if (!$useOfflineSnapshot && count($packageIds) > 0) {
                 $discountPackages = Discount::query()
                     ->where('outlet_id', $outletId)
                     ->whereIn('id', $packageIds)
@@ -424,8 +469,29 @@ class PosCheckoutService
 
             $discountSnapshots = [];
             $discountAmount = 0;
+            $discountPackage = null;
 
-            if ($usePackages) {
+            if ($useOfflineSnapshot) {
+                $discountType = strtoupper((string) ($offlineSnapshot['discount_type'] ?? $discountType ?? 'NONE'));
+                if (!in_array($discountType, ['NONE', 'PERCENT', 'FIXED'], true)) {
+                    $discountType = 'NONE';
+                }
+                $discountValue = (int) ($offlineSnapshot['discount_value'] ?? $discountValue ?? 0);
+                $discountReason = $offlineSnapshot['discount_reason'] ?? $discountReason;
+                $discountAmount = max(0, min((int) $subtotal, (int) ($offlineSnapshot['discount_amount'] ?? 0)));
+                $discountSnapshots = is_array($offlineSnapshot['discounts_snapshot'] ?? null) ? $offlineSnapshot['discounts_snapshot'] : [];
+                if (!empty($discountSnapshots[0]['id'])) {
+                    $firstDiscount = $discountSnapshots[0];
+                    $discountPackage = (object) [
+                        'id' => (string) ($firstDiscount['id'] ?? ''),
+                        'code' => (string) ($firstDiscount['code'] ?? ''),
+                        'name' => (string) ($firstDiscount['name'] ?? ''),
+                        'applies_to' => (string) ($firstDiscount['applies_to'] ?? ''),
+                        'discount_type' => (string) ($firstDiscount['discount_type'] ?? ''),
+                        'discount_value' => (int) ($firstDiscount['discount_value'] ?? 0),
+                    ];
+                }
+            } elseif ($usePackages) {
                 foreach ($discountPackages as $pkg) {
                     $appliesTo = strtoupper((string) $pkg->applies_to);
 
@@ -503,8 +569,7 @@ class PosCheckoutService
             $taxableBase = max(0, (int) $subtotal - (int) $discountAmount);
 
             // Snapshot helpers (for receipts/history)
-            $discountPackage = null;
-            if ($usePackages) {
+            if (!$useOfflineSnapshot && $usePackages) {
                 $discountPackage = $discountPackages->first();
                 // For backward compatibility fields, keep the first package spec.
                 $discountType = $discountPackage ? strtoupper((string) $discountPackage->discount_type) : 'NONE';
@@ -514,23 +579,42 @@ class PosCheckoutService
             }
 
             // 7) Tax (default tax per outlet, except online/delivery which are always no-tax)
-            $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
-            $effectiveTaxId = $isOnlineNoTax ? null : $taxId;
-            $effectiveTaxName = $isOnlineNoTax ? 'Tax' : $taxName;
-            $effectiveTaxPercent = $isOnlineNoTax ? 0 : (int) $taxPercent;
+            if ($useOfflineSnapshot) {
+                $effectiveTaxId = $offlineSnapshot['tax_id'] ?? $taxId;
+                $effectiveTaxName = (string) ($offlineSnapshot['tax_name_snapshot'] ?? $taxName ?? 'Tax');
+                $effectiveTaxPercent = max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
+                $taxTotal = (int) ($offlineSnapshot['tax_total'] ?? 0);
+                $serviceChargeTotal = 0;
+                $roundingTotal = (int) ($offlineSnapshot['rounding_total'] ?? 0);
+                $grandTotalBeforeRounding = (int) max(0, $taxableBase + $taxTotal + $serviceChargeTotal);
+                $grandTotal = (int) ($offlineSnapshot['grand_total'] ?? ($grandTotalBeforeRounding + $roundingTotal));
+            } else {
+                $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
+                $effectiveTaxId = $isOnlineNoTax ? null : $taxId;
+                $effectiveTaxName = $isOnlineNoTax ? 'Tax' : $taxName;
+                $effectiveTaxPercent = $isOnlineNoTax ? 0 : (int) $taxPercent;
 
-            $taxTotal = (int) floor(($taxableBase * $effectiveTaxPercent) / 100);
-            $serviceChargeTotal = 0;
+                $taxTotal = (int) floor(($taxableBase * $effectiveTaxPercent) / 100);
+                $serviceChargeTotal = 0;
 
-            $roundingSnapshot = SaleRounding::apply((int) ($taxableBase + $taxTotal + $serviceChargeTotal));
-            $roundingTotal = (int) ($roundingSnapshot['rounding_total'] ?? 0);
-            $grandTotalBeforeRounding = (int) ($roundingSnapshot['before_rounding'] ?? 0);
-            $grandTotal = (int) ($roundingSnapshot['after_rounding'] ?? 0);
+                $roundingSnapshot = SaleRounding::apply((int) ($taxableBase + $taxTotal + $serviceChargeTotal));
+                $roundingTotal = (int) ($roundingSnapshot['rounding_total'] ?? 0);
+                $grandTotalBeforeRounding = (int) ($roundingSnapshot['before_rounding'] ?? 0);
+                $grandTotal = (int) ($roundingSnapshot['after_rounding'] ?? 0);
+            }
             $marking = app(MarkingService::class)->determineNextMarking($outletId);
 
             // 8) Payment rule
             $inputPaid = (int) ($payment['amount'] ?? 0);
-            if ((string) $pm->type !== PaymentMethodTypes::CASH) {
+            if ($useOfflineSnapshot) {
+                $paid = (int) ($offlineSnapshot['paid_total'] ?? $inputPaid ?? $grandTotal);
+                $change = (int) ($offlineSnapshot['change_total'] ?? max(0, $paid - $grandTotal));
+                if ((string) ($payment['payment_method_type_snapshot'] ?? $pm->type) === PaymentMethodTypes::CASH && $paid < $grandTotal) {
+                    throw ValidationException::withMessages([
+                        'payment.amount' => ['Paid amount is less than grand total.'],
+                    ]);
+                }
+            } elseif ((string) $pm->type !== PaymentMethodTypes::CASH) {
                 // NON_CASH: auto paid = grandTotal (ignore input amount)
                 $paid = $grandTotal;
                 $change = 0;
@@ -546,14 +630,14 @@ class PosCheckoutService
             }
 
             // 9) Create Sale
-            $sale = Sale::query()->create([
+            $sale = Sale::query()->forceCreate([
                 'outlet_id' => $outletId,
                 'cashier_id' => (string) $user->id,
                 'cashier_name' => (string) ($user->name ?? ''),
 
                 'client_sync_id' => $clientSyncId ?: null,
-                'sale_number' => $this->generateSaleNumber($outletId),
-                'queue_no' => $queueNo !== '' ? $queueNo : $this->generateQueueNumber($outletId),
+                'sale_number' => $this->resolveRequestedSaleNumber($outletId, $preferredSaleNumber, $transactionAtTz),
+                'queue_no' => $queueNo !== '' ? $queueNo : $this->generateQueueNumber($outletId, $transactionAtTz),
                 'channel' => (string) $saleChannel,
                 'online_order_source' => (string) $onlineOrderSource,
                 'status' => SaleStatuses::PAID,
@@ -563,7 +647,7 @@ class PosCheckoutService
                 'table_chamber' => $tableChamber !== '' ? $tableChamber : null,
                 'table_number' => $tableNumber !== '' ? $tableNumber : null,
 
-                'subtotal' => $subtotal,
+                'subtotal' => $useOfflineSnapshot ? (int) ($offlineSnapshot['subtotal'] ?? $subtotal) : $subtotal,
 
                 // Discount fields
                 'discount_type' => $discountType,
@@ -578,7 +662,7 @@ class PosCheckoutService
                 'discount_applies_to_snapshot' => $discountPackage ? (string) $discountPackage->applies_to : null,
 
                 // Multiple packages snapshot (json)
-                'discounts_snapshot' => $usePackages ? $discountSnapshots : null,
+                'discounts_snapshot' => (!empty($discountSnapshots) || $usePackages) ? $discountSnapshots : null,
 
                 // Backward compat
                 'discount_total' => $discountAmount,
@@ -599,62 +683,90 @@ class PosCheckoutService
                 'marking' => $marking,
 
                 // snapshots
-                'payment_method_name' => (string) ($pm->name ?? ''),
-                'payment_method_type' => (string) ($pm->type ?? ''),
+                'payment_method_name' => (string) ($offlineSnapshot['payment_method_name'] ?? $payment['payment_method_name_snapshot'] ?? $pm->name ?? ''),
+                'payment_method_type' => (string) ($offlineSnapshot['payment_method_type'] ?? $payment['payment_method_type_snapshot'] ?? $pm->type ?? ''),
 
                 'note' => $payload['note'] ?? null,
+                'created_at' => $transactionAtUtc,
+                'updated_at' => $transactionAtUtc,
             ]);
 
             // 10) Insert items
             foreach ($saleItems as $item) {
                 $item['sale_id'] = (string) $sale->id;
-                SaleItem::query()->create($item);
+                $item['created_at'] = $transactionAtUtc;
+                $item['updated_at'] = $transactionAtUtc;
+                SaleItem::query()->forceCreate($item);
             }
 
             // 11) Insert payment (single)
-            SalePayment::query()->create([
+            SalePayment::query()->forceCreate([
                 'outlet_id' => $outletId,
                 'sale_id' => (string) $sale->id,
                 'payment_method_id' => (string) $pm->id,
                 'amount' => $paid,
                 'reference' => $payment['reference'] ?? null,
+                'created_at' => $transactionAtUtc,
+                'updated_at' => $transactionAtUtc,
             ]);
 
             return $sale->load(['items', 'payments', 'customer', 'outlet']);
         });
     }
 
-    public function generateQueueNumber(string $outletId): string
+    public function generateQueueNumber(string $outletId, $transactionMoment = null): string
     {
-        $outletRow = DB::table('outlets')
-            ->where('id', $outletId)
-            ->select(['timezone'])
-            ->first();
-
-        $tz = $outletRow?->timezone ?: config('app.timezone', 'Asia/Jakarta');
-        $nowTz = now($tz);
-        $dayStartUtc = $nowTz->copy()->startOfDay()->utc();
-        $dayEndUtc = $nowTz->copy()->endOfDay()->utc();
-
-        $lastSale = Sale::query()
-            ->where('outlet_id', $outletId)
-            ->whereBetween('created_at', [$dayStartUtc, $dayEndUtc])
-            ->orderByDesc('created_at')
-            ->lockForUpdate()
-            ->first(['queue_no', 'sale_number']);
-
-        $nextCount = 1;
-        $lastQueue = trim((string) ($lastSale?->queue_no ?? ''));
-        if ($lastQueue !== '' && preg_match('/(\d+)$/', $lastQueue, $m)) {
-            $nextCount = ((int) $m[1]) + 1;
-        } elseif ($lastSale && preg_match('/-(\d{3})$/', (string) $lastSale->sale_number, $m)) {
-            $nextCount = ((int) $m[1]) + 1;
-        }
+        $context = $this->resolveSaleSequenceContext($outletId, $transactionMoment);
+        $nextCount = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
 
         return str_pad((string) $nextCount, 3, '0', STR_PAD_LEFT);
     }
 
-    public function generateSaleNumber(string $outletId): string
+    public function generateSaleNumber(string $outletId, $transactionMoment = null): string
+    {
+        $context = $this->resolveSaleSequenceContext($outletId, $transactionMoment);
+        $nextCount = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
+        $counter = str_pad((string) $nextCount, 3, '0', STR_PAD_LEFT);
+        $random = Str::upper(Str::random(4));
+
+        return sprintf(
+            'S.%s-%s-%s-%s',
+            $context['outlet_code'],
+            $context['today_token'],
+            $random,
+            $counter
+        );
+    }
+
+
+    private function resolveRequestedSaleNumber(string $outletId, ?string $preferredSaleNumber, $transactionMoment = null): string
+    {
+        $preferred = trim((string) ($preferredSaleNumber ?? ''));
+        if ($preferred === '') {
+            return $this->generateSaleNumber($outletId, $transactionMoment);
+        }
+
+        $context = $this->resolveSaleSequenceContext($outletId, $transactionMoment);
+        $pattern = sprintf(
+            '/^S\.%s-%s-[A-Z0-9]{4}-\d{3}$/',
+            preg_quote($context['outlet_code'], '/'),
+            preg_quote($context['today_token'], '/')
+        );
+
+        if (!preg_match($pattern, $preferred)) {
+            return $this->generateSaleNumber($outletId, $transactionMoment);
+        }
+
+        $exists = Sale::query()
+            ->where('outlet_id', $outletId)
+            ->where('sale_number', $preferred)
+            ->lockForUpdate()
+            ->exists();
+
+        return $exists ? $this->generateSaleNumber($outletId, $transactionMoment) : $preferred;
+    }
+
+    private function resolveSaleSequenceContext(string $outletId, $transactionMoment = null): array
     {
         $outletRow = DB::table('outlets')
             ->where('id', $outletId)
@@ -662,40 +774,65 @@ class PosCheckoutService
             ->first();
 
         $tz = $outletRow?->timezone ?: config('app.timezone', 'Asia/Jakarta');
-        $nowTz = now($tz);
-        $today = $nowTz->format('Ymd');
+        $nowTz = $transactionMoment instanceof Carbon ? $transactionMoment->copy()->setTimezone($tz) : now($tz);
 
-        $outletCode = $outletRow?->code;
+        return [
+            'outlet_code' => strtoupper((string) ($outletRow?->code ?: 'OUT')),
+            'timezone' => $tz,
+            'today_token' => $nowTz->format('Ymd'),
+            'day_start_utc' => $nowTz->copy()->startOfDay()->utc(),
+            'day_end_utc' => $nowTz->copy()->endOfDay()->utc(),
+        ];
+    }
 
-        $outletCode = strtoupper($outletCode ?? 'OUT');
-
-        // lock for concurrency
-        // Compare "today" in outlet timezone.
-        // created_at is stored in UTC; build UTC range for the local day.
-        $dayStartUtc = $nowTz->copy()->startOfDay()->utc();
-        $dayEndUtc = $nowTz->copy()->endOfDay()->utc();
-
-        $lastSale = Sale::query()
-            ->where('outlet_id', $outletId)
-            ->whereBetween('created_at', [$dayStartUtc, $dayEndUtc])
-            ->orderByDesc('created_at')
-            ->lockForUpdate()
-            ->first();
-
-        $nextCount = 1;
-        if ($lastSale && preg_match('/-(\d{3})$/', (string) $lastSale->sale_number, $m)) {
-            $nextCount = ((int) $m[1]) + 1;
+    private function resolveTransactionMoment(?string $value, string $timezone): Carbon
+    {
+        if (is_string($value) && trim($value) !== '') {
+            try {
+                return Carbon::parse($value)->setTimezone($timezone);
+            } catch (\Throwable) {
+                // fall through
+            }
         }
 
-        $counter = str_pad((string) $nextCount, 3, '0', STR_PAD_LEFT);
-        $random = Str::upper(Str::random(4));
+        return now($timezone);
+    }
 
-        return sprintf(
-            'S.%s-%s-%s-%s',
-            $outletCode,
-            $today,
-            $random,
-            $counter
-        );
+    private function resolveNextDailySequence(string $outletId, string $todayToken, $dayStartUtc, $dayEndUtc): int
+    {
+        $rows = Sale::query()
+            ->where('outlet_id', $outletId)
+            ->where(function ($query) use ($todayToken, $dayStartUtc, $dayEndUtc) {
+                $query
+                    ->where('sale_number', 'like', '%-' . $todayToken . '-%')
+                    ->orWhere(function ($legacyScope) use ($dayStartUtc, $dayEndUtc) {
+                        $legacyScope
+                            ->where(function ($saleNumberScope) {
+                                $saleNumberScope
+                                    ->whereNull('sale_number')
+                                    ->orWhere('sale_number', 'not like', 'S.%-%-%');
+                            })
+                            ->whereBetween('created_at', [$dayStartUtc, $dayEndUtc]);
+                    });
+            })
+            ->lockForUpdate()
+            ->get(['sale_number', 'queue_no']);
+
+        $maxSequence = 0;
+
+        foreach ($rows as $row) {
+            $saleNumber = (string) ($row->sale_number ?? '');
+            if ($saleNumber !== '' && preg_match('/-(\d{3})$/', $saleNumber, $saleMatches)) {
+                $maxSequence = max($maxSequence, (int) $saleMatches[1]);
+                continue;
+            }
+
+            $queueNo = trim((string) ($row->queue_no ?? ''));
+            if ($queueNo !== '' && preg_match('/(\d+)$/', $queueNo, $queueMatches)) {
+                $maxSequence = max($maxSequence, (int) $queueMatches[1]);
+            }
+        }
+
+        return $maxSequence + 1;
     }
 }

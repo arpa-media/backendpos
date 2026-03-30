@@ -3,6 +3,7 @@
 use Illuminate\Support\Facades\Route;
 
 use App\Http\Controllers\Api\V1\AuthController;
+use App\Http\Controllers\Api\V1\AppUpdateController;
 use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\CustomerController;
 use App\Http\Controllers\Api\V1\DashboardController;
@@ -13,6 +14,8 @@ use App\Http\Controllers\Api\V1\ProductController;
 use App\Http\Controllers\Api\V1\SalesController;
 use App\Http\Controllers\Api\V1\SaleCancelRequestController;
 use App\Http\Controllers\Api\V1\Finance\SalesCollectedController;
+use App\Http\Controllers\Api\V1\Finance\CategorySummaryController;
+use App\Http\Controllers\Api\V1\Finance\SalesSummaryController;
 use App\Http\Controllers\Api\V1\AddonController;
 use App\Http\Controllers\Api\V1\TaxController;
 use App\Http\Controllers\Api\V1\ReportController;
@@ -30,6 +33,10 @@ Route::prefix('v1')->group(function () {
     Route::prefix('auth')->group(function () {
         Route::post('/login', [AuthController::class, 'login']);
         Route::get('/pos-outlets', [OutletController::class, 'posLoginOptions']);
+    });
+
+    Route::prefix('public')->group(function () {
+        Route::get('/app-update/android', [AppUpdateController::class, 'android']);
     });
 
     /**
@@ -143,6 +150,12 @@ Route::prefix('v1')->group(function () {
             ->middleware('permission:sale.view');
 
         Route::get('/finance/sales-collected', [SalesCollectedController::class, 'index'])
+            ->middleware('permission:sale.view');
+
+        Route::get('/finance/category-summary', [CategorySummaryController::class, 'index'])
+            ->middleware('permission:report.view');
+
+        Route::get('/finance/sales-summary', [SalesSummaryController::class, 'index'])
             ->middleware('permission:sale.view');
 
         Route::get('/sales/{id}', [SalesController::class, 'show']);

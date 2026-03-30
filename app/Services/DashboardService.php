@@ -119,7 +119,7 @@ class DashboardService
                 'created_at',
             ])
             ->map(function ($sale) use ($timezone) {
-                $rawCreatedAt = method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('created_at') : $sale->created_at;
+                $rawCreatedAt = $sale->created_at ?: (method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('created_at') : null);
 
                 return [
                     'id' => (string) $sale->id,
@@ -191,7 +191,7 @@ class DashboardService
 
     private function resolveTimezone(?string $outletId): string
     {
-        $defaultTimezone = config('app.timezone', 'Asia/Jakarta');
+        $defaultTimezone = 'Asia/Jakarta';
 
         if (!$outletId) {
             return $defaultTimezone;

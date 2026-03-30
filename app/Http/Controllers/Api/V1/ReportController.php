@@ -87,6 +87,16 @@ class ReportController extends Controller
         ]]);
     }
 
+    public function applyExistingMarking(Request $request, MarkingService $service): JsonResponse
+    {
+        return response()->json(['data' => $service->applyExistingMarking((string) OutletScope::id($request))]);
+    }
+
+    public function removeAllMarking(Request $request, MarkingService $service): JsonResponse
+    {
+        return response()->json(['data' => $service->removeAllMarking((string) OutletScope::id($request))]);
+    }
+
     public function toggleMarking(Request $request, string $saleId, MarkingService $service): JsonResponse
     {
         return response()->json(['data' => $service->toggleSale((string) OutletScope::id($request), $saleId)]);

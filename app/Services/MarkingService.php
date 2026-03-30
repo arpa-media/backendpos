@@ -167,7 +167,101 @@ class MarkingService
         });
     }
 
-    public function toggleSale(string $outletId, string $saleId): array
+
+public function applyExistingMarking(string $outletId): array
+{
+    return DB::transaction(function () use ($outletId) {
+        $setting = OutletMarkingSetting::query()->lockForUpdate()->firstOrCreate(
+            ['outlet_id' => $outletId],
+            [
+                'status' => self::STATUS_NORMAL,
+                'interval_value' => null,
+                'show_count' => 3,
+                'hide_count' => 1,
+                'sequence_counter' => 0,
+            ]
+        );
+
+        $status = $this->normalizeStatus($setting->status);
+        $show = $this->resolveShowCount($setting);
+        $hide = $this->resolveHideCount($setting);
+
+        $sales = DB::table('sales')
+            ->where('outlet_id', $outletId)
+            ->where('status', 'PAID')
+            ->select(['id'])
+            ->orderBy('created_at')
+            ->orderBy('sale_number')
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get();
+
+        $sequence = 0;
+        $groups = [0 => [], 1 => []];
+
+        foreach ($sales as $row) {
+            $marking = 1;
+
+            if ($status === self::STATUS_NON_ACTIVE) {
+                $marking = 0;
+            } elseif ($status === self::STATUS_ACTIVE) {
+                $marking = $this->resolveMarkingByPattern($show, $hide, $sequence);
+                $sequence++;
+            }
+
+            $groups[$marking][] = (string) $row->id;
+        }
+
+        foreach ($groups as $marking => $ids) {
+            if (empty($ids)) {
+                continue;
+            }
+
+            DB::table('sales')
+                ->whereIn('id', $ids)
+                ->update([
+                    'marking' => (int) $marking,
+                    'updated_at' => now(),
+                ]);
+        }
+
+        $setting->sequence_counter = $status === self::STATUS_ACTIVE ? $sequence : 0;
+        $setting->save();
+
+        return [
+            ...$this->buildConfigPayload($setting),
+            'affected_transactions' => count($groups[0]) + count($groups[1]),
+            'marked_transactions' => count($groups[1]),
+            'applies_to' => 'EXISTING_TRANSACTIONS',
+            'action' => 'APPLY_EXISTING_MARKING',
+        ];
+    });
+}
+
+public function removeAllMarking(string $outletId): array
+{
+    return DB::transaction(function () use ($outletId) {
+        $affected = DB::table('sales')
+            ->where('outlet_id', $outletId)
+            ->where('status', 'PAID')
+            ->update([
+                'marking' => 1,
+                'updated_at' => now(),
+            ]);
+
+        $setting = $this->getSetting($outletId);
+
+        return [
+            ...$this->buildConfigPayload($setting),
+            'affected_transactions' => (int) $affected,
+            'marked_transactions' => (int) $affected,
+            'applies_to' => 'EXISTING_TRANSACTIONS',
+            'action' => 'REMOVE_MARKING',
+        ];
+    });
+}
+
+public function toggleSale(string $outletId, string $saleId): array
     {
         $row = DB::table('sales')
             ->where('outlet_id', $outletId)

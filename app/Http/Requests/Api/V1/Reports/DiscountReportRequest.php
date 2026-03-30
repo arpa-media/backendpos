@@ -10,6 +10,8 @@ class DiscountReportRequest extends ReportRangeRequest
             'sale_number' => ['nullable', 'string', 'max:50'],
             'payment_method_name' => ['nullable', 'string', 'max:120'],
             'channel' => ['nullable', 'string', 'max:50'],
+            'discount_name' => ['nullable', 'string', 'max:120'],
+            'discount_squad_nisj' => ['nullable', 'string', 'max:100'],
         ]);
     }
 }

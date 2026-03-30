@@ -14,7 +14,7 @@ class ReportService
 
     private function resolveTimezone(?string $outletId): string
     {
-        $defaultTimezone = config('app.timezone', 'Asia/Jakarta');
+        $defaultTimezone = 'Asia/Jakarta';
 
         if (!$outletId) {
             return $defaultTimezone;
@@ -44,7 +44,7 @@ class ReportService
         [$fromLocal, $toLocal] = TransactionDate::dateRange(
             $dateFrom,
             $dateTo,
-            config('app.timezone', 'Asia/Jakarta')
+            'Asia/Jakarta'
         );
 
         return [$fromLocal, $toLocal];
@@ -61,7 +61,7 @@ private function applyDateRange(object $query, string $column, ?string $dateFrom
         $column,
         $dateFrom,
         $dateTo,
-        config('app.timezone', 'Asia/Jakarta')
+        'Asia/Jakarta'
     );
 }
 
@@ -83,7 +83,7 @@ private function applyOutletUtcDateRange(object $query, string $column, ?string 
 
 private function dateTokensForScope(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
 {
-    return TransactionDate::dateTokens($dateFrom, $dateTo, $timezone ?: config('app.timezone', 'Asia/Jakarta'));
+    return TransactionDate::dateTokens($dateFrom, $dateTo, $timezone ?: 'Asia/Jakarta');
 }
 
 private function applyBusinessDateScope(object $query, ?string $saleNumberColumn, string $createdAtColumn, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
@@ -91,7 +91,7 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
     [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange(
         $dateFrom,
         $dateTo,
-        $timezone ?: config('app.timezone', 'Asia/Jakarta')
+        $timezone ?: 'Asia/Jakarta'
     );
 
     $tokens = $this->dateTokensForScope($dateFrom, $dateTo, $timezone);
@@ -568,11 +568,14 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
-            
             ->where('s.status', '=', 'PAID')
             ->where('s.discount_amount', '>', 0);
 
-        if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
+        $this->applyOutletUtcDateRange($q, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $outletId);
+
+        if (!empty($outletId)) {
+            $q->where('s.outlet_id', '=', $outletId);
+        }
 
         if (!empty($params['sale_number'])) {
             $q->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
@@ -583,6 +586,12 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
         if (!empty($params['payment_method_name'])) {
             $q->where('spm.payment_method_name', '=', $params['payment_method_name']);
         }
+        if (!empty($params['discount_name'])) {
+            $q->where(DB::raw("COALESCE(NULLIF(s.discount_name_snapshot, ''), NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.discounts_snapshot, '$[0].name')), ''))"), '=', $params['discount_name']);
+        }
+        if (!empty($params['discount_squad_nisj'])) {
+            $q->where('s.discount_squad_nisj', 'like', '%' . $params['discount_squad_nisj'] . '%');
+        }
 
         $q->select([
             's.id as sale_id',
@@ -591,6 +600,9 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
             's.grand_total as total',
             's.discount_amount as discount',
+            's.discount_name_snapshot',
+            's.discounts_snapshot',
+            's.discount_squad_nisj',
             's.created_at',
         ])
         ->orderByDesc('s.created_at');
@@ -598,9 +610,26 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
         $p = $this->paginate($q, $perPage, $page);
 
         $items = collect($p->items())->map(function ($r) {
+            $snapshot = [];
+            if (is_array($r->discounts_snapshot ?? null)) {
+                $snapshot = $r->discounts_snapshot;
+            } elseif (is_string($r->discounts_snapshot ?? null) && $r->discounts_snapshot !== '') {
+                $decoded = json_decode($r->discounts_snapshot, true);
+                $snapshot = is_array($decoded) ? $decoded : [];
+            }
+            $discountName = (string) ($r->discount_name_snapshot ?? '');
+            if ($discountName === '' && !empty($snapshot[0]['name'])) {
+                $discountName = (string) $snapshot[0]['name'];
+            }
+            if ($discountName === '') {
+                $discountName = '-';
+            }
+
             return [
                 'sale_id' => (string) $r->sale_id,
                 'sale_number' => (string) $r->sale_number,
+                'discount_name' => $discountName,
+                'discount_squad_nisj' => (string) ($r->discount_squad_nisj ?? ''),
                 'channel' => (string) ($r->channel ?? ''),
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
@@ -609,10 +638,31 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
             ];
         })->values()->all();
 
+        $optionQ = DB::table('sales as s')
+            ->where('s.status', '=', 'PAID')
+            ->where('s.discount_amount', '>', 0);
+        $this->applyOutletUtcDateRange($optionQ, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $outletId);
+        if (!empty($outletId)) $optionQ->where('s.outlet_id', '=', $outletId);
+        $optionsRows = $optionQ->select(['s.discount_name_snapshot', 's.discounts_snapshot'])->get();
+        $discountNames = [];
+        foreach ($optionsRows as $row) {
+            $name = trim((string) ($row->discount_name_snapshot ?? ''));
+            if ($name === '') {
+                $decoded = is_array($row->discounts_snapshot ?? null)
+                    ? $row->discounts_snapshot
+                    : (json_decode((string) ($row->discounts_snapshot ?? '[]'), true) ?: []);
+                $name = trim((string) (($decoded[0]['name'] ?? '') ?: ''));
+            }
+            if ($name !== '') $discountNames[$name] = true;
+        }
+
         return [
             'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
             'data' => $items,
             'meta' => ['current_page' => $p->currentPage(), 'per_page' => $p->perPage(), 'last_page' => $p->lastPage(), 'total' => $p->total()],
+            'filter_options' => [
+                'discount_names' => array_values(array_keys($discountNames)),
+            ],
         ];
     }
 
@@ -623,8 +673,14 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
 
     private function rawCreatedAtValue($value)
     {
-        if ($value instanceof Sale && method_exists($value, 'getRawOriginal')) {
-            return $value->getRawOriginal('created_at') ?: $value->created_at;
+        if ($value instanceof Sale) {
+            if ($value->created_at) {
+                return $value->created_at;
+            }
+
+            if (method_exists($value, 'getRawOriginal')) {
+                return $value->getRawOriginal('created_at');
+            }
         }
 
         return $value;
@@ -730,11 +786,29 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
             ->all();
     }
 
+    private function saleLocalIsoForSorting($sale, ?string $timezone = null): ?string
+    {
+        if (!$sale) {
+            return null;
+        }
+
+        return TransactionDate::toSaleIso(
+            $this->rawCreatedAtValue($sale),
+            $timezone,
+            $sale?->sale_number ? (string) $sale->sale_number : null
+        );
+    }
+
     private function summarizeCashierGroup($group, ?string $timezone = null): array
     {
-        $sorted = collect($group)->sortBy('created_at')->values();
+        $sorted = collect($group)
+            ->sortBy(fn ($sale) => $this->saleLocalIsoForSorting($sale, $timezone) ?: (string) ($this->rawCreatedAtValue($sale) ?? ''))
+            ->values();
         $first = $sorted->first();
         $last = $sorted->last();
+
+        $firstLocalIso = $this->saleLocalIsoForSorting($first, $timezone);
+        $lastLocalIso = $this->saleLocalIsoForSorting($last, $timezone);
 
         return [
             'cashier_id' => $first?->cashier_id ? (string) $first->cashier_id : 'unknown',
@@ -743,10 +817,12 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
             'grand_total' => (int) $sorted->sum('grand_total'),
             'paid_total' => (int) $sorted->sum('paid_total'),
             'items_sold' => (int) $sorted->sum(fn ($sale) => $sale->items->sum('qty')),
-            'first_transaction_at' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($first), $timezone, $first?->sale_number),
-            'first_transaction_time' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($first), $timezone, $first?->sale_number, 'H:i'),
-            'last_transaction_at' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($last), $timezone, $last?->sale_number),
-            'last_transaction_time' => TransactionDate::formatSaleLocal($this->rawCreatedAtValue($last), $timezone, $last?->sale_number, 'H:i'),
+            'first_transaction_at' => $firstLocalIso ? TransactionDate::formatLocal($firstLocalIso, $timezone) : null,
+            'first_transaction_date' => $firstLocalIso ? TransactionDate::formatLocal($firstLocalIso, $timezone, 'Y-m-d') : null,
+            'first_transaction_time' => $firstLocalIso ? TransactionDate::formatLocal($firstLocalIso, $timezone, 'H:i') : null,
+            'last_transaction_at' => $lastLocalIso ? TransactionDate::formatLocal($lastLocalIso, $timezone) : null,
+            'last_transaction_date' => $lastLocalIso ? TransactionDate::formatLocal($lastLocalIso, $timezone, 'Y-m-d') : null,
+            'last_transaction_time' => $lastLocalIso ? TransactionDate::formatLocal($lastLocalIso, $timezone, 'H:i') : null,
             'payment_methods' => $this->summarizePaymentMethods($sorted),
         ];
     }
@@ -882,8 +958,10 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
                 'paid_total' => 0,
                 'items_sold' => 0,
                 'first_transaction_at' => null,
+                'first_transaction_date' => null,
                 'first_transaction_time' => null,
                 'last_transaction_at' => null,
+                'last_transaction_date' => null,
                 'last_transaction_time' => null,
                 'payment_methods' => [],
             ];

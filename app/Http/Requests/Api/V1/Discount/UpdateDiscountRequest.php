@@ -43,8 +43,8 @@ class UpdateDiscountRequest extends FormRequest
                 $v->errors()->add('customer_ids', 'customer_ids cannot be empty when applies_to=CUSTOMER.');
             }
             if ($applies === 'SQUAD') {
-                if ($this->has('product_ids') && !empty($this->input('product_ids'))) {
-                    $v->errors()->add('product_ids', 'product_ids must be empty when applies_to=SQUAD.');
+                if ($this->has('product_ids') && empty($this->input('product_ids'))) {
+                    $v->errors()->add('product_ids', 'product_ids cannot be empty when applies_to=SQUAD.');
                 }
                 if ($this->has('customer_ids') && !empty($this->input('customer_ids'))) {
                     $v->errors()->add('customer_ids', 'customer_ids must be empty when applies_to=SQUAD.');
