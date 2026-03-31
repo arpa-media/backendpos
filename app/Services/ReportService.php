@@ -11,10 +11,16 @@ use Illuminate\Support\Facades\DB;
 
 class ReportService
 {
+    private function currentTimezone(): string
+    {
+        $fallback = 'Asia/Jakarta';
+
+        return TransactionDate::normalizeTimezone((string) config('app.timezone', $fallback), $fallback);
+    }
 
     private function resolveTimezone(?string $outletId): string
     {
-        $defaultTimezone = 'Asia/Jakarta';
+        $defaultTimezone = $this->currentTimezone();
 
         if (!$outletId) {
             return $defaultTimezone;
@@ -34,9 +40,9 @@ class ReportService
         return [$fromLocal, $toLocal, $fromUtc, $toUtc, $timezone];
     }
 
-    private function formatCreatedAt($value): ?string
+    private function formatCreatedAt($value, ?string $timezone = null, ?string $saleNumber = null): ?string
     {
-        return TransactionDate::formatLocal($value);
+        return TransactionDate::formatSaleLocal($value, $timezone ?: $this->currentTimezone(), $saleNumber);
     }
 
     private function resolveRange(?string $dateFrom, ?string $dateTo): array
@@ -44,81 +50,80 @@ class ReportService
         [$fromLocal, $toLocal] = TransactionDate::dateRange(
             $dateFrom,
             $dateTo,
-            'Asia/Jakarta'
+            $this->currentTimezone()
         );
 
         return [$fromLocal, $toLocal];
     }
 
+    private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo): array
+    {
+        $saleNumberColumn = preg_replace('/created_at$/', 'sale_number', $column);
 
-private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo): array
-{
-    $saleNumberColumn = preg_replace('/created_at$/', 'sale_number', $column);
-
-    return $this->applyBusinessDateScope(
-        $query,
-        is_string($saleNumberColumn) ? $saleNumberColumn : null,
-        $column,
-        $dateFrom,
-        $dateTo,
-        'Asia/Jakarta'
-    );
-}
-
-private function applyOutletUtcDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo, ?string $outletId): array
-{
-    $saleNumberColumn = preg_replace('/created_at$/', 'sale_number', $column);
-    $timezone = $this->resolveTimezone($outletId);
-
-    return $this->applyBusinessDateScope(
-        $query,
-        is_string($saleNumberColumn) ? $saleNumberColumn : null,
-        $column,
-        $dateFrom,
-        $dateTo,
-        $timezone
-    );
-}
-
-
-private function dateTokensForScope(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
-{
-    return TransactionDate::dateTokens($dateFrom, $dateTo, $timezone ?: 'Asia/Jakarta');
-}
-
-private function applyBusinessDateScope(object $query, ?string $saleNumberColumn, string $createdAtColumn, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
-{
-    [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange(
-        $dateFrom,
-        $dateTo,
-        $timezone ?: 'Asia/Jakarta'
-    );
-
-    $tokens = $this->dateTokensForScope($dateFrom, $dateTo, $timezone);
-    if (!$saleNumberColumn || empty($tokens)) {
-        $query->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
-        return [$fromLocal, $toLocal, $fromUtc, $toUtc];
+        return $this->applyBusinessDateScope(
+            $query,
+            is_string($saleNumberColumn) ? $saleNumberColumn : null,
+            $column,
+            $dateFrom,
+            $dateTo,
+            $this->currentTimezone()
+        );
     }
 
-    $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $tokens, $fromUtc, $toUtc) {
-        $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
-            foreach ($tokens as $index => $token) {
-                $method = $index === 0 ? 'where' : 'orWhere';
-                $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
-            }
-        })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromUtc, $toUtc) {
-            $fallbackScope
-                ->where(function ($legacyScope) use ($saleNumberColumn) {
-                    $legacyScope
-                        ->whereNull($saleNumberColumn)
-                        ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
-                })
-                ->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
-        });
-    });
+    private function applyOutletUtcDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo, ?string $outletId): array
+    {
+        $saleNumberColumn = preg_replace('/created_at$/', 'sale_number', $column);
+        $timezone = $this->resolveTimezone($outletId);
 
-    return [$fromLocal, $toLocal, $fromUtc, $toUtc];
-}
+        return $this->applyBusinessDateScope(
+            $query,
+            is_string($saleNumberColumn) ? $saleNumberColumn : null,
+            $column,
+            $dateFrom,
+            $dateTo,
+            $timezone
+        );
+    }
+
+    private function dateTokensForScope(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        return TransactionDate::dateTokens($dateFrom, $dateTo, $timezone ?: $this->currentTimezone());
+    }
+
+    private function applyBusinessDateScope(object $query, ?string $saleNumberColumn, string $createdAtColumn, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange(
+            $dateFrom,
+            $dateTo,
+            $timezone ?: $this->currentTimezone()
+        );
+
+        $tokens = $this->dateTokensForScope($dateFrom, $dateTo, $timezone);
+        if (!$saleNumberColumn || empty($tokens)) {
+            $query->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
+
+            return [$fromLocal, $toLocal, $fromUtc, $toUtc];
+        }
+
+        $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $tokens, $fromUtc, $toUtc) {
+            $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
+                foreach ($tokens as $index => $token) {
+                    $method = $index === 0 ? 'where' : 'orWhere';
+                    $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
+                }
+            })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromUtc, $toUtc) {
+                $fallbackScope
+                    ->where(function ($legacyScope) use ($saleNumberColumn) {
+                        $legacyScope
+                            ->whereNull($saleNumberColumn)
+                            ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
+                    })
+                    ->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
+            });
+        });
+
+        return [$fromLocal, $toLocal, $fromUtc, $toUtc];
+    }
 
     private function paginate(QueryBuilder $q, int $perPage, int $page): LengthAwarePaginator
     {
@@ -206,7 +211,7 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
                 'marking' => (int) ($r->marking ?? 1),
-                'created_at' => $this->formatCreatedAt($r->created_at),
+                'created_at' => $this->formatCreatedAt($r->created_at, null, isset($r->sale_number) ? (string) $r->sale_number : null),
             ];
         })->values()->all();
 
@@ -297,7 +302,7 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
                 'items_sold' => (int) ($r->items_sold ?? 0),
                 'total' => (int) ($r->total ?? 0),
                 'paid' => (int) ($r->paid ?? 0),
-                'created_at' => $this->formatCreatedAt($r->created_at),
+                'created_at' => $this->formatCreatedAt($r->created_at, null, isset($r->sale_number) ? (string) $r->sale_number : null),
             ];
         })->values()->all();
 
@@ -463,7 +468,7 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
                 'total_before_rounding' => (int) ($r->total_before_rounding ?? 0),
                 'rounding' => (int) ($r->rounding ?? 0),
                 'total' => (int) ($r->total ?? 0),
-                'created_at' => $this->formatCreatedAt($r->created_at),
+                'created_at' => $this->formatCreatedAt($r->created_at, null, isset($r->sale_number) ? (string) $r->sale_number : null),
             ];
         })->values()->all();
 
@@ -545,7 +550,7 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
                 'tax' => (int) ($r->tax ?? 0),
-                'created_at' => $this->formatCreatedAt($r->created_at),
+                'created_at' => $this->formatCreatedAt($r->created_at, null, isset($r->sale_number) ? (string) $r->sale_number : null),
             ];
         })->values()->all();
 
@@ -634,7 +639,7 @@ private function applyBusinessDateScope(object $query, ?string $saleNumberColumn
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
                 'discount' => (int) ($r->discount ?? 0),
-                'created_at' => $this->formatCreatedAt($r->created_at),
+                'created_at' => $this->formatCreatedAt($r->created_at, null, isset($r->sale_number) ? (string) $r->sale_number : null),
             ];
         })->values()->all();
 

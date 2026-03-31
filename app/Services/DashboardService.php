@@ -191,7 +191,7 @@ class DashboardService
 
     private function resolveTimezone(?string $outletId): string
     {
-        $defaultTimezone = 'Asia/Jakarta';
+        $defaultTimezone = TransactionDate::normalizeTimezone((string) config('app.timezone', 'Asia/Jakarta'), 'Asia/Jakarta');
 
         if (!$outletId) {
             return $defaultTimezone;

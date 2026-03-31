@@ -9,6 +9,7 @@ use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Http\Resources\Api\V1\Sales\SaleListResource;
 use App\Models\Sale;
 use App\Support\OutletScope;
+use App\Support\TransactionDate;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -23,10 +24,13 @@ class SalesController extends Controller
 
         $outletId = OutletScope::id($request); // null => ALL
 
-        // Date filters should follow outlet timezone.
-        $tz = config('app.timezone', 'Asia/Jakarta');
+        // Date filters should follow outlet timezone / request timezone.
+        $tz = TransactionDate::normalizeTimezone((string) config('app.timezone', 'Asia/Jakarta'), 'Asia/Jakarta');
         if ($outletId) {
-            $tz = DB::table('outlets')->where('id', $outletId)->value('timezone') ?: $tz;
+            $tz = TransactionDate::normalizeTimezone(
+                (string) (DB::table('outlets')->where('id', $outletId)->value('timezone') ?: $tz),
+                $tz
+            );
         }
 
         $q = Sale::query()
@@ -54,16 +58,29 @@ class SalesController extends Controller
             });
         }
         if (!empty($v['date_from']) || !empty($v['date_to'])) {
-            $from = !empty($v['date_from']) ? \Carbon\Carbon::parse($v['date_from'], $tz)->startOfDay() : null;
-            $to = !empty($v['date_to']) ? \Carbon\Carbon::parse($v['date_to'], $tz)->endOfDay() : null;
+            [, , $fromQuery, $toQuery] = TransactionDate::dateRange(
+                $v['date_from'] ?? null,
+                $v['date_to'] ?? null,
+                $tz
+            );
+            $tokens = TransactionDate::dateTokens($v['date_from'] ?? null, $v['date_to'] ?? null, $tz);
 
-            if ($from && $to) {
-                $q->whereBetween('created_at', [$from->utc(), $to->utc()]);
-            } elseif ($from) {
-                $q->where('created_at', '>=', $from->utc());
-            } elseif ($to) {
-                $q->where('created_at', '<=', $to->utc());
-            }
+            $q->where(function ($outer) use ($tokens, $fromQuery, $toQuery) {
+                $outer->where(function ($saleNumberScope) use ($tokens) {
+                    foreach ($tokens as $index => $token) {
+                        $method = $index === 0 ? 'where' : 'orWhere';
+                        $saleNumberScope->{$method}('sale_number', 'like', '%-' . $token . '-%');
+                    }
+                })->orWhere(function ($fallbackScope) use ($fromQuery, $toQuery) {
+                    $fallbackScope
+                        ->where(function ($legacyScope) {
+                            $legacyScope
+                                ->whereNull('sale_number')
+                                ->orWhere('sale_number', 'not like', 'S.%-%-%');
+                        })
+                        ->whereBetween('created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
+                });
+            });
         }
         if (isset($v['min_total'])) {
             $q->where('grand_total', '>=', (int) $v['min_total']);
