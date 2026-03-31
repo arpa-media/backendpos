@@ -14,7 +14,7 @@ class DiscountSquadService
 {
     public function currentPeriodKey(): string
     {
-        return now(config('app.timezone', 'Asia/Jakarta'))->format('Y-m');
+        return now(config('app.timezone', 'Asia/Jakarta'))->format('ymd');
     }
 
     public function normalizeNisj(?string $nisj): string
@@ -63,8 +63,8 @@ class DiscountSquadService
             'quota_remaining' => $available ? 1 : 0,
             'quota_available' => $available,
             'quota_message' => $available
-                ? 'Jatah discount squad masih tersedia untuk bulan ini.'
-                : 'Jatah discount squad sudah terpakai untuk bulan ini.',
+                ? 'Jatah discount squad masih tersedia untuk hari ini.'
+                : 'Jatah discount squad sudah terpakai untuk hari ini.',
         ];
     }
 
@@ -121,7 +121,7 @@ class DiscountSquadService
 
         if (! $this->isAvailableForNisj($nisj, $period)) {
             throw ValidationException::withMessages([
-                'discount_squad_nisj' => ['Jatah discount squad untuk NISJ tersebut sudah terpakai bulan ini.'],
+                'discount_squad_nisj' => ['Jatah discount squad untuk NISJ tersebut sudah terpakai hari ini.'],
             ]);
         }
 
@@ -138,7 +138,7 @@ class DiscountSquadService
             ]);
         } catch (QueryException $e) {
             throw ValidationException::withMessages([
-                'discount_squad_nisj' => ['Jatah discount squad untuk NISJ tersebut sudah terpakai bulan ini.'],
+                'discount_squad_nisj' => ['Jatah discount squad untuk NISJ tersebut sudah terpakai hari ini.'],
             ]);
         }
     }
