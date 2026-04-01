@@ -6,11 +6,13 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Auth\LoginRequest;
 use App\Http\Resources\Api\V1\Auth\MeResource;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
+use App\Models\User;
 use App\Services\ReportPortalAccessService;
 use App\Services\UserManagementService;
 use App\Support\Auth\UserAuthContextResolver;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
@@ -34,7 +36,7 @@ class AuthController extends Controller
             ]);
         }
 
-        $user = \App\Models\User::query()
+        $user = User::query()
             ->where(function ($query) use ($identifier) {
                 $query->where('nisj', $identifier)
                     ->orWhere('username', $identifier)
@@ -95,9 +97,7 @@ class AuthController extends Controller
             $abilities = ['*'];
         }
 
-        $tokenName = $loginAs === 'POS' ? 'pos' : 'backoffice';
-        $user->tokens()->where('name', $tokenName)->delete();
-        $token = $user->createToken($tokenName, $abilities);
+        $token = $this->issueToken($request, $user, $loginAs, $validated, $abilities);
 
         return ApiResponse::ok([
             'token' => $token->plainTextToken,
@@ -134,5 +134,86 @@ class AuthController extends Controller
         $request->user()->currentAccessToken()?->delete();
 
         return ApiResponse::ok(null, 'Logged out');
+    }
+
+    private function issueToken(Request $request, User $user, string $loginAs, array $validated, array $abilities)
+    {
+        $tokenName = $this->buildTokenName($request, $loginAs, $validated);
+        $token = $user->createToken($tokenName, $abilities);
+
+        $this->pruneLegacyAndOverflowTokens($user, $loginAs, $token->accessToken->id);
+
+        return $token;
+    }
+
+    private function buildTokenName(Request $request, string $loginAs, array $validated): string
+    {
+        $mode = $loginAs === 'POS' ? 'pos' : 'backoffice';
+        $scope = $loginAs === 'POS'
+            ? strtoupper(trim((string) ($validated['outlet_code'] ?? '')))
+            : 'GLOBAL';
+
+        $clientVariant = strtoupper(trim((string) ($request->header('X-App-Variant') ?: $request->input('app_variant', ''))));
+        $clientAgent = trim((string) ($request->header('X-Cap-User-Agent') ?: $request->userAgent() ?: 'unknown-client'));
+        $fingerprint = substr(hash('sha256', implode('|', [
+            $mode,
+            $scope ?: 'GLOBAL',
+            Str::lower($clientVariant ?: 'default'),
+            Str::lower($clientAgent),
+        ])), 0, 12);
+
+        return sprintf(
+            '%s:%s:%s:%s',
+            $mode,
+            $scope ?: 'GLOBAL',
+            $fingerprint,
+            now()->format('YmdHisv')
+        );
+    }
+
+    private function pruneLegacyAndOverflowTokens(User $user, string $loginAs, int $currentTokenId): void
+    {
+        $legacyName = $loginAs === 'POS' ? 'pos' : 'backoffice';
+        $prefixedName = $legacyName . ':';
+        $maxActiveTokens = 20;
+        $staleBefore = now()->subDays(30);
+
+        $query = $user->tokens()
+            ->where(function ($builder) use ($legacyName, $prefixedName) {
+                $builder->where('name', $legacyName)
+                    ->orWhere('name', 'like', $prefixedName . '%');
+            });
+
+        $staleIds = (clone $query)
+            ->where('id', '<>', $currentTokenId)
+            ->whereNotNull('last_used_at')
+            ->where('last_used_at', '<', $staleBefore)
+            ->pluck('id')
+            ->all();
+
+        if (!empty($staleIds)) {
+            $user->tokens()->whereIn('id', $staleIds)->delete();
+        }
+
+        $keepIds = (clone $query)
+            ->orderByRaw('CASE WHEN id = ? THEN 0 ELSE 1 END', [$currentTokenId])
+            ->orderByDesc('last_used_at')
+            ->orderByDesc('id')
+            ->limit($maxActiveTokens)
+            ->pluck('id')
+            ->all();
+
+        if (empty($keepIds)) {
+            return;
+        }
+
+        $overflowIds = (clone $query)
+            ->whereNotIn('id', $keepIds)
+            ->pluck('id')
+            ->all();
+
+        if (!empty($overflowIds)) {
+            $user->tokens()->whereIn('id', $overflowIds)->delete();
+        }
     }
 }
