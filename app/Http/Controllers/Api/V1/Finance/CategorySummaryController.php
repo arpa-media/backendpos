@@ -5,7 +5,7 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListCategorySummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
-use App\Support\OutletScope;
+use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -19,9 +19,10 @@ class CategorySummaryController extends Controller
         $sort = (string) ($v['sort'] ?? 'category_name');
         $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
 
-        $outletId = OutletScope::id($request);
-        $outletInfo = $this->resolveOutletScopeInfo($outletId);
-        $timezone = $outletInfo['timezone'];
+        $outletFilter = FinanceOutletFilter::resolve((string) ($v['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
+        $timezone = $outletFilter['timezone'];
+        $outletIds = $outletFilter['outlet_ids'];
+        $categorySegment = strtolower((string) ($v['category_segment'] ?? ''));
 
         [$fromLocal, $toLocal, $fromQuery, $toQuery] = TransactionDate::dateRange(
             $v['date_from'] ?? null,
@@ -29,7 +30,7 @@ class CategorySummaryController extends Controller
             $timezone
         );
 
-        $rows = $this->buildRows($outletId, $fromQuery, $toQuery, $v, $timezone, $sort, $dir)->get();
+        $rows = $this->buildRows($outletIds, $fromQuery, $toQuery, $v, $timezone, $sort, $dir)->get();
 
         $items = $rows->map(function ($row) {
             $grossSales = (int) round((float) ($row->gross_sales ?? 0));
@@ -69,21 +70,32 @@ class CategorySummaryController extends Controller
             'filters' => [
                 'date_from' => $fromLocal->format('Y-m-d'),
                 'date_to' => $toLocal->format('Y-m-d'),
+                'outlet_filter' => $outletFilter['value'],
+                'category_segment' => $categorySegment,
                 'sort' => $sort,
                 'dir' => $dir,
             ],
+            'filter_options' => [
+                'outlet_filters' => $outletFilter['options'],
+                'category_segments' => [
+                    ['value' => '', 'label' => 'All Category'],
+                    ['value' => 'bar', 'label' => 'Bar (placeholder)'],
+                    ['value' => 'kitchen', 'label' => 'Kitchen (placeholder)'],
+                ],
+            ],
             'meta' => [
                 'timezone' => $timezone,
-                'outlet_scope_id' => $outletId,
-                'outlet_scope_name' => $outletInfo['name'],
+                'outlet_scope_name' => $outletFilter['label'],
                 'range_start_local' => $fromLocal->copy()->startOfDay()->format('Y-m-d H:i:s'),
                 'range_end_local' => $toLocal->copy()->endOfDay()->format('Y-m-d H:i:s'),
                 'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                'category_segment_active' => $categorySegment,
+                'category_segment_placeholder' => true,
             ],
         ], 'OK');
     }
 
-    private function buildRows(?string $outletId, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, string $sort, string $dir): Builder
+    private function buildRows(array $outletIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, string $sort, string $dir): Builder
     {
         $salesTotalsSub = DB::table('sale_items as tsi')
             ->selectRaw('tsi.sale_id, COALESCE(SUM(tsi.line_total), 0) as items_gross_sales')
@@ -97,7 +109,7 @@ class CategorySummaryController extends Controller
             ->whereNull('si.voided_at')
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->when($outletId, fn ($query) => $query->where('s.outlet_id', $outletId));
+            ->when(!empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds));
 
         $this->applyBusinessDateScope($aggSub, $fromQuery, $toQuery, $filters, $timezone, 's.sale_number', 's.created_at');
 
@@ -108,32 +120,33 @@ class CategorySummaryController extends Controller
             ->selectRaw('COALESCE(SUM(si.line_total), 0) as gross_sales')
             ->selectRaw('COALESCE(ROUND(SUM(CASE WHEN COALESCE(sale_totals.items_gross_sales, 0) > 0 THEN (COALESCE(s.discount_total, 0) * si.line_total) / sale_totals.items_gross_sales ELSE 0 END), 0), 0) as discount');
 
-        $baseCategories = DB::table('categories as c')
-            ->join('products as p', 'p.category_id', '=', 'c.id')
-            ->whereNull('c.deleted_at')
-            ->whereNull('p.deleted_at')
-            ->where('p.is_active', true)
-            ->when($outletId, function ($query) use ($outletId) {
-                $query->join('outlet_product as op', function ($join) use ($outletId) {
-                    $join->on('op.product_id', '=', 'p.id')
-                        ->where('op.outlet_id', '=', $outletId)
-                        ->where('op.is_active', '=', true);
-                });
-            }, function ($query) {
-                $query->join('outlet_product as op', function ($join) {
-                    $join->on('op.product_id', '=', 'p.id')
-                        ->where('op.is_active', '=', true);
-                });
+        $visibleCategories = DB::table('products as p')
+            ->join('categories as c', 'c.id', '=', 'p.category_id')
+            ->join('outlet_product as op', function ($join) use ($outletIds) {
+                $join->on('op.product_id', '=', 'p.id')
+                    ->where('op.is_active', '=', true);
+
+                if (!empty($outletIds)) {
+                    $join->whereIn('op.outlet_id', $outletIds);
+                }
             })
-            ->leftJoinSub($aggSub, 'agg', fn ($join) => $join->on('agg.category_id', '=', 'c.id'))
-            ->groupBy('c.id', 'c.name', 'agg.item_sold', 'agg.gross_sales', 'agg.discount')
-            ->selectRaw('c.id as category_id')
-            ->selectRaw('c.name as category_name')
+            ->whereNull('p.deleted_at')
+            ->whereNull('c.deleted_at')
+            ->where('p.is_active', true)
+            ->groupBy('p.category_id')
+            ->selectRaw('p.category_id as category_id')
+            ->selectRaw('MAX(c.name) as category_name');
+
+        $query = DB::query()
+            ->fromSub($visibleCategories, 'vc')
+            ->leftJoinSub($aggSub, 'agg', fn ($join) => $join->on('agg.category_id', '=', 'vc.category_id'))
+            ->selectRaw('vc.category_id as category_id')
+            ->selectRaw('COALESCE(vc.category_name, ?) as category_name', ['-'])
             ->selectRaw('COALESCE(agg.item_sold, 0) as item_sold')
             ->selectRaw('COALESCE(agg.gross_sales, 0) as gross_sales')
             ->selectRaw('COALESCE(agg.discount, 0) as discount');
 
-        return $this->applySorting($baseCategories, $sort, $dir);
+        return $this->applySorting($query, $sort, $dir);
     }
 
     private function applySorting(Builder $query, string $sort, string $dir): Builder
@@ -148,28 +161,6 @@ class CategorySummaryController extends Controller
             'gross_margin' => $query->orderByRaw('(CASE WHEN (COALESCE(agg.gross_sales, 0) - COALESCE(agg.discount, 0)) > 0 THEN 100 ELSE 0 END) ' . strtoupper($dir))->orderBy('category_name'),
             default => $query->orderBy('category_name', $dir),
         };
-    }
-
-    private function resolveOutletScopeInfo(?string $outletId): array
-    {
-        $defaultTimezone = config('app.timezone', 'Asia/Jakarta');
-
-        if (!$outletId) {
-            return [
-                'name' => 'Semua Outlet',
-                'timezone' => TransactionDate::normalizeTimezone($defaultTimezone, $defaultTimezone),
-            ];
-        }
-
-        $outlet = DB::table('outlets')
-            ->select(['name', 'timezone'])
-            ->where('id', $outletId)
-            ->first();
-
-        return [
-            'name' => (string) ($outlet->name ?? 'Outlet'),
-            'timezone' => TransactionDate::normalizeTimezone((string) ($outlet->timezone ?: $defaultTimezone), $defaultTimezone),
-        ];
     }
 
     private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void

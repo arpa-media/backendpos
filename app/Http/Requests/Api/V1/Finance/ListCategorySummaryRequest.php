@@ -17,6 +17,8 @@ class ListCategorySummaryRequest extends FormRequest
         return [
             'date_from' => ['nullable', 'date'],
             'date_to' => ['nullable', 'date'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
+            'category_segment' => ['nullable', 'string', Rule::in(['', 'bar', 'kitchen'])],
             'sort' => ['nullable', 'string', Rule::in([
                 'category_name', 'item_sold', 'gross_sales', 'discount', 'net_sales', 'cogs', 'gross_profit', 'gross_margin',
             ])],

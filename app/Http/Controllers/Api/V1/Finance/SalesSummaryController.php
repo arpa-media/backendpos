@@ -5,7 +5,7 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListSalesSummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
-use App\Support\OutletScope;
+use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -19,9 +19,9 @@ class SalesSummaryController extends Controller
         $sort = (string) ($v['sort'] ?? 'outlet_name');
         $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
 
-        $outletId = OutletScope::id($request);
-        $outletInfo = $this->resolveOutletScopeInfo($outletId);
-        $timezone = $outletInfo['timezone'];
+        $outletFilter = FinanceOutletFilter::resolve((string) ($v['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
+        $timezone = $outletFilter['timezone'];
+        $outletIds = $outletFilter['outlet_ids'];
 
         [$fromLocal, $toLocal, $fromQuery, $toQuery] = TransactionDate::dateRange(
             $v['date_from'] ?? null,
@@ -29,7 +29,7 @@ class SalesSummaryController extends Controller
             $timezone
         );
 
-        $rows = $this->buildRows($outletId, $fromQuery, $toQuery, $v, $timezone, $sort, $dir)->get();
+        $rows = $this->buildRows($outletIds, $fromQuery, $toQuery, $v, $timezone, $sort, $dir)->get();
 
         $items = $rows->map(function ($row) {
             $grossSales = (int) round((float) ($row->gross_sales ?? 0));
@@ -52,10 +52,11 @@ class SalesSummaryController extends Controller
             ];
         })->values();
 
+        $discountTotal = (int) $items->sum('discount');
         $summary = [
             'gross_sales' => (int) $items->sum('gross_sales'),
-            'discount' => (int) $items->sum('discount'),
-            'discount_display' => (int) ($items->sum('discount') > 0 ? (-1 * $items->sum('discount')) : 0),
+            'discount' => $discountTotal,
+            'discount_display' => $discountTotal > 0 ? (-1 * $discountTotal) : 0,
             'net_sales' => (int) $items->sum('net_sales'),
             'tax' => (int) $items->sum('tax'),
             'rounding' => (int) $items->sum('rounding'),
@@ -68,13 +69,16 @@ class SalesSummaryController extends Controller
             'filters' => [
                 'date_from' => $fromLocal->format('Y-m-d'),
                 'date_to' => $toLocal->format('Y-m-d'),
+                'outlet_filter' => $outletFilter['value'],
                 'sort' => $sort,
                 'dir' => $dir,
             ],
+            'filter_options' => [
+                'outlet_filters' => $outletFilter['options'],
+            ],
             'meta' => [
                 'timezone' => $timezone,
-                'outlet_scope_id' => $outletId,
-                'outlet_scope_name' => $outletInfo['name'],
+                'outlet_scope_name' => $outletFilter['label'],
                 'range_start_local' => $fromLocal->copy()->startOfDay()->format('Y-m-d H:i:s'),
                 'range_end_local' => $toLocal->copy()->endOfDay()->format('Y-m-d H:i:s'),
                 'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
@@ -82,12 +86,12 @@ class SalesSummaryController extends Controller
         ], 'OK');
     }
 
-    private function buildRows(?string $outletId, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, string $sort, string $dir): Builder
+    private function buildRows(array $outletIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, string $sort, string $dir): Builder
     {
         $aggSub = DB::table('sales as s')
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->when($outletId, fn ($query) => $query->where('s.outlet_id', $outletId));
+            ->when(!empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds));
 
         $this->applyBusinessDateScope($aggSub, $fromQuery, $toQuery, $filters, $timezone, 's.sale_number', 's.created_at');
 
@@ -104,7 +108,7 @@ class SalesSummaryController extends Controller
         $query = DB::table('outlets as o')
             ->leftJoinSub($aggSub, 'agg', fn ($join) => $join->on('agg.outlet_id', '=', 'o.id'))
             ->where('o.type', 'outlet')
-            ->when($outletId, fn ($builder) => $builder->where('o.id', $outletId))
+            ->when(!empty($outletIds), fn ($builder) => $builder->whereIn('o.id', $outletIds))
             ->selectRaw('o.id as outlet_id')
             ->selectRaw('o.name as outlet_name')
             ->selectRaw('COALESCE(agg.gross_sales, 0) as gross_sales')
@@ -128,28 +132,6 @@ class SalesSummaryController extends Controller
             'total_collected' => $query->orderBy('total_collected', $dir)->orderBy('outlet_name'),
             default => $query->orderBy('outlet_name', $dir),
         };
-    }
-
-    private function resolveOutletScopeInfo(?string $outletId): array
-    {
-        $defaultTimezone = config('app.timezone', 'Asia/Jakarta');
-
-        if (!$outletId) {
-            return [
-                'name' => 'Semua Outlet',
-                'timezone' => TransactionDate::normalizeTimezone($defaultTimezone, $defaultTimezone),
-            ];
-        }
-
-        $outlet = DB::table('outlets')
-            ->select(['name', 'timezone'])
-            ->where('id', $outletId)
-            ->first();
-
-        return [
-            'name' => (string) ($outlet->name ?? 'Outlet'),
-            'timezone' => TransactionDate::normalizeTimezone((string) ($outlet->timezone ?: $defaultTimezone), $defaultTimezone),
-        ];
     }
 
     private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void

@@ -20,6 +20,7 @@ use App\Http\Controllers\Api\V1\AddonController;
 use App\Http\Controllers\Api\V1\TaxController;
 use App\Http\Controllers\Api\V1\ReportController;
 use App\Http\Controllers\Api\V1\ReportPortalController;
+use App\Http\Controllers\Api\V1\OwnerOverviewController;
 use App\Http\Controllers\Api\V1\UserManagementController;
 
 
@@ -64,6 +65,10 @@ Route::prefix('v1')->group(function () {
         /**
          * REPORT PORTALS (Patch-02)
          */
+
+        Route::get('/owner-overview', [OwnerOverviewController::class, 'index'])
+            ->middleware(['permission:dashboard.view', 'role:admin']);
+
         Route::prefix('report-portals/{portalCode}')->group(function () {
             Route::get('/dashboard', [ReportPortalController::class, 'dashboard'])
                 ->middleware('permission:dashboard.view');

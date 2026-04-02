@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
+use App\Support\TransactionDate;
 use App\Models\Sale;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
@@ -155,6 +156,7 @@ class ReportPortalAnalyticsService
                 's.created_at',
                 'o.code as outlet_code',
                 'o.name as outlet_name',
+                'o.timezone as outlet_timezone',
             ])
             ->orderByDesc('s.created_at')
             ->orderByDesc('s.id')
@@ -373,26 +375,35 @@ class ReportPortalAnalyticsService
                 's.created_at',
                 'o.code as outlet_code',
                 'o.name as outlet_name',
+                'o.timezone as outlet_timezone',
             ])
             ->orderByDesc('s.created_at')
             ->orderByDesc('s.id');
 
         $paginator = $this->paginate($query, $perPage, $page);
 
-        $items = collect($paginator->items())->map(fn ($row) => [
-            'sale_id' => (string) $row->sale_id,
-            'sale_number' => (string) ($row->sale_number ?? ''),
-            'outlet_code' => (string) ($row->outlet_code ?? ''),
-            'outlet_name' => (string) ($row->outlet_name ?? ''),
-            'channel' => (string) ($row->channel ?? '-'),
-            'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
-            'tax_name' => (string) ($row->tax_name_snapshot ?? 'Tax'),
-            'tax_percent' => (int) ($row->tax_percent_snapshot ?? 0),
-            'tax_total' => (int) ($row->tax_total ?? 0),
-            'grand_total' => (int) ($row->grand_total ?? 0),
-            'marking' => (int) ($row->marking ?? 1),
-            'created_at' => $this->normalizeDateTime($row->created_at),
-        ])->values()->all();
+        $items = collect($paginator->items())->map(function ($row) {
+            $timezone = (string) ($row->outlet_timezone ?? config('app.timezone', 'Asia/Jakarta'));
+            $createdAtText = TransactionDate::formatSaleLocal($row->created_at ?? null, $timezone, (string) ($row->sale_number ?? ''));
+
+            return [
+                'sale_id' => (string) $row->sale_id,
+                'sale_number' => (string) ($row->sale_number ?? ''),
+                'outlet_code' => (string) ($row->outlet_code ?? ''),
+                'outlet_name' => (string) ($row->outlet_name ?? ''),
+                'outlet_timezone' => $timezone,
+                'channel' => (string) ($row->channel ?? '-'),
+                'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
+                'tax_name' => (string) ($row->tax_name_snapshot ?? 'Tax'),
+                'tax_percent' => (int) ($row->tax_percent_snapshot ?? 0),
+                'tax_total' => (int) ($row->tax_total ?? 0),
+                'grand_total' => (int) ($row->grand_total ?? 0),
+                'marking' => (int) ($row->marking ?? 1),
+                'created_at' => TransactionDate::toSaleIso($row->created_at ?? null, $timezone, (string) ($row->sale_number ?? '')),
+                'created_at_text' => $createdAtText,
+                'created_at_time' => $createdAtText ? substr($createdAtText, 11, 5) : '-',
+            ];
+        })->values()->all();
 
         return [
             'scope' => $this->scopeMeta($scope),
@@ -479,6 +490,7 @@ class ReportPortalAnalyticsService
                 's.created_at',
                 'o.code as outlet_code',
                 'o.name as outlet_name',
+                'o.timezone as outlet_timezone',
             ])
             ->orderByDesc('s.created_at')
             ->orderByDesc('s.id');
@@ -538,11 +550,15 @@ class ReportPortalAnalyticsService
 
     private function mapSaleListRow(object $row): array
     {
+        $timezone = (string) ($row->outlet_timezone ?? config('app.timezone', 'Asia/Jakarta'));
+        $createdAtText = TransactionDate::formatSaleLocal($row->created_at ?? null, $timezone, (string) ($row->sale_number ?? ''));
+
         return [
             'sale_id' => (string) $row->sale_id,
             'sale_number' => (string) ($row->sale_number ?? ''),
             'outlet_code' => (string) ($row->outlet_code ?? ''),
             'outlet_name' => (string) ($row->outlet_name ?? ''),
+            'outlet_timezone' => $timezone,
             'channel' => (string) ($row->channel ?? '-'),
             'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
             'payment_method_type' => (string) ($row->payment_method_type ?? ''),
@@ -550,7 +566,9 @@ class ReportPortalAnalyticsService
             'paid' => (int) ($row->paid_total ?? 0),
             'change' => (int) ($row->change_total ?? 0),
             'marking' => (int) ($row->marking ?? 1),
-            'created_at' => $this->normalizeDateTime($row->created_at),
+            'created_at' => TransactionDate::toSaleIso($row->created_at ?? null, $timezone, (string) ($row->sale_number ?? '')),
+            'created_at_text' => $createdAtText,
+            'created_at_time' => $createdAtText ? substr($createdAtText, 11, 5) : '-',
         ];
     }
 

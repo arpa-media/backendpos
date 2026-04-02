@@ -17,6 +17,7 @@ class ListSalesSummaryRequest extends FormRequest
         return [
             'date_from' => ['nullable', 'date'],
             'date_to' => ['nullable', 'date'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
             'sort' => ['nullable', 'string', Rule::in([
                 'outlet_name', 'gross_sales', 'discount', 'net_sales', 'tax', 'rounding', 'total_collected',
             ])],
