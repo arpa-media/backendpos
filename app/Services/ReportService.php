@@ -835,6 +835,86 @@ class ReportService
         ];
     }
 
+    private function isMakassarCashierBusinessTimezone(?string $timezone = null): bool
+    {
+        return TransactionDate::normalizeTimezone($timezone, $this->currentTimezone()) === 'Asia/Makassar';
+    }
+
+    private function resolveCashierReportBusinessToday(?string $timezone = null): string
+    {
+        $tz = TransactionDate::normalizeTimezone($timezone, $this->currentTimezone());
+        $now = CarbonImmutable::now($tz);
+
+        if ($this->isMakassarCashierBusinessTimezone($tz)) {
+            return $now->subHour()->toDateString();
+        }
+
+        return $now->toDateString();
+    }
+
+    private function resolveCashierReportBusinessWindow(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        $tz = TransactionDate::normalizeTimezone($timezone, $this->currentTimezone());
+        $today = CarbonImmutable::parse($this->resolveCashierReportBusinessToday($tz), $tz)->startOfDay();
+
+        try {
+            $requestedFrom = $dateFrom ? CarbonImmutable::parse($dateFrom, $tz)->startOfDay() : $today;
+        } catch (\Throwable $e) {
+            $requestedFrom = $today;
+        }
+
+        try {
+            $requestedTo = $dateTo ? CarbonImmutable::parse($dateTo, $tz)->startOfDay() : $today;
+        } catch (\Throwable $e) {
+            $requestedTo = $today;
+        }
+
+        if ($requestedTo->lessThan($requestedFrom)) {
+            [$requestedFrom, $requestedTo] = [$requestedTo, $requestedFrom];
+        }
+
+        if ($this->isMakassarCashierBusinessTimezone($tz)) {
+            $fromLocal = $requestedFrom->addHour();
+            $toExclusiveLocal = $requestedTo->addDay()->addHour();
+        } else {
+            $fromLocal = $requestedFrom->startOfDay();
+            $toExclusiveLocal = $requestedTo->addDay()->startOfDay();
+        }
+
+        return [
+            'timezone' => $tz,
+            'requested_from' => $requestedFrom,
+            'requested_to' => $requestedTo,
+            'from_local' => $fromLocal,
+            'to_exclusive_local' => $toExclusiveLocal,
+            'to_inclusive_local' => $toExclusiveLocal->subSecond(),
+        ];
+    }
+
+    private function saleLocalMomentForCashierWindow(Sale $sale, ?string $timezone = null): ?CarbonImmutable
+    {
+        $localIso = $this->saleLocalIsoForSorting($sale, $timezone);
+        if (!$localIso) {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($localIso);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    private function saleFallsWithinCashierBusinessWindow(Sale $sale, CarbonImmutable $fromLocal, CarbonImmutable $toExclusiveLocal, ?string $timezone = null): bool
+    {
+        $moment = $this->saleLocalMomentForCashierWindow($sale, $timezone);
+        if (!$moment) {
+            return false;
+        }
+
+        return $moment->greaterThanOrEqualTo($fromLocal) && $moment->lessThan($toExclusiveLocal);
+    }
+
     private function normalizeCashierReportParams(array $params, ?string $outletId = null): array
     {
         if (!empty($params['date']) && empty($params['date_from']) && empty($params['date_to'])) {
@@ -843,7 +923,7 @@ class ReportService
         }
 
         if (empty($params['date_from']) && empty($params['date_to'])) {
-            $today = TransactionDate::todayDateString($this->resolveTimezone($outletId));
+            $today = $this->resolveCashierReportBusinessToday($this->resolveTimezone($outletId));
             $params['date_from'] = $today;
             $params['date_to'] = $today;
         } elseif (empty($params['date_from']) && !empty($params['date_to'])) {
@@ -908,17 +988,37 @@ class ReportService
     public function cashierReport(array $params, ?string $outletId): array
     {
         $params = $this->normalizeCashierReportParams($params, $outletId);
-        [$fromLocal, $toLocal, $fromUtc, $toUtc, $timezone] = $this->resolveOutletUtcRange(
+        $timezone = $this->resolveTimezone($outletId);
+        $window = $this->resolveCashierReportBusinessWindow(
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
-            $outletId
+            $timezone
         );
 
         $salesQuery = Sale::query()
             ->with(['items', 'payments.paymentMethod'])
             ->where('status', '=', 'PAID');
 
-        $this->applyBusinessDateScope($salesQuery, 'sale_number', 'created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone);
+        if ($this->isMakassarCashierBusinessTimezone($timezone)) {
+            $candidateDateTo = $window['requested_to']->addDay()->toDateString();
+            $this->applyBusinessDateScope(
+                $salesQuery,
+                'sale_number',
+                'created_at',
+                $window['requested_from']->toDateString(),
+                $candidateDateTo,
+                $timezone
+            );
+        } else {
+            $this->applyBusinessDateScope(
+                $salesQuery,
+                'sale_number',
+                'created_at',
+                $window['requested_from']->toDateString(),
+                $window['requested_to']->toDateString(),
+                $timezone
+            );
+        }
 
         $salesQuery
             ->orderBy('created_at')
@@ -937,6 +1037,12 @@ class ReportService
         }
 
         $sales = $salesQuery->get();
+
+        if ($this->isMakassarCashierBusinessTimezone($timezone)) {
+            $sales = $sales
+                ->filter(fn (Sale $sale) => $this->saleFallsWithinCashierBusinessWindow($sale, $window['from_local'], $window['to_exclusive_local'], $timezone))
+                ->values();
+        }
 
         $summary = [
             'transaction_count' => $sales->count(),
@@ -977,9 +1083,9 @@ class ReportService
 
         return [
             'range' => [
-                'date_from' => $fromLocal->toDateString(),
-                'date_to' => $toLocal->toDateString(),
-                'date' => $fromLocal->toDateString(),
+                'date_from' => $window['requested_from']->toDateString(),
+                'date_to' => $window['requested_to']->toDateString(),
+                'date' => $window['requested_from']->toDateString(),
             ],
             'cashier' => $cashier,
             'summary' => $summary,
