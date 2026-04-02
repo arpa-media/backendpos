@@ -17,4 +17,16 @@ class OwnerOverviewController extends Controller
     {
         return ApiResponse::ok($this->service->overview($request->validated()), 'OK');
     }
+
+    public function saleDetail(OwnerOverviewQueryRequest $request, string $saleId)
+    {
+        $payload = $this->service->saleDetail($request->validated(), $saleId);
+        if (($payload['ok'] ?? false) !== true) {
+            return ApiResponse::error($payload['message'], $payload['error_code'], $payload['status'], [], $payload['data'] ?? null);
+        }
+
+        unset($payload['ok']);
+
+        return ApiResponse::ok($payload, 'OK');
+    }
 }

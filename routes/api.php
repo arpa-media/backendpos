@@ -69,6 +69,9 @@ Route::prefix('v1')->group(function () {
         Route::get('/owner-overview', [OwnerOverviewController::class, 'index'])
             ->middleware(['permission:dashboard.view', 'role:admin']);
 
+        Route::get('/owner-overview/sales/{saleId}', [OwnerOverviewController::class, 'saleDetail'])
+            ->middleware(['permission:owner_overview.sale_detail.view', 'role:admin']);
+
         Route::prefix('report-portals/{portalCode}')->group(function () {
             Route::get('/dashboard', [ReportPortalController::class, 'dashboard'])
                 ->middleware('permission:dashboard.view');

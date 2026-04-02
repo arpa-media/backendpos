@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
+use App\Models\Sale;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -18,6 +20,81 @@ class OwnerOverviewService
      * @var array<string, array<int, string>>
      */
     private array $groupOutletIdsCache = [];
+
+
+    public function saleDetail(array $params, string $saleId): array
+    {
+        $scope = $this->detailScope($params);
+        if (empty($scope['allowed_outlet_ids'])) {
+            return [
+                'ok' => false,
+                'status' => 403,
+                'message' => 'User tidak memiliki outlet aktif untuk detail sales Owner Overview.',
+                'error_code' => 'OWNER_OVERVIEW_OUTLET_FORBIDDEN',
+            ];
+        }
+
+        $timezone = $this->resolveTimezone($scope['selected_outlet_id'] ?? null);
+        [, , $fromQuery, $toQuery] = TransactionDate::dateRange(
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+        );
+
+        $sale = Sale::query()
+            ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer'])
+            ->where('id', $saleId)
+            ->whereNull('deleted_at')
+            ->where('status', '=', 'PAID')
+            ->whereIn('outlet_id', $scope['allowed_outlet_ids']);
+
+        if (! empty($scope['selected_outlet_id'])) {
+            $sale->where('outlet_id', '=', $scope['selected_outlet_id']);
+        }
+
+        $this->applyBusinessDateScopeToEloquent($sale, $fromQuery, $toQuery, $params, $timezone, 'sale_number', 'created_at');
+
+        $sale = $sale->first();
+        if (! $sale) {
+            return [
+                'ok' => false,
+                'status' => 404,
+                'message' => 'Transaksi tidak ditemukan pada filter Owner Overview ini.',
+                'error_code' => 'OWNER_OVERVIEW_SALE_NOT_FOUND',
+            ];
+        }
+
+        return [
+            'ok' => true,
+            'scope' => $scope,
+            'sale' => $this->normalizeSaleDetailPayload((new SaleDetailResource($sale))->toArray(request())),
+        ];
+    }
+
+    public function detailScope(array $params): array
+    {
+        $selectedOutletId = $this->normalizeOutletId($params['outlet_id'] ?? null);
+        $allowedOutlets = $this->resolveAllowedOutlets($selectedOutletId);
+        $selectedOutlet = null;
+
+        if ($selectedOutletId && ! $this->isOutletGroup($selectedOutletId)) {
+            $selectedOutlet = collect($allowedOutlets)->first(fn (array $outlet) => (string) ($outlet['id'] ?? '') === (string) $selectedOutletId);
+        }
+
+        return [
+            'portal_code' => 'owner-overview',
+            'portal_name' => 'Owner Overview',
+            'mode' => 'owner_overview',
+            'marking_rule' => 'ignore_marking',
+            'marked_only' => false,
+            'allowed_outlets' => $allowedOutlets,
+            'allowed_outlet_ids' => array_values(array_map(fn (array $outlet) => (string) ($outlet['id'] ?? ''), $allowedOutlets)),
+            'selected_outlet_id' => $selectedOutlet ? (string) ($selectedOutlet['id'] ?? '') : null,
+            'selected_outlet_code' => $selectedOutlet ? (string) ($selectedOutlet['code'] ?? '') : ($selectedOutletId ? (string) $selectedOutletId : 'ALL'),
+            'selected_outlet_name' => $selectedOutlet ? (string) ($selectedOutlet['name'] ?? '') : ($selectedOutletId ? (string) $selectedOutletId : 'ALL'),
+            'uses_all_outlets' => $selectedOutletId === null || $this->isOutletGroup($selectedOutletId),
+        ];
+    }
 
     public function overview(array $params): array
     {
@@ -252,6 +329,41 @@ class OwnerOverviewService
         ];
     }
 
+
+    /**
+     * @return array<int, array{id:string,code:string,name:string,type:string,timezone:string}>
+     */
+    private function resolveAllowedOutlets(?string $outletId): array
+    {
+        $query = DB::table('outlets')
+            ->whereRaw('LOWER(COALESCE(type, ?)) = ?', ['outlet', 'outlet']);
+
+        if ($outletId) {
+            if ($this->isOutletGroup($outletId)) {
+                $ids = $this->resolveGroupOutletIds($outletId);
+                if (empty($ids)) {
+                    return [];
+                }
+                $query->whereIn('id', $ids);
+            } else {
+                $query->where('id', '=', $outletId);
+            }
+        }
+
+        return $query
+            ->orderBy('name')
+            ->get(['id', 'code', 'name', 'type', 'timezone'])
+            ->map(fn ($outlet) => [
+                'id' => (string) ($outlet->id ?? ''),
+                'code' => (string) ($outlet->code ?? ''),
+                'name' => (string) ($outlet->name ?? '-'),
+                'type' => (string) ($outlet->type ?? 'outlet'),
+                'timezone' => TransactionDate::normalizeTimezone((string) ($outlet->timezone ?? config('app.timezone', 'Asia/Jakarta'))),
+            ])
+            ->values()
+            ->all();
+    }
+
     private function normalizeOutletId(?string $value): ?string
     {
         $raw = strtoupper(trim((string) ($value ?? '')));
@@ -345,6 +457,34 @@ class OwnerOverviewService
             ->all();
     }
 
+
+    private function applyBusinessDateScopeToEloquent($query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 'sale_number', string $createdAtColumn = 'created_at'): void
+    {
+        $tokens = TransactionDate::dateTokens($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
+
+        if (empty($tokens)) {
+            $query->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
+            return;
+        }
+
+        $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery, $tokens) {
+            $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
+                foreach ($tokens as $index => $token) {
+                    $method = $index === 0 ? 'where' : 'orWhere';
+                    $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
+                }
+            })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery) {
+                $fallbackScope
+                    ->where(function ($legacyScope) use ($saleNumberColumn) {
+                        $legacyScope
+                            ->whereNull($saleNumberColumn)
+                            ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
+                    })
+                    ->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
+            });
+        });
+    }
+
     private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void
     {
         $tokens = TransactionDate::dateTokens($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
@@ -395,5 +535,73 @@ class OwnerOverviewService
             'created_at_text' => $createdAtText,
             'created_at_time' => $createdAtText ? substr($createdAtText, 11, 5) : '-',
         ];
+    }
+
+    private function normalizeSaleDetailPayload(array $sale): array
+    {
+        $items = collect($sale['items'] ?? [])
+            ->filter(fn ($item) => !($item['is_voided'] ?? false));
+        $payments = collect($sale['payments'] ?? []);
+
+        $itemsSubtotal = (int) $items->sum(fn ($item) => max(0, (int) ($item['line_total'] ?? 0)));
+        $paymentTotal = (int) $payments->sum(fn ($payment) => max(0, (int) ($payment['amount'] ?? 0)));
+
+        $subtotal = max(0, (int) ($sale['subtotal'] ?? 0));
+        if ($subtotal <= 0 && $itemsSubtotal > 0) {
+            $subtotal = $itemsSubtotal;
+        }
+
+        $discountTotal = max(0, (int) ($sale['discount_total'] ?? 0));
+        if ($discountTotal <= 0) {
+            $discountTotal = max(0, (int) ($sale['discount_amount'] ?? 0));
+        }
+
+        $taxTotal = max(0, (int) ($sale['tax_total'] ?? 0));
+        $taxPercent = max(0, (int) ($sale['tax_percent'] ?? 0));
+        if ($taxTotal <= 0 && $taxPercent > 0 && $subtotal > 0) {
+            $taxBase = max(0, $subtotal - $discountTotal);
+            $taxTotal = (int) round($taxBase * $taxPercent / 100);
+        }
+
+        $serviceChargeTotal = max(0, (int) ($sale['service_charge_total'] ?? 0));
+        $roundingTotal = (int) ($sale['rounding_total'] ?? 0);
+        $grandTotal = max(0, (int) ($sale['grand_total'] ?? 0));
+
+        $computedGrand = max(0, $subtotal - $discountTotal + $taxTotal + $serviceChargeTotal + $roundingTotal);
+        if ($grandTotal <= 0 && $computedGrand > 0) {
+            $grandTotal = $computedGrand;
+        }
+        if ($grandTotal <= 0 && $paymentTotal > 0) {
+            $grandTotal = $paymentTotal;
+        }
+
+        $paidTotal = max(0, (int) ($sale['paid_total'] ?? 0));
+        if ($paidTotal <= 0 && $paymentTotal > 0) {
+            $paidTotal = $paymentTotal;
+        }
+        if ($paidTotal <= 0 && $grandTotal > 0) {
+            $paidTotal = $grandTotal;
+        }
+
+        $changeTotal = max(0, (int) ($sale['change_total'] ?? 0));
+        if ($changeTotal <= 0 && $paidTotal > $grandTotal) {
+            $changeTotal = max(0, $paidTotal - $grandTotal);
+        }
+
+        $sale['subtotal'] = $subtotal;
+        $sale['discount_total'] = $discountTotal;
+        $sale['tax_total'] = $taxTotal;
+        $sale['service_charge_total'] = $serviceChargeTotal;
+        $sale['rounding_total'] = $roundingTotal;
+        $sale['grand_total'] = $grandTotal;
+        $sale['paid_total'] = $paidTotal;
+        $sale['change_total'] = $changeTotal;
+        $sale['total_before_rounding'] = max(0, $grandTotal - $roundingTotal);
+
+        if (empty($sale['tax_name']) && $taxTotal > 0) {
+            $sale['tax_name'] = 'Tax';
+        }
+
+        return $sale;
     }
 }
