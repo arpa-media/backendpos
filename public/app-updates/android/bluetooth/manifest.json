@@ -9,6 +9,6 @@
     "Fix cutoff timezone WITA",
     "Fix login Gagal",
     "Fix Dashboard permission",
-    "Add Feature prevent logout when unsync",
+    "Add Feature prevent logout when unsync"
   ]
 }
