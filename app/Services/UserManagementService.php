@@ -382,6 +382,15 @@ class UserManagementService
             ],
             [
                 'portal_code' => 'pos',
+                'code' => 'pos-dashboard',
+                'legacy_codes' => ['cashier-dashboard'],
+                'name' => 'Dashboard',
+                'path' => '/c/dashboard',
+                'sort_order' => 12,
+                'permission_view' => 'dashboard.view',
+            ],
+            [
+                'portal_code' => 'pos',
                 'code' => 'pos-offline-transactions',
                 'legacy_codes' => ['sales-offline-sync', 'offline-transactions'],
                 'name' => 'Unsync Transactions',
