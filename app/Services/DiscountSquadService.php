@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Discount;
 use App\Models\DiscountSquadUsage;
+use App\Models\Outlet;
 use App\Models\Sale;
 use App\Models\User;
 use Illuminate\Database\QueryException;
@@ -12,9 +13,28 @@ use Illuminate\Validation\ValidationException;
 
 class DiscountSquadService
 {
-    public function currentPeriodKey(): string
+    public function currentPeriodKey(?string $timezone = null): string
     {
-        return now(config('app.timezone', 'Asia/Jakarta'))->format('ymd');
+        return now($this->normalizeTimezone($timezone))->format('ymd');
+    }
+
+    public function normalizeTimezone(?string $timezone = null): string
+    {
+        $value = trim((string) ($timezone ?: config('app.timezone', 'Asia/Jakarta')));
+
+        return $value !== '' ? $value : 'Asia/Jakarta';
+    }
+
+    public function resolveOutletTimezone(?string $outletId): string
+    {
+        $outletId = trim((string) $outletId);
+        if ($outletId === '') {
+            return $this->normalizeTimezone();
+        }
+
+        $timezone = Outlet::query()->whereKey($outletId)->value('timezone');
+
+        return $this->normalizeTimezone(is_string($timezone) ? $timezone : null);
     }
 
     public function normalizeNisj(?string $nisj): string
@@ -68,7 +88,7 @@ class DiscountSquadService
         ];
     }
 
-    public function searchUsers(string $q, int $limit = 10): Collection
+    public function searchUsers(string $q, int $limit = 10, ?string $timezone = null): Collection
     {
         $term = trim($q);
         if ($term === '') {
@@ -76,7 +96,7 @@ class DiscountSquadService
         }
 
         $limit = max(1, min(20, $limit));
-        $period = $this->currentPeriodKey();
+        $period = $this->currentPeriodKey($timezone);
 
         return User::query()
             ->whereNotNull('nisj')
@@ -111,7 +131,8 @@ class DiscountSquadService
     public function registerUsage(Discount $discount, Sale $sale, User $user): DiscountSquadUsage
     {
         $nisj = $this->normalizeNisj($user->nisj);
-        $period = $this->currentPeriodKey();
+        $timezone = $this->resolveOutletTimezone((string) $sale->outlet_id);
+        $period = $this->currentPeriodKey($timezone);
 
         if ($nisj === '') {
             throw ValidationException::withMessages([

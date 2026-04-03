@@ -78,6 +78,29 @@ class TransactionDate
         return CarbonImmutable::now(self::normalizeTimezone($timezone, self::appTimezone()))->toDateString();
     }
 
+    public static function businessDayStartHour(?string $timezone = null): int
+    {
+        return self::normalizeTimezone($timezone, self::appTimezone()) === 'Asia/Makassar' ? 1 : 0;
+    }
+
+    public static function usesBusinessCutoff(?string $timezone = null): bool
+    {
+        return self::businessDayStartHour($timezone) > 0;
+    }
+
+    public static function businessTodayDateString(?string $timezone = null): string
+    {
+        $tz = self::normalizeTimezone($timezone, self::appTimezone());
+        $now = CarbonImmutable::now($tz);
+        $startHour = self::businessDayStartHour($tz);
+
+        if ($startHour > 0 && (int) $now->format('H') < $startHour) {
+            return $now->subDay()->toDateString();
+        }
+
+        return $now->toDateString();
+    }
+
     /**
      * Resolve a local outlet date range and convert the query boundaries to UTC.
      *
@@ -85,30 +108,66 @@ class TransactionDate
      */
     public static function dateRange(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
     {
+        $window = self::businessDateWindow($dateFrom, $dateTo, $timezone);
+
+        return [
+            $window['requested_from'],
+            $window['requested_to'],
+            $window['from_utc'],
+            $window['to_utc'],
+        ];
+    }
+
+    /**
+     * @return array{
+     *   timezone: string,
+     *   requested_from: CarbonImmutable,
+     *   requested_to: CarbonImmutable,
+     *   from_local: CarbonImmutable,
+     *   to_exclusive_local: CarbonImmutable,
+     *   to_inclusive_local: CarbonImmutable,
+     *   from_utc: CarbonImmutable,
+     *   to_utc: CarbonImmutable,
+     *   start_hour: int
+     * }
+     */
+    public static function businessDateWindow(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
         $tz = self::normalizeTimezone($timezone, self::appTimezone());
-        $today = CarbonImmutable::now($tz)->startOfDay();
+        $today = CarbonImmutable::parse(self::businessTodayDateString($tz), $tz)->startOfDay();
 
         try {
-            $from = $dateFrom ? CarbonImmutable::parse($dateFrom, $tz)->startOfDay() : $today;
+            $requestedFrom = $dateFrom ? CarbonImmutable::parse($dateFrom, $tz)->startOfDay() : $today;
         } catch (\Throwable $e) {
-            $from = $today;
+            $requestedFrom = $today;
         }
 
         try {
-            $to = $dateTo ? CarbonImmutable::parse($dateTo, $tz)->startOfDay() : $today;
+            $requestedTo = $dateTo ? CarbonImmutable::parse($dateTo, $tz)->startOfDay() : $today;
         } catch (\Throwable $e) {
-            $to = $today;
+            $requestedTo = $today;
         }
 
-        if ($to->lessThan($from)) {
-            [$from, $to] = [$to, $from];
+        if ($requestedTo->lessThan($requestedFrom)) {
+            [$requestedFrom, $requestedTo] = [$requestedTo, $requestedFrom];
         }
 
-        $to = $to->endOfDay();
-        $fromUtc = $from->setTimezone('UTC');
-        $toUtc = $to->setTimezone('UTC');
+        $startHour = self::businessDayStartHour($tz);
+        $fromLocal = $requestedFrom->addHours($startHour);
+        $toExclusiveLocal = $requestedTo->addDay()->addHours($startHour);
+        $toInclusiveLocal = $toExclusiveLocal->subSecond();
 
-        return [$from, $to, $fromUtc, $toUtc];
+        return [
+            'timezone' => $tz,
+            'requested_from' => $requestedFrom,
+            'requested_to' => $requestedTo,
+            'from_local' => $fromLocal,
+            'to_exclusive_local' => $toExclusiveLocal,
+            'to_inclusive_local' => $toInclusiveLocal,
+            'from_utc' => $fromLocal->setTimezone('UTC'),
+            'to_utc' => $toInclusiveLocal->setTimezone('UTC'),
+            'start_hour' => $startHour,
+        ];
     }
 
     public static function saleNumberDateToken(?string $saleNumber): ?string
@@ -127,7 +186,14 @@ class TransactionDate
 
     public static function dateTokens(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
     {
-        [$from, $to] = self::dateRange($dateFrom, $dateTo, $timezone);
+        return self::businessDateTokens($dateFrom, $dateTo, $timezone);
+    }
+
+    public static function businessDateTokens(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        $window = self::businessDateWindow($dateFrom, $dateTo, $timezone);
+        $from = $window['requested_from'];
+        $to = $window['requested_to'];
 
         $tokens = [];
         for ($cursor = $from->startOfDay(); $cursor->lessThanOrEqualTo($to->startOfDay()); $cursor = $cursor->addDay()) {
@@ -158,6 +224,76 @@ class TransactionDate
         }
 
         return $dt->toIso8601String();
+    }
+
+    public static function timezoneUtcOffsetHours(?string $timezone = null): int
+    {
+        return match (self::normalizeTimezone($timezone, self::appTimezone())) {
+            'Asia/Makassar' => 8,
+            'Asia/Jayapura' => 9,
+            default => 7,
+        };
+    }
+
+    public static function saleNumberTokenSqlExpression(string $saleNumberColumn): string
+    {
+        return "CASE WHEN {$saleNumberColumn} REGEXP '-[0-9]{8}-' THEN SUBSTRING_INDEX(SUBSTRING_INDEX({$saleNumberColumn}, '-', -2), '-', 1) ELSE NULL END";
+    }
+
+    public static function resolvedSaleLocalSqlExpression(string $createdAtColumn, ?string $saleNumberColumn = null, ?string $timezone = null): string
+    {
+        $offsetHours = self::timezoneUtcOffsetHours($timezone);
+        $utcLocalExpr = $offsetHours === 0
+            ? $createdAtColumn
+            : "DATE_ADD({$createdAtColumn}, INTERVAL {$offsetHours} HOUR)";
+
+        if (!$saleNumberColumn) {
+            return $utcLocalExpr;
+        }
+
+        $tokenExpr = self::saleNumberTokenSqlExpression($saleNumberColumn);
+        $utcTokenExpr = "DATE_FORMAT({$utcLocalExpr}, '%Y%m%d')";
+        $localTokenExpr = "DATE_FORMAT({$createdAtColumn}, '%Y%m%d')";
+
+        return implode(' ', [
+            'CASE',
+            "WHEN ({$saleNumberColumn} IS NULL OR {$saleNumberColumn} NOT REGEXP '-[0-9]{8}-') THEN {$utcLocalExpr}",
+            "WHEN {$utcTokenExpr} = {$tokenExpr} AND {$localTokenExpr} <> {$tokenExpr} THEN {$utcLocalExpr}",
+            "WHEN {$localTokenExpr} = {$tokenExpr} AND {$utcTokenExpr} <> {$tokenExpr} THEN {$createdAtColumn}",
+            "ELSE {$utcLocalExpr}",
+            'END',
+        ]);
+    }
+
+    /**
+     * Apply exact business-date filtering using the resolved local transaction moment.
+     *
+     * @return array{
+     *   timezone: string,
+     *   requested_from: CarbonImmutable,
+     *   requested_to: CarbonImmutable,
+     *   from_local: CarbonImmutable,
+     *   to_exclusive_local: CarbonImmutable,
+     *   to_inclusive_local: CarbonImmutable,
+     *   from_utc: CarbonImmutable,
+     *   to_utc: CarbonImmutable,
+     *   start_hour: int
+     * }
+     */
+    public static function applyExactBusinessDateScope(object $query, string $createdAtColumn, ?string $dateFrom, ?string $dateTo, ?string $timezone = null, ?string $saleNumberColumn = null): array
+    {
+        $window = self::businessDateWindow($dateFrom, $dateTo, $timezone);
+        $resolvedLocalExpr = self::resolvedSaleLocalSqlExpression($createdAtColumn, $saleNumberColumn, $window['timezone']);
+
+        $query->whereRaw(
+            "({$resolvedLocalExpr} >= ? AND {$resolvedLocalExpr} < ?)",
+            [
+                $window['from_local']->format('Y-m-d H:i:s'),
+                $window['to_exclusive_local']->format('Y-m-d H:i:s'),
+            ]
+        );
+
+        return $window;
     }
 
     private static function coerce($value): ?Carbon

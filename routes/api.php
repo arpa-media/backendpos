@@ -60,7 +60,7 @@ Route::prefix('v1')->group(function () {
          * DASHBOARD (sesuai UI: /dashboard/summary)
          */
         Route::get('/dashboard/summary', [DashboardController::class, 'summary'])
-            ->middleware('permission:dashboard.view');
+            ->middleware('permission_or_snapshot:dashboard.view');
 
         /**
          * REPORT PORTALS (Patch-02)

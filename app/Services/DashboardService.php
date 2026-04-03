@@ -6,10 +6,29 @@ use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Support\SaleStatuses;
 use App\Support\TransactionDate;
+use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\DB;
 
 class DashboardService
 {
+    private function rawCreatedAtValue($value)
+    {
+        if ($value instanceof Sale) {
+            if (method_exists($value, 'getRawOriginal')) {
+                $raw = $value->getRawOriginal('created_at');
+                if ($raw !== null && $raw !== '') {
+                    return $raw;
+                }
+            }
+
+            if ($value->created_at) {
+                return $value->created_at;
+            }
+        }
+
+        return $value;
+    }
+
     /**
      * Build dashboard summary for an outlet in date range (inclusive).
      *
@@ -19,12 +38,22 @@ class DashboardService
     {
         $status = $filters['status'] ?? SaleStatuses::PAID;
         $recentLimit = (int) ($filters['recent_limit'] ?? 10);
+        $timezone = $this->resolveTimezone($outletId);
+        $window = $this->resolveDashboardBusinessWindow(
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone
+        );
+
+        if ($outletId && $this->isMakassarDashboardBusinessTimezone($timezone)) {
+            return $this->summaryForMakassarBusinessWindow($outletId, $filters, $status, $recentLimit, $timezone, $window);
+        }
 
         $salesBase = Sale::query()
             ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
             ->where('status', $status);
 
-        [$from, $to, $fromQuery, $toQuery, $timezone] = $this->applyBusinessDateScope($salesBase, $outletId, $filters);
+        [$from, $to, $fromQuery, $toQuery] = $this->applyBusinessDateScope($salesBase, $outletId, $filters);
 
         $metrics = (clone $salesBase)
             ->selectRaw('COUNT(*) as trx_count')
@@ -119,7 +148,7 @@ class DashboardService
                 'created_at',
             ])
             ->map(function ($sale) use ($timezone) {
-                $rawCreatedAt = $sale->created_at ?: (method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('created_at') : null);
+                $rawCreatedAt = $this->rawCreatedAtValue($sale);
 
                 return [
                     'id' => (string) $sale->id,
@@ -157,6 +186,231 @@ class DashboardService
             'top_items' => $topItems,
             'recent_sales' => $recentSales,
         ];
+    }
+
+    private function summaryForMakassarBusinessWindow(string $outletId, array $filters, string $status, int $recentLimit, string $timezone, array $window): array
+    {
+        $candidateQuery = Sale::query()
+            ->where('outlet_id', $outletId)
+            ->where('status', $status);
+
+        $candidateFilters = $filters;
+        $candidateFilters['date_from'] = $window['requested_from']->toDateString();
+        $candidateFilters['date_to'] = $window['requested_to']->addDay()->toDateString();
+        $this->applyBusinessDateScope($candidateQuery, $outletId, $candidateFilters);
+
+        $candidateSales = $candidateQuery
+            ->get([
+                'id',
+                'outlet_id',
+                'sale_number',
+                'channel',
+                'status',
+                'cashier_name',
+                'grand_total',
+                'paid_total',
+                'change_total',
+                'payment_method_name',
+                'payment_method_type',
+                'created_at',
+            ]);
+
+        $sales = $candidateSales
+            ->filter(fn (Sale $sale) => $this->saleFallsWithinDashboardBusinessWindow($sale, $window['from_local'], $window['to_exclusive_local'], $timezone))
+            ->values();
+
+        $saleIds = $sales->pluck('id')->filter()->values()->all();
+
+        $trxCount = $sales->count();
+        $grossSales = (int) $sales->sum('grand_total');
+        $itemsSold = 0;
+        $topItems = [];
+        $byChannel = [];
+        $byPayment = [];
+
+        if (!empty($saleIds)) {
+            $itemsSold = (int) SaleItem::query()->whereIn('sale_id', $saleIds)->sum('qty');
+
+            $topItems = SaleItem::query()
+                ->whereIn('sale_id', $saleIds)
+                ->select('variant_id', 'product_name', 'variant_name')
+                ->selectRaw('COALESCE(SUM(qty),0) as qty_sold')
+                ->selectRaw('COALESCE(SUM(line_total),0) as revenue')
+                ->groupBy('variant_id', 'product_name', 'variant_name')
+                ->orderByDesc('qty_sold')
+                ->limit(5)
+                ->get()
+                ->map(fn ($r) => [
+                    'variant_id' => (string) $r->variant_id,
+                    'product_name' => (string) $r->product_name,
+                    'variant_name' => (string) $r->variant_name,
+                    'qty_sold' => (int) $r->qty_sold,
+                    'revenue' => (int) $r->revenue,
+                ])
+                ->values()
+                ->all();
+        }
+
+        $avgTicket = $trxCount > 0 ? (int) floor($grossSales / $trxCount) : 0;
+
+        $byChannel = $sales
+            ->groupBy(fn ($sale) => (string) ($sale->channel ?? ''))
+            ->map(fn ($group, $channel) => [
+                'channel' => (string) $channel,
+                'trx_count' => $group->count(),
+                'gross_sales' => (int) $group->sum('grand_total'),
+            ])
+            ->sortByDesc('gross_sales')
+            ->values()
+            ->all();
+
+        $byPayment = $sales
+            ->groupBy(fn ($sale) => implode('|', [
+                (string) ($sale->payment_method_type ?? ''),
+                (string) ($sale->payment_method_name ?? ''),
+            ]))
+            ->map(function ($group) {
+                $first = $group->first();
+
+                return [
+                    'payment_method_type' => (string) ($first->payment_method_type ?? ''),
+                    'payment_method_name' => (string) ($first->payment_method_name ?? ''),
+                    'trx_count' => $group->count(),
+                    'gross_sales' => (int) $group->sum('grand_total'),
+                ];
+            })
+            ->sortByDesc('gross_sales')
+            ->values()
+            ->all();
+
+        $recentSales = $sales
+            ->sortByDesc(function ($sale) {
+                return (string) ($sale->created_at ?: (method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('created_at') : ''));
+            })
+            ->take($recentLimit)
+            ->values()
+            ->map(function ($sale) use ($timezone) {
+                $rawCreatedAt = $this->rawCreatedAtValue($sale);
+
+                return [
+                    'id' => (string) $sale->id,
+                    'outlet_id' => (string) $sale->outlet_id,
+                    'sale_number' => (string) $sale->sale_number,
+                    'channel' => (string) $sale->channel,
+                    'status' => (string) $sale->status,
+                    'cashier_name' => $sale->cashier_name,
+                    'payment_method_name' => $sale->payment_method_name,
+                    'payment_method_type' => $sale->payment_method_type,
+                    'grand_total' => (int) $sale->grand_total,
+                    'paid_total' => (int) $sale->paid_total,
+                    'change_total' => (int) $sale->change_total,
+                    'created_at' => TransactionDate::formatSaleLocal($rawCreatedAt, $timezone, (string) $sale->sale_number),
+                ];
+            })
+            ->all();
+
+        return [
+            'range' => [
+                'date_from' => $window['requested_from']->toDateString(),
+                'date_to' => $window['requested_to']->toDateString(),
+                'status' => (string) $status,
+                'outlet_id' => $outletId,
+            ],
+            'metrics' => [
+                'trx_count' => $trxCount,
+                'gross_sales' => $grossSales,
+                'items_sold' => $itemsSold,
+                'avg_ticket' => $avgTicket,
+            ],
+            'by_channel' => $byChannel,
+            'by_payment_method' => $byPayment,
+            'top_items' => $topItems,
+            'recent_sales' => $recentSales,
+        ];
+    }
+
+    private function isMakassarDashboardBusinessTimezone(?string $timezone = null): bool
+    {
+        return TransactionDate::normalizeTimezone($timezone, config('app.timezone', 'Asia/Jakarta')) === 'Asia/Makassar';
+    }
+
+    private function resolveDashboardBusinessToday(?string $timezone = null): string
+    {
+        $tz = TransactionDate::normalizeTimezone($timezone, config('app.timezone', 'Asia/Jakarta'));
+        $now = CarbonImmutable::now($tz);
+
+        if ($this->isMakassarDashboardBusinessTimezone($tz)) {
+            return $now->subHour()->toDateString();
+        }
+
+        return $now->toDateString();
+    }
+
+    private function resolveDashboardBusinessWindow(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        $tz = TransactionDate::normalizeTimezone($timezone, config('app.timezone', 'Asia/Jakarta'));
+        $today = CarbonImmutable::parse($this->resolveDashboardBusinessToday($tz), $tz)->startOfDay();
+
+        try {
+            $requestedFrom = $dateFrom ? CarbonImmutable::parse($dateFrom, $tz)->startOfDay() : $today;
+        } catch (\Throwable $e) {
+            $requestedFrom = $today;
+        }
+
+        try {
+            $requestedTo = $dateTo ? CarbonImmutable::parse($dateTo, $tz)->startOfDay() : $today;
+        } catch (\Throwable $e) {
+            $requestedTo = $today;
+        }
+
+        if ($requestedTo->lessThan($requestedFrom)) {
+            [$requestedFrom, $requestedTo] = [$requestedTo, $requestedFrom];
+        }
+
+        if ($this->isMakassarDashboardBusinessTimezone($tz)) {
+            $fromLocal = $requestedFrom->addHour();
+            $toExclusiveLocal = $requestedTo->addDay()->addHour();
+        } else {
+            $fromLocal = $requestedFrom->startOfDay();
+            $toExclusiveLocal = $requestedTo->addDay()->startOfDay();
+        }
+
+        return [
+            'timezone' => $tz,
+            'requested_from' => $requestedFrom,
+            'requested_to' => $requestedTo,
+            'from_local' => $fromLocal,
+            'to_exclusive_local' => $toExclusiveLocal,
+        ];
+    }
+
+    private function saleLocalMomentForDashboardWindow(Sale $sale, ?string $timezone = null): ?CarbonImmutable
+    {
+        $localIso = TransactionDate::toSaleIso(
+            $this->rawCreatedAtValue($sale),
+            $timezone,
+            (string) $sale->sale_number
+        );
+
+        if (!$localIso) {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($localIso);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    private function saleFallsWithinDashboardBusinessWindow(Sale $sale, CarbonImmutable $fromLocal, CarbonImmutable $toExclusiveLocal, ?string $timezone = null): bool
+    {
+        $moment = $this->saleLocalMomentForDashboardWindow($sale, $timezone);
+        if (!$moment) {
+            return false;
+        }
+
+        return $moment->greaterThanOrEqualTo($fromLocal) && $moment->lessThan($toExclusiveLocal);
     }
 
     private function applyBusinessDateScope($query, ?string $outletId, array $filters, string $createdAtColumn = 'created_at', string $saleNumberColumn = 'sale_number'): array

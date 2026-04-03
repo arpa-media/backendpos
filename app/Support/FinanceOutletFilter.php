@@ -80,6 +80,7 @@ class FinanceOutletFilter
             'label' => (string) ($outlet['name'] ?? '-'),
             'kind' => 'outlet',
             'code' => (string) ($outlet['code'] ?? ''),
+            'timezone' => TransactionDate::normalizeTimezone((string) ($outlet['timezone'] ?? ''), config('app.timezone', 'Asia/Jakarta')),
             'is_active' => (bool) ($outlet['is_active'] ?? false),
         ])->values()->all();
 

@@ -58,29 +58,14 @@ class SalesController extends Controller
             });
         }
         if (!empty($v['date_from']) || !empty($v['date_to'])) {
-            [, , $fromQuery, $toQuery] = TransactionDate::dateRange(
+            TransactionDate::applyExactBusinessDateScope(
+                $q,
+                'created_at',
                 $v['date_from'] ?? null,
                 $v['date_to'] ?? null,
-                $tz
+                $tz,
+                'sale_number'
             );
-            $tokens = TransactionDate::dateTokens($v['date_from'] ?? null, $v['date_to'] ?? null, $tz);
-
-            $q->where(function ($outer) use ($tokens, $fromQuery, $toQuery) {
-                $outer->where(function ($saleNumberScope) use ($tokens) {
-                    foreach ($tokens as $index => $token) {
-                        $method = $index === 0 ? 'where' : 'orWhere';
-                        $saleNumberScope->{$method}('sale_number', 'like', '%-' . $token . '-%');
-                    }
-                })->orWhere(function ($fallbackScope) use ($fromQuery, $toQuery) {
-                    $fallbackScope
-                        ->where(function ($legacyScope) {
-                            $legacyScope
-                                ->whereNull('sale_number')
-                                ->orWhere('sale_number', 'not like', 'S.%-%-%');
-                        })
-                        ->whereBetween('created_at', [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
-                });
-            });
         }
         if (isset($v['min_total'])) {
             $q->where('grand_total', '>=', (int) $v['min_total']);

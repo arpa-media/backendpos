@@ -460,56 +460,26 @@ class OwnerOverviewService
 
     private function applyBusinessDateScopeToEloquent($query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 'sale_number', string $createdAtColumn = 'created_at'): void
     {
-        $tokens = TransactionDate::dateTokens($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
-
-        if (empty($tokens)) {
-            $query->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
-            return;
-        }
-
-        $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery, $tokens) {
-            $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
-                foreach ($tokens as $index => $token) {
-                    $method = $index === 0 ? 'where' : 'orWhere';
-                    $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
-                }
-            })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery) {
-                $fallbackScope
-                    ->where(function ($legacyScope) use ($saleNumberColumn) {
-                        $legacyScope
-                            ->whereNull($saleNumberColumn)
-                            ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
-                    })
-                    ->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
-            });
-        });
+        TransactionDate::applyExactBusinessDateScope(
+            $query,
+            $createdAtColumn,
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone,
+            $saleNumberColumn
+        );
     }
 
     private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void
     {
-        $tokens = TransactionDate::dateTokens($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
-
-        if (empty($tokens)) {
-            $query->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
-            return;
-        }
-
-        $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery, $tokens) {
-            $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
-                foreach ($tokens as $index => $token) {
-                    $method = $index === 0 ? 'where' : 'orWhere';
-                    $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
-                }
-            })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery) {
-                $fallbackScope
-                    ->where(function ($legacyScope) use ($saleNumberColumn) {
-                        $legacyScope
-                            ->whereNull($saleNumberColumn)
-                            ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
-                    })
-                    ->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
-            });
-        });
+        TransactionDate::applyExactBusinessDateScope(
+            $query,
+            $createdAtColumn,
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone,
+            $saleNumberColumn
+        );
     }
 
     private function mapSaleListRow(object $row): array

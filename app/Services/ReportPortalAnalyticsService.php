@@ -12,20 +12,59 @@ use Illuminate\Support\Facades\DB;
 
 class ReportPortalAnalyticsService
 {
+    private ?string $contextTimezone = null;
+
     public function __construct(private readonly ReportPortalScopeService $scopeService)
     {
     }
 
-    private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo): void
+    private function setScopeTimezone(array $scope): void
     {
-        [$from, $to] = $this->resolveRange($dateFrom, $dateTo);
+        $this->contextTimezone = $this->resolveScopeTimezone($scope);
+    }
 
-        $query->whereDate($column, '>=', $from->toDateString())
-            ->whereDate($column, '<=', $to->toDateString());
+    private function resolveScopeTimezone(array $scope): string
+    {
+        $defaultTimezone = TransactionDate::normalizeTimezone(config('app.timezone', 'Asia/Jakarta'));
+        $allowed = collect($scope['allowed_outlets'] ?? []);
+        $selectedOutletId = (string) ($scope['selected_outlet_id'] ?? '');
+
+        if ($selectedOutletId !== '') {
+            $selected = $allowed->first(fn ($outlet) => (string) ($outlet['id'] ?? '') === $selectedOutletId);
+            if (!empty($selected['timezone'])) {
+                return TransactionDate::normalizeTimezone((string) $selected['timezone'], $defaultTimezone);
+            }
+        }
+
+        if ($allowed->count() === 1 && !empty($allowed->first()['timezone'])) {
+            return TransactionDate::normalizeTimezone((string) $allowed->first()['timezone'], $defaultTimezone);
+        }
+
+        return $defaultTimezone;
+    }
+
+    private function resolveWindow(?string $dateFrom, ?string $dateTo): array
+    {
+        return TransactionDate::businessDateWindow($dateFrom, $dateTo, $this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+    }
+
+    private function applyDateRange(object $query, string $column, ?string $dateFrom, ?string $dateTo, ?string $saleNumberColumn = null): void
+    {
+        $saleNumberColumn = $saleNumberColumn ?: preg_replace('/created_at$/', 'sale_number', $column);
+
+        TransactionDate::applyExactBusinessDateScope(
+            $query,
+            $column,
+            $dateFrom,
+            $dateTo,
+            $this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'),
+            is_string($saleNumberColumn) ? $saleNumberColumn : null
+        );
     }
 
     public function dashboard(array $scope, array $params): array
     {
+        $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $recentLimit = max(1, min(20, (int) ($params['recent_limit'] ?? 5)));
         $topLimit = max(1, min(10, (int) ($params['top_limit'] ?? 5)));
@@ -34,7 +73,7 @@ class ReportPortalAnalyticsService
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($salesBase, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($salesBase, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($salesBase, $scope, 's');
 
@@ -52,7 +91,7 @@ class ReportPortalAnalyticsService
             ->join('sales as s', 's.id', '=', 'si.sale_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($itemsSoldQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($itemsSoldQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($itemsSoldQuery, $scope, 's');
 
@@ -97,7 +136,7 @@ class ReportPortalAnalyticsService
             ->join('sales as s', 's.id', '=', 'si.sale_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($topVariantsQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($topVariantsQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($topVariantsQuery, $scope, 's');
 
@@ -123,7 +162,7 @@ class ReportPortalAnalyticsService
             ->join('sales as s', 's.id', '=', 'si.sale_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($topProductsQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($topProductsQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($topProductsQuery, $scope, 's');
 
@@ -198,16 +237,19 @@ class ReportPortalAnalyticsService
 
     public function ledger(array $scope, array $params): array
     {
+        $this->setScopeTimezone($scope);
         return $this->saleListing($scope, $params, max(1, min(100, (int) ($params['per_page'] ?? 10))));
     }
 
     public function recentSales(array $scope, array $params): array
     {
+        $this->setScopeTimezone($scope);
         return $this->saleListing($scope, $params, max(1, min(100, (int) ($params['per_page'] ?? 5))));
     }
 
     public function itemSold(array $scope, array $params): array
     {
+        $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? 10)));
         $page = max(1, (int) ($params['page'] ?? 1));
@@ -216,7 +258,7 @@ class ReportPortalAnalyticsService
             ->join('sales as s', 's.id', '=', 'si.sale_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -253,6 +295,7 @@ class ReportPortalAnalyticsService
 
     public function itemByProduct(array $scope, array $params): array
     {
+        $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? 10)));
         $page = max(1, (int) ($params['page'] ?? 1));
@@ -261,7 +304,7 @@ class ReportPortalAnalyticsService
             ->join('sales as s', 's.id', '=', 'si.sale_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -294,6 +337,7 @@ class ReportPortalAnalyticsService
 
     public function itemByVariant(array $scope, array $params): array
     {
+        $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? 10)));
         $page = max(1, (int) ($params['page'] ?? 1));
@@ -302,7 +346,7 @@ class ReportPortalAnalyticsService
             ->join('sales as s', 's.id', '=', 'si.sale_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -337,6 +381,7 @@ class ReportPortalAnalyticsService
 
     public function tax(array $scope, array $params): array
     {
+        $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? 10)));
         $page = max(1, (int) ($params['page'] ?? 1));
@@ -345,7 +390,7 @@ class ReportPortalAnalyticsService
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -418,6 +463,7 @@ class ReportPortalAnalyticsService
 
     public function saleDetail(array $scope, string $saleId): array
     {
+        $this->setScopeTimezone($scope);
         $sale = Sale::query()
             ->with(['outlet', 'items.product.category', 'payments', 'customer'])
             ->where('id', $saleId)
@@ -460,7 +506,7 @@ class ReportPortalAnalyticsService
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->where('s.status', '=', 'PAID');
 
-        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -512,16 +558,9 @@ class ReportPortalAnalyticsService
 
     private function resolveRange(?string $dateFrom, ?string $dateTo): array
     {
-        $today = CarbonImmutable::today();
+        $window = $this->resolveWindow($dateFrom, $dateTo);
 
-        $from = $dateFrom ? CarbonImmutable::parse($dateFrom)->startOfDay() : $today;
-        $to = $dateTo ? CarbonImmutable::parse($dateTo)->startOfDay() : $today;
-
-        if ($to->lessThan($from)) {
-            [$from, $to] = [$to, $from];
-        }
-
-        return [$from, $to->endOfDay()];
+        return [$window['requested_from'], $window['requested_to']];
     }
 
     private function paginate(QueryBuilder $query, int $perPage, int $page): LengthAwarePaginator

@@ -592,7 +592,14 @@ class ReportService
             $q->where('spm.payment_method_name', '=', $params['payment_method_name']);
         }
         if (!empty($params['discount_name'])) {
-            $q->where(DB::raw("COALESCE(NULLIF(s.discount_name_snapshot, ''), NULLIF(JSON_UNQUOTE(JSON_EXTRACT(s.discounts_snapshot, '$[0].name')), ''))"), '=', $params['discount_name']);
+            $needle = trim((string) $params['discount_name']);
+            $jsonNeedle = '%"name":"' . $needle . '"%';
+            $q->where(function ($discountScope) use ($needle, $jsonNeedle) {
+                $discountScope
+                    ->where('s.discount_name_snapshot', '=', $needle)
+                    ->orWhere('s.discounts_snapshot', 'like', $jsonNeedle)
+                    ->orWhere('s.discounts_snapshot', 'like', '%' . $needle . '%');
+            });
         }
         if (!empty($params['discount_squad_nisj'])) {
             $q->where('s.discount_squad_nisj', 'like', '%' . $params['discount_squad_nisj'] . '%');
@@ -615,25 +622,13 @@ class ReportService
         $p = $this->paginate($q, $perPage, $page);
 
         $items = collect($p->items())->map(function ($r) {
-            $snapshot = [];
-            if (is_array($r->discounts_snapshot ?? null)) {
-                $snapshot = $r->discounts_snapshot;
-            } elseif (is_string($r->discounts_snapshot ?? null) && $r->discounts_snapshot !== '') {
-                $decoded = json_decode($r->discounts_snapshot, true);
-                $snapshot = is_array($decoded) ? $decoded : [];
-            }
-            $discountName = (string) ($r->discount_name_snapshot ?? '');
-            if ($discountName === '' && !empty($snapshot[0]['name'])) {
-                $discountName = (string) $snapshot[0]['name'];
-            }
-            if ($discountName === '') {
-                $discountName = '-';
-            }
+            $discountNames = $this->extractDiscountNames($r->discount_name_snapshot ?? null, $r->discounts_snapshot ?? null);
 
             return [
                 'sale_id' => (string) $r->sale_id,
                 'sale_number' => (string) $r->sale_number,
-                'discount_name' => $discountName,
+                'discount_name' => !empty($discountNames) ? implode(', ', $discountNames) : '-',
+                'discount_names' => $discountNames,
                 'discount_squad_nisj' => (string) ($r->discount_squad_nisj ?? ''),
                 'channel' => (string) ($r->channel ?? ''),
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
@@ -651,15 +646,13 @@ class ReportService
         $optionsRows = $optionQ->select(['s.discount_name_snapshot', 's.discounts_snapshot'])->get();
         $discountNames = [];
         foreach ($optionsRows as $row) {
-            $name = trim((string) ($row->discount_name_snapshot ?? ''));
-            if ($name === '') {
-                $decoded = is_array($row->discounts_snapshot ?? null)
-                    ? $row->discounts_snapshot
-                    : (json_decode((string) ($row->discounts_snapshot ?? '[]'), true) ?: []);
-                $name = trim((string) (($decoded[0]['name'] ?? '') ?: ''));
+            foreach ($this->extractDiscountNames($row->discount_name_snapshot ?? null, $row->discounts_snapshot ?? null) as $name) {
+                if ($name !== '') {
+                    $discountNames[$name] = true;
+                }
             }
-            if ($name !== '') $discountNames[$name] = true;
         }
+        ksort($discountNames);
 
         return [
             'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
@@ -692,6 +685,46 @@ class ReportService
         }
 
         return $value;
+    }
+
+    private function decodeDiscountSnapshot($value): array
+    {
+        if (is_array($value)) {
+            return array_values(array_filter($value, fn ($row) => is_array($row)));
+        }
+
+        if (is_string($value) && trim($value) !== '') {
+            $decoded = json_decode($value, true);
+
+            return is_array($decoded) ? array_values(array_filter($decoded, fn ($row) => is_array($row))) : [];
+        }
+
+        return [];
+    }
+
+    private function extractDiscountNames($discountNameSnapshot, $discountsSnapshot): array
+    {
+        $names = [];
+        $primary = trim((string) ($discountNameSnapshot ?? ''));
+        if ($primary !== '') {
+            $names[$primary] = true;
+        }
+
+        foreach ($this->decodeDiscountSnapshot($discountsSnapshot) as $snapshot) {
+            $name = trim((string) ($snapshot['name'] ?? ''));
+            if ($name !== '') {
+                $names[$name] = true;
+            }
+        }
+
+        return array_values(array_keys($names));
+    }
+
+    private function joinDiscountNames($discountNameSnapshot, $discountsSnapshot): string
+    {
+        $names = $this->extractDiscountNames($discountNameSnapshot, $discountsSnapshot);
+
+        return !empty($names) ? implode(', ', $names) : '-';
     }
 
     private function resolveSalePaymentMethodName(Sale $sale, $payment = null): string

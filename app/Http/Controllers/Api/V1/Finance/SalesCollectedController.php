@@ -26,11 +26,12 @@ class SalesCollectedController extends Controller
         $outletInfo = $this->resolveOutletScopeInfo($outletId);
         $timezone = $outletInfo['timezone'];
 
-        [$fromLocal, $toLocal, $fromQuery, $toQuery] = $this->resolveLocalDateRange(
+        $window = $this->resolveLocalDateRange(
             $v['date_from'] ?? null,
             $v['date_to'] ?? null,
             $timezone
         );
+        [$fromLocal, $toLocal, $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
 
         $summaryQuery = $this->buildBaseQuery($outletId, $fromQuery, $toQuery, $v, true, true);
         $summary = (clone $summaryQuery)
@@ -137,8 +138,8 @@ class SalesCollectedController extends Controller
 
         $metaPayload = [
             'timezone' => $timezone,
-            'range_start_local' => $fromLocal->copy()->startOfDay()->format('Y-m-d H:i:s'),
-            'range_end_local' => $toLocal->copy()->endOfDay()->format('Y-m-d H:i:s'),
+            'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
+            'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
             'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
             'outlet_scope_id' => $outletId,
             'outlet_scope_name' => $outletInfo['name'],
@@ -209,38 +210,21 @@ class SalesCollectedController extends Controller
 
     private function resolveLocalDateRange(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
     {
-        [$fromLocal, $toLocal, $fromQuery, $toQuery] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
-
-        return [$fromLocal, $toLocal, $fromQuery, $toQuery];
+        return TransactionDate::businessDateWindow($dateFrom, $dateTo, $timezone);
     }
 
 
-private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void
-{
-    $tokens = TransactionDate::dateTokens($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
-
-    if (empty($tokens)) {
-        $query->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
-        return;
+    private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void
+    {
+        TransactionDate::applyExactBusinessDateScope(
+            $query,
+            $createdAtColumn,
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone,
+            $saleNumberColumn
+        );
     }
-
-    $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery, $tokens) {
-        $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
-            foreach ($tokens as $index => $token) {
-                $method = $index === 0 ? 'where' : 'orWhere';
-                $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
-            }
-        })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromQuery, $toQuery) {
-            $fallbackScope
-                ->where(function ($legacyScope) use ($saleNumberColumn) {
-                    $legacyScope
-                        ->whereNull($saleNumberColumn)
-                        ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
-                })
-                ->whereBetween($createdAtColumn, [$fromQuery->toDateTimeString(), $toQuery->toDateTimeString()]);
-        });
-    });
-}
 
     private function buildBaseQuery(?string $outletId, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
     {

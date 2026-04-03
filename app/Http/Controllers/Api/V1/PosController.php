@@ -100,6 +100,7 @@ class PosController extends Controller
                 'discount_type' => (string) $d->discount_type,
                 'discount_value' => (int) $d->discount_value,
                 'requires_squad_nisj' => strtoupper((string) $d->applies_to) === 'SQUAD',
+                'squad_daily_quota' => strtoupper((string) $d->applies_to) === 'SQUAD' ? 1 : null,
                 'squad_monthly_quota' => strtoupper((string) $d->applies_to) === 'SQUAD' ? 1 : null,
                 'product_ids' => $d->products->pluck('id')->map(fn ($x) => (string) $x)->values()->all(),
                 'customer_ids' => $d->customers->pluck('id')->map(fn ($x) => (string) $x)->values()->all(),
@@ -125,7 +126,11 @@ class PosController extends Controller
         }
 
         return ApiResponse::ok([
-            'items' => $this->discountSquadService->searchUsers($q, $limit)->all(),
+            'items' => $this->discountSquadService->searchUsers(
+                $q,
+                $limit,
+                $this->discountSquadService->resolveOutletTimezone(OutletScope::id($request))
+            )->all(),
         ], 'OK');
     }
 

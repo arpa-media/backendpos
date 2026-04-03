@@ -96,13 +96,32 @@ class UserManagementService
             ? AccessRoleMenuPermission::query()->where('access_role_id', $roleId)->where('access_level_id', $levelId)->get()->keyBy('menu_id')
             : collect();
 
-        $portalSnapshots = $portals->map(function (AccessPortal $portal) use ($basePortalRows, $exactPortalRows) {
+        $menuPermissionMap = $menus->mapWithKeys(function (AccessMenu $menu) use ($baseMenuRows, $exactMenuRows) {
+            $effective = $exactMenuRows->get($menu->id) ?: $baseMenuRows->get($menu->id);
+
+            return [
+                (string) $menu->id => [
+                    'can_view' => (bool) ($effective->can_view ?? false),
+                    'can_create' => (bool) ($effective->can_create ?? false),
+                    'can_edit' => (bool) ($effective->can_edit ?? false),
+                    'can_delete' => (bool) ($effective->can_delete ?? false),
+                ],
+            ];
+        });
+
+        $portalSnapshots = $portals->map(function (AccessPortal $portal) use ($basePortalRows, $exactPortalRows, $menus, $menuPermissionMap) {
             $effective = $exactPortalRows->get($portal->id) ?: $basePortalRows->get($portal->id);
+            $portalCode = strtolower((string) $portal->code);
+            $hasVisibleChildMenu = $this->portalAllowsImplicitVisibility($portalCode)
+                && $menus->where('portal_id', $portal->id)->contains(function (AccessMenu $menu) use ($menuPermissionMap) {
+                    return (bool) ($menuPermissionMap->get((string) $menu->id)['can_view'] ?? false);
+                });
+
             return [
                 'id' => (string) $portal->id,
                 'code' => (string) $portal->code,
                 'name' => (string) $portal->name,
-                'can_view' => (bool) ($effective->can_view ?? false),
+                'can_view' => (bool) ($effective->can_view ?? false) || $hasVisibleChildMenu,
             ];
         })->values()->all();
 
@@ -112,10 +131,16 @@ class UserManagementService
             ->values()
             ->all();
 
-        $menuSnapshots = $menus->map(function (AccessMenu $menu) use ($baseMenuRows, $exactMenuRows, $visiblePortalCodes) {
-            $effective = $exactMenuRows->get($menu->id) ?: $baseMenuRows->get($menu->id);
+        $menuSnapshots = $menus->map(function (AccessMenu $menu) use ($menuPermissionMap, $visiblePortalCodes) {
+            $effective = $menuPermissionMap->get((string) $menu->id, [
+                'can_view' => false,
+                'can_create' => false,
+                'can_edit' => false,
+                'can_delete' => false,
+            ]);
             $portalCode = strtolower((string) ($menu->portal?->code ?? ''));
             $portalVisible = in_array($portalCode, $visiblePortalCodes, true);
+            $standaloneHiddenAccess = $this->menuAllowsHiddenPortalAccess($menu);
 
             return [
                 'id' => (string) $menu->id,
@@ -125,12 +150,15 @@ class UserManagementService
                 'portal_id' => $menu->portal_id ? (string) $menu->portal_id : null,
                 'portal_code' => $portalCode,
                 'portal_name' => (string) ($menu->portal?->name ?? ''),
-                'can_view' => $portalVisible && (bool) ($effective->can_view ?? false),
-                'can_create' => $portalVisible && (bool) ($effective->can_create ?? false),
-                'can_edit' => $portalVisible && (bool) ($effective->can_edit ?? false),
-                'can_delete' => $portalVisible && (bool) ($effective->can_delete ?? false),
+                'can_view' => ($portalVisible || $standaloneHiddenAccess) && (bool) ($effective['can_view'] ?? false),
+                'can_create' => $portalVisible && (bool) ($effective['can_create'] ?? false),
+                'can_edit' => $portalVisible && (bool) ($effective['can_edit'] ?? false),
+                'can_delete' => $portalVisible && (bool) ($effective['can_delete'] ?? false),
             ];
         })->values()->all();
+
+        $menuSnapshots = $this->augmentOwnerOverviewDetailMenu($menuSnapshots, $assignment);
+        $menuSnapshots = $this->prioritizePosDashboardMenu($menuSnapshots, $assignment);
 
         return [
             'role' => $assignment->role ? [
@@ -152,6 +180,109 @@ class UserManagementService
             'portals' => $portalSnapshots,
             'menus' => $menuSnapshots,
         ];
+    }
+
+    protected function prioritizePosDashboardMenu(array $menuSnapshots, UserAccessAssignment $assignment): array
+    {
+        $roleCode = strtoupper((string) ($assignment->role?->code ?? ''));
+        $userTypeCode = strtoupper((string) ($assignment->role?->userType?->code ?? ''));
+
+        if ($roleCode !== 'CASHIER' && $userTypeCode !== 'POS') {
+            return $menuSnapshots;
+        }
+
+        $dashboardIndex = null;
+        foreach ($menuSnapshots as $index => $menu) {
+            if ((string) ($menu['path'] ?? '') === '/c/dashboard') {
+                $dashboardIndex = $index;
+                break;
+            }
+        }
+
+        if ($dashboardIndex === null || $dashboardIndex === 0) {
+            return $menuSnapshots;
+        }
+
+        $dashboardMenu = $menuSnapshots[$dashboardIndex];
+        unset($menuSnapshots[$dashboardIndex]);
+
+        return array_values(array_merge([$dashboardMenu], $menuSnapshots));
+    }
+
+    private function portalAllowsImplicitVisibility(string $portalCode): bool
+    {
+        return in_array(strtolower($portalCode), ['finance', 'pos'], true);
+    }
+
+    private function menuAllowsHiddenPortalAccess(AccessMenu $menu): bool
+    {
+        $code = strtolower((string) $menu->code);
+        $path = (string) $menu->path;
+
+        return in_array($code, ['owner-overview-detail-sales'], true)
+            || $path === '/owner-overview/detail-sales';
+    }
+
+    private function augmentOwnerOverviewDetailMenu(array $menuSnapshots, UserAccessAssignment $assignment): array
+    {
+        if (! $this->shouldImplicitOwnerOverviewDetailAccess($assignment, $menuSnapshots)) {
+            return $menuSnapshots;
+        }
+
+        foreach ($menuSnapshots as $index => $menu) {
+            if ((string) ($menu['path'] ?? '') !== '/owner-overview/detail-sales') {
+                continue;
+            }
+
+            $menuSnapshots[$index]['can_view'] = true;
+            $menuSnapshots[$index]['can_create'] = false;
+            $menuSnapshots[$index]['can_edit'] = false;
+            $menuSnapshots[$index]['can_delete'] = false;
+            $menuSnapshots[$index]['permission_view'] = (string) ($menuSnapshots[$index]['permission_view'] ?? 'owner_overview.sale_detail.view');
+
+            return $menuSnapshots;
+        }
+
+        $menuSnapshots[] = [
+            'id' => 'synthetic-owner-overview-detail-sales',
+            'code' => 'owner-overview-detail-sales',
+            'name' => 'Detail Sales',
+            'path' => '/owner-overview/detail-sales',
+            'portal_id' => null,
+            'portal_code' => 'owner-overview',
+            'portal_name' => 'Owner Overview',
+            'can_view' => true,
+            'can_create' => false,
+            'can_edit' => false,
+            'can_delete' => false,
+            'permission_view' => 'owner_overview.sale_detail.view',
+        ];
+
+        return $menuSnapshots;
+    }
+
+    private function shouldImplicitOwnerOverviewDetailAccess(UserAccessAssignment $assignment, array $menuSnapshots): bool
+    {
+        if (! $this->isAdministratorAssignment($assignment)) {
+            return false;
+        }
+
+        foreach ($menuSnapshots as $menu) {
+            if (strtolower((string) ($menu['portal_code'] ?? '')) !== 'omzet-report') {
+                continue;
+            }
+
+            if (! empty($menu['can_view'])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isAdministratorAssignment(UserAccessAssignment $assignment): bool
+    {
+        return strtoupper((string) ($assignment->role?->code ?? '')) === 'ADMIN';
     }
 
     public function syncUserPermissions(User $user): array
@@ -180,6 +311,10 @@ class UserManagementService
             if (($menu['can_delete'] ?? false) && $accessMenu->permission_delete) {
                 $permissionNames->push($accessMenu->permission_delete);
             }
+        }
+
+        if ($this->shouldImplicitOwnerOverviewDetailAccess($assignment, $access['menus'] ?? [])) {
+            $permissionNames->push('owner_overview.sale_detail.view');
         }
 
         $permissionNames = $permissionNames
@@ -230,15 +365,15 @@ class UserManagementService
                 [
                     'access_role_id' => $roleId,
                     'access_level_id' => $levelId,
-                    'portal_id' => Arr::get($row, 'portal_id'),
+                    'portal_id' => $row['portal_id'],
                 ],
                 [
-                    'can_view' => (bool) Arr::get($row, 'can_view', false),
+                    'can_view' => (bool) ($row['can_view'] ?? false),
                 ]
             );
         }
 
-        return $this->syncUsersForScope($roleId, $levelId);
+        return count($rows);
     }
 
     public function upsertMenuPermissions(string $roleId, ?string $levelId, array $rows): int
@@ -248,46 +383,32 @@ class UserManagementService
                 [
                     'access_role_id' => $roleId,
                     'access_level_id' => $levelId,
-                    'menu_id' => Arr::get($row, 'menu_id'),
+                    'menu_id' => $row['menu_id'],
                 ],
                 [
-                    'can_view' => (bool) Arr::get($row, 'can_view', false),
-                    'can_create' => (bool) Arr::get($row, 'can_create', false),
-                    'can_edit' => (bool) Arr::get($row, 'can_edit', false),
-                    'can_delete' => (bool) Arr::get($row, 'can_delete', false),
+                    'can_view' => (bool) ($row['can_view'] ?? false),
+                    'can_create' => (bool) ($row['can_create'] ?? false),
+                    'can_edit' => (bool) ($row['can_edit'] ?? false),
+                    'can_delete' => (bool) ($row['can_delete'] ?? false),
                 ]
             );
         }
 
-        return $this->syncUsersForScope($roleId, $levelId);
+        return count($rows);
     }
 
-    public function syncUsersForScope(string $roleId, ?string $levelId): int
+    public function listUsers(): Collection
     {
-        $query = UserAccessAssignment::query()->where('access_role_id', $roleId);
-        if ($levelId) {
-            $query->where('access_level_id', $levelId);
-        } else {
-            $query->whereNull('access_level_id');
-        }
-
-        $count = 0;
-        /** @var Collection<int, UserAccessAssignment> $assignments */
-        $assignments = $query->with('user.roles')->get();
-        foreach ($assignments as $assignment) {
-            if (!$assignment->user) {
-                continue;
-            }
-            $this->syncUserPermissions($assignment->user);
-            $count++;
-        }
-
-        return $count;
+        return User::query()->with(['accessAssignment.role.userType', 'accessAssignment.level', 'roles', 'outlet'])->orderBy('name')->get();
     }
 
     public function currentSessionSnapshot(User $user): array
     {
-        $user = $user->fresh(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+        return $this->getSessionSnapshot($user);
+    }
+
+    public function getSessionSnapshot(User $user): array
+    {
         $access = $this->buildSessionAccess($user);
         $permissions = $user->getAllPermissions()->pluck('name')->values()->all();
         $visiblePortals = collect($access['portals'] ?? [])
@@ -379,15 +500,6 @@ class UserManagementService
                 'sort_order' => 100,
                 'permission_view' => 'outlet.view',
                 'permission_update' => 'outlet.update',
-            ],
-            [
-                'portal_code' => 'pos',
-                'code' => 'pos-dashboard',
-                'legacy_codes' => ['cashier-dashboard'],
-                'name' => 'Dashboard',
-                'path' => '/c/dashboard',
-                'sort_order' => 12,
-                'permission_view' => 'dashboard.view',
             ],
             [
                 'portal_code' => 'pos',
@@ -487,26 +599,6 @@ class UserManagementService
 
             $target->fill($payload);
             $target->save();
-
-            foreach ($menus as $menu) {
-                if ((string) $menu->id === (string) $target->id) {
-                    continue;
-                }
-                $this->repointMenuReferences((string) $menu->id, (string) $target->id);
-                $menu->delete();
-            }
         });
-    }
-
-    private function repointMenuReferences(string $fromMenuId, string $toMenuId): void
-    {
-        foreach (['access_role_menu_permissions'] as $table) {
-            if (!DB::getSchemaBuilder()->hasTable($table) || !DB::getSchemaBuilder()->hasColumn($table, 'menu_id')) {
-                continue;
-            }
-            DB::table($table)
-                ->where('menu_id', $fromMenuId)
-                ->update(['menu_id' => $toMenuId]);
-        }
     }
 }
