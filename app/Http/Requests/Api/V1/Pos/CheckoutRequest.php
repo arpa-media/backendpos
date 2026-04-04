@@ -8,6 +8,20 @@ use Illuminate\Validation\Rule;
 
 class CheckoutRequest extends FormRequest
 {
+    protected function prepareForValidation(): void
+    {
+        $tableNumber = $this->input('table_number');
+
+        if ($tableNumber !== null) {
+            $tableNumber = trim((string) $tableNumber);
+            $tableNumber = $tableNumber !== '' ? mb_substr($tableNumber, 0, 30) : null;
+        }
+
+        $this->merge([
+            'table_number' => $tableNumber,
+        ]);
+    }
+
     public function authorize(): bool
     {
         // enforced by middleware permission:pos.checkout
