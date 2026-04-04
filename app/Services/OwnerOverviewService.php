@@ -529,8 +529,7 @@ class OwnerOverviewService
         $taxTotal = max(0, (int) ($sale['tax_total'] ?? 0));
         $taxPercent = max(0, (int) ($sale['tax_percent'] ?? 0));
         if ($taxTotal <= 0 && $taxPercent > 0 && $subtotal > 0) {
-            $taxBase = max(0, $subtotal - $discountTotal);
-            $taxTotal = (int) round($taxBase * $taxPercent / 100);
+            $taxTotal = (int) round($subtotal * $taxPercent / 100);
         }
 
         $serviceChargeTotal = max(0, (int) ($sale['service_charge_total'] ?? 0));

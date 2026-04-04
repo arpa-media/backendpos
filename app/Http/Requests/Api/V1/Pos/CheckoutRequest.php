@@ -8,6 +8,14 @@ use Illuminate\Validation\Rule;
 
 class CheckoutRequest extends FormRequest
 {
+    public function authorize(): bool
+    {
+        // enforced by middleware permission:pos.checkout
+        return true;
+    }
+
+
+
     protected function prepareForValidation(): void
     {
         $tableNumber = $this->input('table_number');
@@ -17,15 +25,16 @@ class CheckoutRequest extends FormRequest
             $tableNumber = $tableNumber !== '' ? mb_substr($tableNumber, 0, 30) : null;
         }
 
+        $discountSquadNisj = $this->input('discount_squad_nisj');
+        if ($discountSquadNisj !== null) {
+            $discountSquadNisj = trim((string) $discountSquadNisj);
+            $discountSquadNisj = $discountSquadNisj !== '' ? $discountSquadNisj : null;
+        }
+
         $this->merge([
             'table_number' => $tableNumber,
+            'discount_squad_nisj' => $discountSquadNisj,
         ]);
-    }
-
-    public function authorize(): bool
-    {
-        // enforced by middleware permission:pos.checkout
-        return true;
     }
 
     public function rules(): array

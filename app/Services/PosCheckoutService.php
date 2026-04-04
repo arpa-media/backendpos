@@ -47,12 +47,197 @@ class PosCheckoutService
 
         return false;
     }
+
+    private function normalizeDiscountSquadNisj(mixed $value): string
+    {
+        return trim((string) $value);
+    }
+
+    private function resolveSquadDiscountPackageFromSnapshots(array $discountSnapshots): ?array
+    {
+        foreach ($discountSnapshots as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            if (strtoupper((string) ($row['applies_to'] ?? '')) === 'SQUAD') {
+                return $row;
+            }
+        }
+
+        return null;
+    }
+
+    private function normalizedDiscountSpec(string $appliesTo, string $discountType, int $discountValue): array
+    {
+        $applies = strtoupper(trim((string) $appliesTo));
+        if ($applies === 'SQUAD') {
+            return ['type' => 'PERCENT', 'value' => 20];
+        }
+
+        $type = strtoupper(trim((string) $discountType));
+        if (!in_array($type, ['NONE', 'PERCENT', 'FIXED'], true)) {
+            $type = 'NONE';
+        }
+
+        return [
+            'type' => $type,
+            'value' => max(0, (int) $discountValue),
+        ];
+    }
+
+    private function normalizeStringIdList(array $values): array
+    {
+        return collect($values)
+            ->map(fn ($value) => trim((string) $value))
+            ->filter(fn ($value) => $value !== '')
+            ->values()
+            ->all();
+    }
+
+    private function sumSaleItemsForProductIds(array $saleItems, array $productIds): int
+    {
+        $ids = $this->normalizeStringIdList($productIds);
+        if (empty($ids)) {
+            return 0;
+        }
+
+        $total = 0;
+        foreach ($saleItems as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            if (in_array((string) ($row['product_id'] ?? ''), $ids, true)) {
+                $total += (int) ($row['line_total'] ?? 0);
+            }
+        }
+
+        return max(0, (int) $total);
+    }
+
+    private function resolveDiscountBase(string $appliesTo, int $subtotal, array $saleItems, array $productIds = [], array $customerIds = [], ?Customer $customer = null, string $discountSquadNisj = ''): int
+    {
+        $applies = strtoupper(trim((string) $appliesTo));
+
+        if ($applies === 'PRODUCT') {
+            return $this->sumSaleItemsForProductIds($saleItems, $productIds);
+        }
+
+        if ($applies === 'CUSTOMER') {
+            $customerId = (string) ($customer?->id ?? '');
+            $allowedCustomerIds = $this->normalizeStringIdList($customerIds);
+            return ($customerId !== '' && in_array($customerId, $allowedCustomerIds, true)) ? max(0, (int) $subtotal) : 0;
+        }
+
+        if ($applies === 'SQUAD') {
+            if (trim($discountSquadNisj) === '') {
+                return 0;
+            }
+
+            return $this->sumSaleItemsForProductIds($saleItems, $productIds);
+        }
+
+        return max(0, (int) $subtotal);
+    }
+
+    private function calculateDiscountAmountFromBase(string $discountType, int $discountValue, int $base): int
+    {
+        $normalizedBase = max(0, (int) $base);
+        $normalizedType = strtoupper(trim((string) $discountType));
+        $normalizedValue = max(0, (int) $discountValue);
+
+        if ($normalizedType === 'PERCENT') {
+            $pct = max(0, min(100, $normalizedValue));
+            return (int) floor(($normalizedBase * $pct) / 100);
+        }
+
+        if ($normalizedType === 'FIXED') {
+            return (int) min($normalizedBase, $normalizedValue);
+        }
+
+        return 0;
+    }
+
+    private function recalculateDiscountSnapshots(array $discountSnapshots, int $subtotal, array $saleItems, ?Customer $customer, string $discountSquadNisj, iterable $discountPackages = []): array
+    {
+        $packagesById = [];
+        foreach ($discountPackages as $pkg) {
+            if ($pkg instanceof Discount) {
+                $packagesById[(string) $pkg->id] = $pkg;
+            }
+        }
+
+        $normalized = [];
+        foreach ($discountSnapshots as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            $discountId = trim((string) ($row['id'] ?? ''));
+            $package = $discountId !== '' ? ($packagesById[$discountId] ?? null) : null;
+            $appliesTo = strtoupper(trim((string) ($row['applies_to'] ?? ($package?->applies_to ?? 'GLOBAL'))));
+            $spec = $this->normalizedDiscountSpec(
+                $appliesTo,
+                (string) ($row['discount_type'] ?? ($package?->discount_type ?? 'NONE')),
+                (int) ($row['discount_value'] ?? ($package?->discount_value ?? 0))
+            );
+            $productIds = $this->normalizeStringIdList(is_array($row['product_ids'] ?? null)
+                ? $row['product_ids']
+                : ($package ? $package->products->pluck('id')->all() : []));
+            $customerIds = $this->normalizeStringIdList(is_array($row['customer_ids'] ?? null)
+                ? $row['customer_ids']
+                : ($package ? $package->customers->pluck('id')->all() : []));
+            $base = $this->resolveDiscountBase($appliesTo, $subtotal, $saleItems, $productIds, $customerIds, $customer, $discountSquadNisj);
+            $amount = $this->calculateDiscountAmountFromBase((string) $spec['type'], (int) $spec['value'], $base);
+
+            $normalized[] = array_merge($row, [
+                'id' => $discountId !== '' ? $discountId : (string) ($package?->id ?? ''),
+                'code' => array_key_exists('code', $row) ? $row['code'] : ($package?->code ?? null),
+                'name' => array_key_exists('name', $row) ? $row['name'] : ($package?->name ?? null),
+                'applies_to' => $appliesTo,
+                'discount_type' => (string) $spec['type'],
+                'discount_value' => (int) $spec['value'],
+                'product_ids' => $productIds,
+                'customer_ids' => $customerIds,
+                'base' => $base,
+                'amount' => $amount,
+            ]);
+        }
+
+        return array_values($normalized);
+    }
+
+    private function buildDiscountSnapshotsFromPackages(iterable $discountPackages, int $subtotal, array $saleItems, ?Customer $customer, string $discountSquadNisj): array
+    {
+        $snapshots = [];
+        foreach ($discountPackages as $pkg) {
+            if (!($pkg instanceof Discount)) {
+                continue;
+            }
+
+            $snapshots[] = [
+                'id' => (string) $pkg->id,
+                'code' => (string) $pkg->code,
+                'name' => (string) $pkg->name,
+                'applies_to' => (string) $pkg->applies_to,
+                'discount_type' => (string) $pkg->discount_type,
+                'discount_value' => (int) $pkg->discount_value,
+                'product_ids' => $pkg->products->pluck('id')->map(fn ($value) => (string) $value)->values()->all(),
+                'customer_ids' => $pkg->customers->pluck('id')->map(fn ($value) => (string) $value)->values()->all(),
+            ];
+        }
+
+        return $this->recalculateDiscountSnapshots($snapshots, $subtotal, $saleItems, $customer, $discountSquadNisj, $discountPackages);
+    }
+
     /**
      * Checkout (atomic).
      *
      * NOTE:
      * - Outlet is resolved by middleware (OutletScope) and passed in from controller.
      * - Tax percent from request is ignored; tax is computed server-side from active default tax.
+     * - Discount reduces subtotal item and tax is computed after discount.
      */
     public function checkout(User $user, string $outletId, array $payload): Sale
     {
@@ -100,6 +285,7 @@ class PosCheckoutService
         $discountType = strtoupper((string) ($discount['type'] ?? 'NONE'));
         $discountValue = (int) ($discount['value'] ?? 0);
         $discountReason = $discount['reason'] ?? ($payload['discount_reason'] ?? null);
+        $discountSquadNisjInput = $this->normalizeDiscountSquadNisj($payload['discount_squad_nisj'] ?? null);
 
         // IMPORTANT: ignore tax_percent input (legacy Phase 1)
         $defaultTax = Tax::query()
@@ -161,6 +347,7 @@ class PosCheckoutService
             $tableChamber,
             $tableNumber,
             $discountType,
+            $discountSquadNisjInput,
             $discountValue,
             $discountReason,
             $discountId,
@@ -542,60 +729,75 @@ class PosCheckoutService
                 $discountReason = $offlineSnapshot['discount_reason'] ?? $discountReason;
                 $discountAmount = max(0, min((int) $subtotal, (int) ($offlineSnapshot['discount_amount'] ?? 0)));
                 $discountSnapshots = is_array($offlineSnapshot['discounts_snapshot'] ?? null) ? $offlineSnapshot['discounts_snapshot'] : [];
+
+                if (!empty($discountSnapshots)) {
+                    $discountSnapshots = $this->recalculateDiscountSnapshots(
+                        $discountSnapshots,
+                        (int) $subtotal,
+                        $saleItems,
+                        $customer,
+                        $discountSquadNisjInput,
+                        $discountPackages
+                    );
+                    $discountAmount = collect($discountSnapshots)->sum(fn ($row) => max(0, (int) ($row['amount'] ?? 0)));
+                } elseif ($usePackages) {
+                    $discountSnapshots = $this->buildDiscountSnapshotsFromPackages(
+                        $discountPackages,
+                        (int) $subtotal,
+                        $saleItems,
+                        $customer,
+                        $discountSquadNisjInput
+                    );
+                    $discountAmount = collect($discountSnapshots)->sum(fn ($row) => max(0, (int) ($row['amount'] ?? 0)));
+                }
+
                 if (!empty($discountSnapshots[0]['id'])) {
                     $firstDiscount = $discountSnapshots[0];
+                    $firstAppliesTo = (string) ($firstDiscount['applies_to'] ?? '');
+                    $firstSpec = $this->normalizedDiscountSpec($firstAppliesTo, (string) ($firstDiscount['discount_type'] ?? ''), (int) ($firstDiscount['discount_value'] ?? 0));
                     $discountPackage = (object) [
                         'id' => (string) ($firstDiscount['id'] ?? ''),
                         'code' => (string) ($firstDiscount['code'] ?? ''),
                         'name' => (string) ($firstDiscount['name'] ?? ''),
-                        'applies_to' => (string) ($firstDiscount['applies_to'] ?? ''),
-                        'discount_type' => (string) ($firstDiscount['discount_type'] ?? ''),
-                        'discount_value' => (int) ($firstDiscount['discount_value'] ?? 0),
+                        'applies_to' => $firstAppliesTo,
+                        'discount_type' => $firstSpec['type'],
+                        'discount_value' => (int) $firstSpec['value'],
                     ];
                 }
             } elseif ($usePackages) {
                 foreach ($discountPackages as $pkg) {
                     $appliesTo = strtoupper((string) $pkg->applies_to);
 
-                    // base by applies_to
-                    $base = $subtotal;
-                    if ($appliesTo === 'PRODUCT') {
-                        $productIdsForDiscount = $pkg->products->pluck('id')->map(fn ($x) => (string) $x)->all();
-                        $base = 0;
-                        foreach ($saleItems as $row) {
-                            if (in_array((string) $row['product_id'], $productIdsForDiscount, true)) {
-                                $base += (int) $row['line_total'];
-                            }
-                        }
-                    } elseif ($appliesTo === 'CUSTOMER') {
+                    $productIdsForDiscount = $pkg->products->pluck('id')->map(fn ($x) => (string) $x)->values()->all();
+                    $customerIdsForDiscount = $pkg->customers->pluck('id')->map(fn ($x) => (string) $x)->values()->all();
+
+                    if ($appliesTo === 'CUSTOMER') {
                         if (!$customer) {
                             throw ValidationException::withMessages([
                                 'customer_id' => ['Customer is required for this discount.'],
                             ]);
                         }
-                        $customerIdsForDiscount = $pkg->customers->pluck('id')->map(fn ($x) => (string) $x)->all();
                         if (!in_array((string) $customer->id, $customerIdsForDiscount, true)) {
                             throw ValidationException::withMessages([
                                 'customer_id' => ['Customer not eligible for this discount.'],
                             ]);
                         }
-                        // CUSTOMER => subtotal semua cart (per instruksi)
-                        $base = $subtotal;
-                    } else {
-                        $base = $subtotal;
                     }
 
-                    $base = max(0, (int) $base);
-                    $amt = 0;
-                    $t = strtoupper((string) $pkg->discount_type);
-                    $v = (int) $pkg->discount_value;
-                    if ($t === 'PERCENT') {
-                        $pct = max(0, min(100, $v));
-                        $amt = (int) floor(($base * $pct) / 100);
-                    } elseif ($t === 'FIXED') {
-                        $amt = min($base, max(0, $v));
-                    }
-                    $amt = max(0, $amt);
+                    $base = $this->resolveDiscountBase(
+                        $appliesTo,
+                        (int) $subtotal,
+                        $saleItems,
+                        $productIdsForDiscount,
+                        $customerIdsForDiscount,
+                        $customer,
+                        $discountSquadNisjInput
+                    );
+
+                    $spec = $this->normalizedDiscountSpec($appliesTo, (string) $pkg->discount_type, (int) $pkg->discount_value);
+                    $t = $spec['type'];
+                    $v = (int) $spec['value'];
+                    $amt = $this->calculateDiscountAmountFromBase($t, $v, (int) $base);
 
                     $discountSnapshots[] = [
                         'id' => (string) $pkg->id,
@@ -604,6 +806,8 @@ class PosCheckoutService
                         'applies_to' => $appliesTo,
                         'discount_type' => $t,
                         'discount_value' => (int) $v,
+                        'product_ids' => $productIdsForDiscount,
+                        'customer_ids' => $customerIdsForDiscount,
                         'base' => (int) $base,
                         'amount' => (int) $amt,
                     ];
@@ -628,16 +832,174 @@ class PosCheckoutService
 
             // cap at subtotal
             $discountAmount = max(0, min((int) $subtotal, (int) $discountAmount));
-            $taxableBase = max(0, (int) $subtotal - (int) $discountAmount);
+            $netSubtotal = max(0, (int) $subtotal - (int) $discountAmount);
+            $taxBase = (int) $netSubtotal;
 
             // Snapshot helpers (for receipts/history)
             if (!$useOfflineSnapshot && $usePackages) {
                 $discountPackage = $discountPackages->first();
                 // For backward compatibility fields, keep the first package spec.
-                $discountType = $discountPackage ? strtoupper((string) $discountPackage->discount_type) : 'NONE';
-                $discountValue = $discountPackage ? (int) $discountPackage->discount_value : 0;
+                $discountType = $discountPackage ? $this->normalizedDiscountSpec((string) $discountPackage->applies_to, (string) $discountPackage->discount_type, (int) $discountPackage->discount_value)['type'] : 'NONE';
+                $discountValue = $discountPackage ? (int) $this->normalizedDiscountSpec((string) $discountPackage->applies_to, (string) $discountPackage->discount_type, (int) $discountPackage->discount_value)['value'] : 0;
                 $codes = collect($discountSnapshots)->pluck('code')->filter()->values()->all();
                 $discountReason = !empty($codes) ? implode('+', $codes) : null;
+            }
+
+            $selectedSquadPackage = null;
+            $selectedSquadDiscountModel = null;
+            $selectedSquadUser = null;
+            $selectedSquadPeriodKey = null;
+
+            if (!$useOfflineSnapshot && $usePackages) {
+                $squadPackages = $discountPackages
+                    ->filter(fn (Discount $pkg) => strtoupper((string) $pkg->applies_to) === 'SQUAD')
+                    ->values();
+
+                if ($squadPackages->count() > 0) {
+                    if ($discountPackages->count() > 1) {
+                        throw ValidationException::withMessages([
+                            'discounts' => ['Discount squad hanya bisa dipilih sendiri.'],
+                        ]);
+                    }
+
+                    if ($discountSquadNisjInput === '') {
+                        throw ValidationException::withMessages([
+                            'discount_squad_nisj' => ['NISJ squad wajib dipilih untuk discount squad.'],
+                        ]);
+                    }
+
+                    $selectedSquadDiscountModel = $squadPackages->first();
+                    $selectedSquadPackage = [
+                        'id' => (string) $selectedSquadDiscountModel->id,
+                        'code' => (string) $selectedSquadDiscountModel->code,
+                        'name' => (string) $selectedSquadDiscountModel->name,
+                        'applies_to' => 'SQUAD',
+                    ];
+                }
+            }
+
+            if ($useOfflineSnapshot) {
+                $selectedSquadPackage = $this->resolveSquadDiscountPackageFromSnapshots($discountSnapshots);
+                if ($selectedSquadPackage !== null) {
+                    if (count($discountSnapshots) > 1) {
+                        throw ValidationException::withMessages([
+                            'discounts' => ['Discount squad hanya bisa dipilih sendiri.'],
+                        ]);
+                    }
+
+                    if ($discountSquadNisjInput === '') {
+                        throw ValidationException::withMessages([
+                            'discount_squad_nisj' => ['NISJ squad wajib dipilih untuk discount squad.'],
+                        ]);
+                    }
+
+                    $selectedSquadDiscountId = trim((string) ($selectedSquadPackage['id'] ?? ''));
+                    if ($selectedSquadDiscountId !== '') {
+                        $selectedSquadDiscountModel = Discount::query()
+                            ->withTrashed()
+                            ->where('outlet_id', $outletId)
+                            ->whereKey($selectedSquadDiscountId)
+                            ->first();
+                    }
+                }
+            }
+
+            if ($selectedSquadPackage !== null) {
+                $discountSquadService = app(DiscountSquadService::class);
+                $selectedSquadUser = $discountSquadService->findUserByNisj($discountSquadNisjInput);
+
+                if (!$selectedSquadUser) {
+                    throw ValidationException::withMessages([
+                        'discount_squad_nisj' => ['NISJ squad tidak ditemukan atau tidak aktif.'],
+                    ]);
+                }
+
+                $selectedSquadPeriodKey = $discountSquadService->currentPeriodKey($outletTimezone);
+                if (!$discountSquadService->isAvailableForNisj((string) $selectedSquadUser->nisj, $selectedSquadPeriodKey)) {
+                    throw ValidationException::withMessages([
+                        'discount_squad_nisj' => ['Jatah discount squad untuk NISJ tersebut sudah terpakai hari ini.'],
+                    ]);
+                }
+            }
+
+            if ($selectedSquadPackage !== null) {
+                $forcedSpec = $this->normalizedDiscountSpec('SQUAD', 'PERCENT', 20);
+                $discountType = $forcedSpec['type'];
+                $discountValue = (int) $forcedSpec['value'];
+                $selectedSquadProductIds = $this->normalizeStringIdList(is_array($selectedSquadPackage['product_ids'] ?? null)
+                    ? $selectedSquadPackage['product_ids']
+                    : ($selectedSquadDiscountModel ? $selectedSquadDiscountModel->products->pluck('id')->all() : []));
+                $selectedSquadCustomerIds = $this->normalizeStringIdList(is_array($selectedSquadPackage['customer_ids'] ?? null)
+                    ? $selectedSquadPackage['customer_ids']
+                    : ($selectedSquadDiscountModel ? $selectedSquadDiscountModel->customers->pluck('id')->all() : []));
+                $squadBase = $this->resolveDiscountBase(
+                    'SQUAD',
+                    (int) $subtotal,
+                    $saleItems,
+                    $selectedSquadProductIds,
+                    $selectedSquadCustomerIds,
+                    $customer,
+                    $discountSquadNisjInput
+                );
+                $squadAmount = $this->calculateDiscountAmountFromBase($discountType, $discountValue, $squadBase);
+                $discountAmount = max(0, min((int) $subtotal, (int) $squadAmount));
+
+                if (empty($discountSnapshots)) {
+                    $discountSnapshots[] = [
+                        'id' => (string) ($selectedSquadPackage['id'] ?? ''),
+                        'code' => (string) ($selectedSquadPackage['code'] ?? ''),
+                        'name' => (string) ($selectedSquadPackage['name'] ?? ''),
+                        'applies_to' => 'SQUAD',
+                        'discount_type' => $discountType,
+                        'discount_value' => $discountValue,
+                        'product_ids' => $selectedSquadProductIds,
+                        'customer_ids' => $selectedSquadCustomerIds,
+                        'base' => (int) $squadBase,
+                        'amount' => (int) $discountAmount,
+                    ];
+                } else {
+                    foreach ($discountSnapshots as $i => $snapshot) {
+                        if (strtoupper((string) ($snapshot['applies_to'] ?? '')) !== 'SQUAD') {
+                            continue;
+                        }
+
+                        $discountSnapshots[$i]['discount_type'] = $discountType;
+                        $discountSnapshots[$i]['discount_value'] = $discountValue;
+                        $discountSnapshots[$i]['product_ids'] = !empty($selectedSquadProductIds)
+                            ? $selectedSquadProductIds
+                            : $this->normalizeStringIdList((array) ($discountSnapshots[$i]['product_ids'] ?? []));
+                        $discountSnapshots[$i]['customer_ids'] = !empty($selectedSquadCustomerIds)
+                            ? $selectedSquadCustomerIds
+                            : $this->normalizeStringIdList((array) ($discountSnapshots[$i]['customer_ids'] ?? []));
+                        $discountSnapshots[$i]['base'] = (int) $this->resolveDiscountBase(
+                            'SQUAD',
+                            (int) $subtotal,
+                            $saleItems,
+                            (array) ($discountSnapshots[$i]['product_ids'] ?? []),
+                            (array) ($discountSnapshots[$i]['customer_ids'] ?? []),
+                            $customer,
+                            $discountSquadNisjInput
+                        );
+                        $discountSnapshots[$i]['amount'] = $this->calculateDiscountAmountFromBase(
+                            $discountType,
+                            $discountValue,
+                            (int) $discountSnapshots[$i]['base']
+                        );
+                    }
+                }
+
+                if (!$discountPackage) {
+                    $discountPackage = (object) [
+                        'id' => (string) ($selectedSquadPackage['id'] ?? ''),
+                        'code' => (string) ($selectedSquadPackage['code'] ?? ''),
+                        'name' => (string) ($selectedSquadPackage['name'] ?? ''),
+                        'applies_to' => 'SQUAD',
+                        'discount_type' => $discountType,
+                        'discount_value' => $discountValue,
+                    ];
+                }
+
+                $discountReason = (string) (($selectedSquadPackage['code'] ?? null) ?: ($selectedSquadPackage['name'] ?? null) ?: 'SQUAD');
             }
 
             // 7) Tax (default tax per outlet, except online/delivery which are always no-tax)
@@ -645,10 +1007,12 @@ class PosCheckoutService
                 $effectiveTaxId = $offlineSnapshot['tax_id'] ?? $taxId;
                 $effectiveTaxName = (string) ($offlineSnapshot['tax_name_snapshot'] ?? $taxName ?? 'Tax');
                 $effectiveTaxPercent = max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
-                $taxTotal = (int) ($offlineSnapshot['tax_total'] ?? 0);
+                $taxTotal = array_key_exists('tax_total', $offlineSnapshot)
+                    ? (int) ($offlineSnapshot['tax_total'] ?? 0)
+                    : (int) floor(($taxBase * $effectiveTaxPercent) / 100);
                 $serviceChargeTotal = 0;
                 $roundingTotal = (int) ($offlineSnapshot['rounding_total'] ?? 0);
-                $grandTotalBeforeRounding = (int) max(0, $taxableBase + $taxTotal + $serviceChargeTotal);
+                $grandTotalBeforeRounding = (int) max(0, $netSubtotal + $taxTotal + $serviceChargeTotal);
                 $grandTotal = (int) ($offlineSnapshot['grand_total'] ?? ($grandTotalBeforeRounding + $roundingTotal));
             } else {
                 $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
@@ -656,10 +1020,10 @@ class PosCheckoutService
                 $effectiveTaxName = $isOnlineNoTax ? 'Tax' : $taxName;
                 $effectiveTaxPercent = $isOnlineNoTax ? 0 : (int) $taxPercent;
 
-                $taxTotal = (int) floor(($taxableBase * $effectiveTaxPercent) / 100);
+                $taxTotal = (int) floor(($taxBase * $effectiveTaxPercent) / 100);
                 $serviceChargeTotal = 0;
 
-                $roundingSnapshot = SaleRounding::apply((int) ($taxableBase + $taxTotal + $serviceChargeTotal));
+                $roundingSnapshot = SaleRounding::apply((int) ($netSubtotal + $taxTotal + $serviceChargeTotal));
                 $roundingTotal = (int) ($roundingSnapshot['rounding_total'] ?? 0);
                 $grandTotalBeforeRounding = (int) ($roundingSnapshot['before_rounding'] ?? 0);
                 $grandTotal = (int) ($roundingSnapshot['after_rounding'] ?? 0);
@@ -725,6 +1089,10 @@ class PosCheckoutService
 
                 // Multiple packages snapshot (json)
                 'discounts_snapshot' => (!empty($discountSnapshots) || $usePackages) ? $discountSnapshots : null,
+                'discount_squad_user_id' => $selectedSquadUser ? (string) $selectedSquadUser->id : null,
+                'discount_squad_nisj' => $selectedSquadUser ? (string) ($selectedSquadUser->nisj ?? '') : null,
+                'discount_squad_name' => $selectedSquadUser ? (string) ($selectedSquadUser->name ?? '') : null,
+                'discount_squad_period_key' => $selectedSquadPeriodKey,
 
                 // Backward compat
                 'discount_total' => $discountAmount,
@@ -771,6 +1139,10 @@ class PosCheckoutService
                 'created_at' => $transactionAtUtc,
                 'updated_at' => $transactionAtUtc,
             ]);
+
+            if ($selectedSquadDiscountModel && $selectedSquadUser) {
+                app(DiscountSquadService::class)->registerUsage($selectedSquadDiscountModel, $sale, $selectedSquadUser);
+            }
 
             return $sale->load(['items', 'payments', 'customer', 'outlet']);
         });

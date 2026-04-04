@@ -117,11 +117,11 @@ class SaleAdjustmentService
 
         $subtotal = (int) $sale->items->sum(fn (SaleItem $item) => max(0, (int) $item->line_total));
         $discountTotal = max(0, min($subtotal, (int) ($sale->discount_total ?? $sale->discount_amount ?? 0)));
-        $taxableBase = max(0, $subtotal - $discountTotal);
+        $netSubtotal = max(0, $subtotal - $discountTotal);
         $taxPercent = max(0, (int) ($sale->tax_percent_snapshot ?? 0));
-        $taxTotal = (int) floor(($taxableBase * $taxPercent) / 100);
+        $taxTotal = (int) floor(($subtotal * $taxPercent) / 100);
         $serviceChargeTotal = max(0, (int) ($sale->service_charge_total ?? 0));
-        $beforeRounding = (int) ($taxableBase + $taxTotal + $serviceChargeTotal);
+        $beforeRounding = (int) ($netSubtotal + $taxTotal + $serviceChargeTotal);
 
         $roundingSnapshot = SaleRounding::apply($beforeRounding);
 
