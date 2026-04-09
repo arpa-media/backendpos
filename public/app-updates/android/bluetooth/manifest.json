@@ -5,14 +5,11 @@
   "released_at": "2026-04-10T09:02:00+07:00",
   "apk_file": "JayaPOS-bluetooth-1.4.0.apk",
  "notes": [
-    "Fix force logout",
-    "Fix cutoff timezone WITA",
-    "Fix login Gagal",
-    "Fix Dashboard permission",
-    "Fix Sales Scroll",
-    "Fix Discount Squad",
-    "Fix Unsync Transaction",
-    "Add Info Login Readiness Status",
-    "Add Feature prevent logout when unsync"
+    "Fix Unresolve Login",
+    "Fix Force Logout",
+    "Fix Offline Provision",
+    "Fix Drawer Scroll",
+    "Fix No Tax Discount",
+    "Add Provision Menu"
   ]
 }
