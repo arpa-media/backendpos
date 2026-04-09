@@ -14,37 +14,56 @@ use App\Http\Requests\Api\V1\Reports\TaxReportRequest;
 use App\Http\Requests\Api\V1\Reports\UpdateMarkingSettingRequest;
 use App\Services\MarkingService;
 use App\Services\ReportService;
+use App\Support\BackofficeOutletScope;
+use App\Support\FinanceOutletFilter;
 use App\Support\OutletScope;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class ReportController extends Controller
 {
+    private function injectBackofficeScope(Request $request, bool $allowGroups = true): array
+    {
+        $params = method_exists($request, 'validated') ? $request->validated() : $request->all();
+        $rawFilter = $params['outlet_filter'] ?? $params['outlet_id'] ?? FinanceOutletFilter::FILTER_ALL;
+        $scope = BackofficeOutletScope::resolve($request, (string) $rawFilter, $allowGroups);
+
+        $params['scope_outlet_ids'] = $scope['outlet_ids'] ?? [];
+        $params['scope_timezone'] = $scope['timezone'] ?? config('app.timezone', 'Asia/Jakarta');
+        $params['outlet_filter'] = $scope['value'] ?? ($params['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL);
+        $params['outlet_scope_name'] = $scope['label'] ?? 'All Outlet';
+        $params['outlet_filter_options'] = $scope['options'] ?? [];
+
+        return $params;
+    }
+
     public function cashierReport(CashierReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->cashierReport($request->validated(), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return response()->json(['data' => $service->cashierReport($params, OutletScope::id($request))]);
     }
 
     public function cashierReportCashiers(CashierReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->cashierReportCashiers($request->validated(), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return response()->json(['data' => $service->cashierReportCashiers($params, OutletScope::id($request))]);
     }
 
     public function cashierReportByCashier(CashierReportRequest $request, string $cashierId, ReportService $service): JsonResponse
     {
-        $params = $request->validated();
+        $params = $this->injectBackofficeScope($request);
         $params['cashier_id'] = $cashierId;
         return response()->json(['data' => $service->cashierReport($params, OutletScope::id($request))]);
     }
 
     public function ledger(LedgerReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->ledger($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->ledger($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 
     public function marking(MarkingReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->marking($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->marking($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 
     public function markingConfig(Request $request, MarkingService $service): JsonResponse
@@ -104,36 +123,36 @@ class ReportController extends Controller
 
     public function itemSold(ReportRangeRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->itemSold($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->itemSold($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 
     public function recentSales(RecentSalesReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->recentSales($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->recentSales($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 
     public function itemByProduct(ReportRangeRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->itemByProduct($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->itemByProduct($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 
     public function itemByVariant(ReportRangeRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->itemByVariant($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->itemByVariant($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 
     public function rounding(RoundingReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->rounding($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->rounding($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 
     public function tax(TaxReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->tax($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->tax($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 
     public function discount(DiscountReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->discount($request->validated(), OutletScope::id($request))]);
+        return response()->json(['data' => $service->discount($this->injectBackofficeScope($request), OutletScope::id($request))]);
     }
 }

@@ -14,6 +14,8 @@ use App\Http\Controllers\Api\V1\ProductController;
 use App\Http\Controllers\Api\V1\SalesController;
 use App\Http\Controllers\Api\V1\SaleCancelRequestController;
 use App\Http\Controllers\Api\V1\Finance\SalesCollectedController;
+use App\Http\Controllers\Api\V1\Finance\FinanceOverviewController;
+use App\Http\Controllers\Api\V1\Finance\ItemSummaryController;
 use App\Http\Controllers\Api\V1\Finance\CategorySummaryController;
 use App\Http\Controllers\Api\V1\Finance\SalesSummaryController;
 use App\Http\Controllers\Api\V1\AddonController;
@@ -52,8 +54,10 @@ Route::prefix('v1')->group(function () {
          */
         Route::prefix('auth')->group(function () {
             Route::post('/logout', [AuthController::class, 'logout']);
+            Route::put('/change-password', [AuthController::class, 'changePassword']);
             Route::get('/me', [AuthController::class, 'me'])
                 ->middleware('permission:auth.me');
+            Route::get('/pos-provision-payload', [AuthController::class, 'posProvisionPayload']);
         });
 
         /**
@@ -169,6 +173,18 @@ Route::prefix('v1')->group(function () {
         Route::get('/finance/sales-collected', [SalesCollectedController::class, 'index'])
             ->middleware('permission:sale.view');
 
+        Route::get('/finance/sales-collected/items', [SalesCollectedController::class, 'items'])
+            ->middleware('permission:sale.view');
+
+        Route::get('/finance/sales-collected/{saleId}', [SalesCollectedController::class, 'detail'])
+            ->middleware('permission:sale.view');
+
+        Route::get('/finance/overview', [FinanceOverviewController::class, 'index'])
+            ->middleware('permission:report.view');
+
+        Route::get('/finance/item-summary', [ItemSummaryController::class, 'index'])
+            ->middleware('permission:report.view');
+
         Route::get('/finance/category-summary', [CategorySummaryController::class, 'index'])
             ->middleware('permission:report.view');
 
@@ -257,6 +273,7 @@ Route::put('/outlet', [OutletController::class, 'update'])
                 Route::post('/levels', [UserManagementController::class, 'storeLevel']);
                 Route::put('/levels/{id}', [UserManagementController::class, 'updateLevel']);
                 Route::put('/users/{userId}/access', [UserManagementController::class, 'updateUserAccess']);
+                Route::put('/users/{userId}/profile', [UserManagementController::class, 'updateUserProfile']);
                 Route::put('/portal-permissions', [UserManagementController::class, 'updatePortalPermission']);
                 Route::put('/portal-permissions/bulk', [UserManagementController::class, 'bulkPortalPermissions']);
                 Route::put('/menu-permissions', [UserManagementController::class, 'updateMenuPermission']);

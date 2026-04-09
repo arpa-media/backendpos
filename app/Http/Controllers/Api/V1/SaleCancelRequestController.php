@@ -8,6 +8,7 @@ use App\Http\Resources\Api\V1\Sales\SaleCancelRequestResource;
 use App\Models\Sale;
 use App\Models\SaleCancelRequest;
 use App\Models\SaleItem;
+use App\Support\BackofficeOutletScope;
 use App\Support\OutletScope;
 use App\Support\SaleStatuses;
 use Illuminate\Http\Request;
@@ -54,10 +55,17 @@ class SaleCancelRequestController extends Controller
 
     private function baseScopedRequestQuery(Request $request)
     {
-        $outletId = $this->resolveScopedOutletId($request);
+        $scope = BackofficeOutletScope::resolve($request, (string) $request->query('outlet_filter', ''));
+        $ids = array_values(array_filter(array_map('strval', $scope['outlet_ids'] ?? [])));
 
-        return SaleCancelRequest::query()
-            ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId));
+        $query = SaleCancelRequest::query();
+        if (count($ids) === 1) {
+            $query->where('outlet_id', $ids[0]);
+        } elseif (count($ids) > 1) {
+            $query->whereIn('outlet_id', $ids);
+        }
+
+        return $query;
     }
 
     /**
@@ -189,6 +197,7 @@ class SaleCancelRequestController extends Controller
             'page' => ['nullable', 'integer', 'min:1'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
             'all_outlets' => ['nullable', 'boolean'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
         ]);
 
         $q = $this->baseScopedRequestQuery($request)
@@ -284,6 +293,7 @@ class SaleCancelRequestController extends Controller
             'decision' => ['required', 'string', Rule::in(['APPROVE', 'REJECT'])],
             'note' => ['nullable', 'string', 'max:500'],
             'all_outlets' => ['nullable', 'boolean'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
         ]);
 
         $user = $request->user();
@@ -338,6 +348,7 @@ class SaleCancelRequestController extends Controller
         $validated = $request->validate([
             'note' => ['nullable', 'string', 'max:500'],
             'all_outlets' => ['nullable', 'boolean'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
         ]);
 
         $user = $request->user();

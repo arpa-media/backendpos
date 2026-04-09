@@ -5,14 +5,19 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListCategorySummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
+use App\Services\CashierAlignedSaleScopeService;
+use App\Support\FinanceCategorySegment;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
-use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 
 class CategorySummaryController extends Controller
 {
+    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
+    {
+    }
+
     public function index(ListCategorySummaryRequest $request)
     {
         $v = $request->validated();
@@ -22,7 +27,7 @@ class CategorySummaryController extends Controller
         $outletFilter = FinanceOutletFilter::resolve((string) ($v['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
         $timezone = $outletFilter['timezone'];
         $outletIds = $outletFilter['outlet_ids'];
-        $categorySegment = strtolower((string) ($v['category_segment'] ?? ''));
+        $categorySegment = FinanceCategorySegment::normalize((string) ($v['category_segment'] ?? ''));
 
         $window = TransactionDate::businessDateWindow(
             $v['date_from'] ?? null,
@@ -31,7 +36,9 @@ class CategorySummaryController extends Controller
         );
         [$fromLocal, $toLocal, $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
 
-        $rows = $this->buildRows($outletIds, $fromQuery, $toQuery, $v, $timezone, $sort, $dir)->get();
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+
+        $rows = $this->buildRows($outletIds, $eligibleSaleIds, $v, $timezone, $sort, $dir, $categorySegment)->get();
 
         $items = $rows->map(function ($row) {
             $grossSales = (int) round((float) ($row->gross_sales ?? 0));
@@ -78,11 +85,7 @@ class CategorySummaryController extends Controller
             ],
             'filter_options' => [
                 'outlet_filters' => $outletFilter['options'],
-                'category_segments' => [
-                    ['value' => '', 'label' => 'All Category'],
-                    ['value' => 'bar', 'label' => 'Bar (placeholder)'],
-                    ['value' => 'kitchen', 'label' => 'Kitchen (placeholder)'],
-                ],
+                'category_segments' => FinanceCategorySegment::options(),
             ],
             'meta' => [
                 'timezone' => $timezone,
@@ -91,28 +94,34 @@ class CategorySummaryController extends Controller
                 'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                 'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
                 'category_segment_active' => $categorySegment,
-                'category_segment_placeholder' => true,
+                'category_segment_label' => FinanceCategorySegment::label($categorySegment),
+                'bar_category_names' => FinanceCategorySegment::barCategoryNames(),
+                'category_segment_placeholder' => false,
+                'cogs_source' => 'not_available',
             ],
         ], 'OK');
     }
 
-    private function buildRows(array $outletIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, string $sort, string $dir): Builder
+    private function buildRows(array $outletIds, array $eligibleSaleIds, array $filters, string $timezone, string $sort, string $dir, string $categorySegment): Builder
     {
         $salesTotalsSub = DB::table('sale_items as tsi')
             ->selectRaw('tsi.sale_id, COALESCE(SUM(tsi.line_total), 0) as items_gross_sales')
             ->whereNull('tsi.voided_at')
+            ->when(!empty($eligibleSaleIds), fn ($builder) => $builder->whereIn('tsi.sale_id', $eligibleSaleIds), fn ($builder) => $builder->whereRaw('1 = 0'))
             ->groupBy('tsi.sale_id');
 
         $aggSub = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
             ->join('products as p', 'p.id', '=', 'si.product_id')
+            ->leftJoin('categories as c', 'c.id', '=', 'p.category_id')
             ->leftJoinSub($salesTotalsSub, 'sale_totals', fn ($join) => $join->on('sale_totals.sale_id', '=', 's.id'))
             ->whereNull('si.voided_at')
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->when(!empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds));
+            ->when(!empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds))
+            ->when(!empty($eligibleSaleIds), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'));
 
-        $this->applyBusinessDateScope($aggSub, $fromQuery, $toQuery, $filters, $timezone, 's.sale_number', 's.created_at');
+        FinanceCategorySegment::apply($aggSub, 'c.name', $categorySegment);
 
         $aggSub
             ->groupBy('p.category_id')
@@ -133,7 +142,11 @@ class CategorySummaryController extends Controller
             })
             ->whereNull('p.deleted_at')
             ->whereNull('c.deleted_at')
-            ->where('p.is_active', true)
+            ->where('p.is_active', true);
+
+        FinanceCategorySegment::apply($visibleCategories, 'c.name', $categorySegment);
+
+        $visibleCategories
             ->groupBy('p.category_id')
             ->selectRaw('p.category_id as category_id')
             ->selectRaw('MAX(c.name) as category_name');
@@ -164,15 +177,4 @@ class CategorySummaryController extends Controller
         };
     }
 
-    private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void
-    {
-        TransactionDate::applyExactBusinessDateScope(
-            $query,
-            $createdAtColumn,
-            $filters['date_from'] ?? null,
-            $filters['date_to'] ?? null,
-            $timezone,
-            $saleNumberColumn
-        );
-    }
 }

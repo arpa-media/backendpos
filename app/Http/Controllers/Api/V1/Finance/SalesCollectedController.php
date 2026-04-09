@@ -5,7 +5,10 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListSalesCollectedRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
-use App\Support\OutletScope;
+use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
+use App\Models\Sale;
+use App\Services\CashierAlignedSaleScopeService;
+use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -13,6 +16,50 @@ use Illuminate\Support\Facades\DB;
 
 class SalesCollectedController extends Controller
 {
+    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
+    {
+    }
+
+    public function detail(ListSalesCollectedRequest $request, string $saleId)
+    {
+        $v = $request->validated();
+        $outletFilter = $this->resolveOutletFilter($v);
+        $timezone = $outletFilter['timezone'];
+        $outletIds = $outletFilter['outlet_ids'];
+
+        $window = $this->resolveLocalDateRange(
+            $v['date_from'] ?? null,
+            $v['date_to'] ?? null,
+            $timezone
+        );
+
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+
+        $sale = Sale::query()
+            ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer'])
+            ->where('id', $saleId)
+            ->whereNull('deleted_at')
+            ->where('status', 'PAID')
+            ->when(!empty($outletIds), fn ($query) => $query->whereIn('outlet_id', $outletIds))
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('id', $eligibleSaleIds));
+
+        $sale = $sale->first();
+        if (!$sale) {
+            return ApiResponse::error('Transaksi tidak ditemukan pada filter Sales Collected ini.', 'SALES_COLLECTED_SALE_NOT_FOUND', 404);
+        }
+
+        return ApiResponse::ok([
+            'sale' => (new SaleDetailResource($sale))->toArray($request),
+            'meta' => [
+                'outlet_scope_id' => $outletFilter['value'],
+                'outlet_scope_name' => $outletFilter['label'],
+                'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
+                'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
+                'timezone' => $timezone,
+            ],
+        ], 'OK');
+    }
+
     public function index(ListSalesCollectedRequest $request)
     {
         $v = $request->validated();
@@ -20,11 +67,13 @@ class SalesCollectedController extends Controller
         $page = max(1, (int) ($v['page'] ?? 1));
         $sort = (string) ($v['sort'] ?? 'date');
         $dir = strtolower((string) ($v['dir'] ?? 'desc')) === 'asc' ? 'asc' : 'desc';
-        $isExport = filter_var($v['export'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        $isExport = $this->toBool($v['export'] ?? false);
+        $includeItems = $isExport || $this->toBool($v['include_items'] ?? false);
+        $includeFilterOptions = $isExport || $this->toBool($v['include_filter_options'] ?? true);
 
-        $outletId = OutletScope::id($request);
-        $outletInfo = $this->resolveOutletScopeInfo($outletId);
-        $timezone = $outletInfo['timezone'];
+        $outletFilter = $this->resolveOutletFilter($v);
+        $timezone = $outletFilter['timezone'];
+        $outletIds = $outletFilter['outlet_ids'];
 
         $window = $this->resolveLocalDateRange(
             $v['date_from'] ?? null,
@@ -33,7 +82,9 @@ class SalesCollectedController extends Controller
         );
         [$fromLocal, $toLocal, $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
 
-        $summaryQuery = $this->buildBaseQuery($outletId, $fromQuery, $toQuery, $v, true, true);
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+
+        $summaryQuery = $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone, true, true, false);
         $summary = (clone $summaryQuery)
             ->selectRaw('COALESCE(SUM(s.subtotal), 0) as total_gross_sales')
             ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
@@ -42,10 +93,14 @@ class SalesCollectedController extends Controller
             ->selectRaw('COALESCE(SUM(s.grand_total), 0) as total_collected')
             ->first();
 
-        $channelOptions = $this->resolveChannelOptions($outletId, $fromQuery, $toQuery, $v);
-        $paymentOptions = $this->resolvePaymentMethodOptions($outletId, $fromQuery, $toQuery, $v);
+        $channelOptions = [];
+        $paymentOptions = [];
+        if ($includeFilterOptions) {
+            $channelOptions = $this->resolveChannelOptions($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone);
+            $paymentOptions = $this->resolvePaymentMethodOptions($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone);
+        }
 
-        $rowsQuery = $this->buildBaseQuery($outletId, $fromQuery, $toQuery, $v, true, true)
+        $rowsQuery = $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone, true, true, true)
             ->select([
                 's.id',
                 's.sale_number',
@@ -84,10 +139,10 @@ class SalesCollectedController extends Controller
             ];
         }
 
-        $saleIds = $rows->pluck('id')->filter()->values()->all();
-        $itemsMap = $this->resolveItemsTextBySaleIds($saleIds);
+        $saleIds = $rows->pluck('id')->filter()->map(fn ($id) => (string) $id)->values()->all();
+        $itemsMap = $includeItems ? $this->resolveItemsTextBySaleIds($saleIds) : [];
 
-        $items = $rows->map(function ($row) use ($itemsMap) {
+        $items = $rows->map(function ($row) use ($itemsMap, $includeItems) {
             $transactionTimezone = $row->outlet_timezone ?: config('app.timezone', 'Asia/Jakarta');
             $saleNumber = (string) ($row->sale_number ?? '');
             $date = TransactionDate::formatSaleLocal($row->created_at, $transactionTimezone, $saleNumber, 'Y-m-d');
@@ -112,7 +167,7 @@ class SalesCollectedController extends Controller
                 'grand_total' => (int) ($row->grand_total ?? 0),
                 'paid_total' => (int) ($row->paid_total ?? 0),
                 'collected_by' => (string) ($row->cashier_name ?? '-'),
-                'items' => $itemsMap[(string) $row->id] ?? '-',
+                'items' => $includeItems ? ($itemsMap[(string) $row->id] ?? '-') : '',
                 'channel' => (string) ($row->display_channel ?? '-'),
                 'payment_method' => (string) ($row->payment_method_display ?? '-'),
             ];
@@ -134,6 +189,7 @@ class SalesCollectedController extends Controller
             'selected_channel' => (string) ($v['channel'] ?? ''),
             'selected_payment_method' => (string) ($v['payment_method_name'] ?? ''),
             'search' => (string) ($v['q'] ?? ''),
+            'outlet_filter' => (string) $outletFilter['value'],
         ];
 
         $metaPayload = [
@@ -141,13 +197,16 @@ class SalesCollectedController extends Controller
             'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
             'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
             'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
-            'outlet_scope_id' => $outletId,
-            'outlet_scope_name' => $outletInfo['name'],
+            'outlet_scope_id' => $outletFilter['value'],
+            'outlet_scope_name' => $outletFilter['label'],
             'sort' => $sort,
             'dir' => $dir,
+            'items_loaded' => $includeItems,
+            'filter_options_loaded' => $includeFilterOptions,
             'performance_notes' => [
-                'payment_options_query' => 'distinct-union on filtered sales scope',
-                'items_query' => 'chunked sale id batches',
+                'list_mode' => $includeItems ? 'full' : 'lite',
+                'filter_options' => $includeFilterOptions ? 'loaded' : 'deferred',
+                'items_endpoint' => '/finance/sales-collected/items',
                 'recommended_indexes_migration' => '2026_03_26_100500_add_sales_collected_indexes',
             ],
         ];
@@ -186,26 +245,43 @@ class SalesCollectedController extends Controller
         return ApiResponse::ok($payload, 'OK');
     }
 
-    private function resolveOutletScopeInfo(?string $outletId): array
+    public function items(ListSalesCollectedRequest $request)
     {
-        $defaultTimezone = config('app.timezone', 'Asia/Jakarta');
-
-        if (!$outletId) {
-            return [
-                'name' => 'Semua Outlet',
-                'timezone' => $defaultTimezone,
-            ];
+        $v = $request->validated();
+        $saleIds = collect($v['sale_ids'] ?? [])->map(fn ($id) => trim((string) $id))->filter()->unique()->values()->all();
+        if (empty($saleIds)) {
+            return ApiResponse::ok(['items_map' => []], 'OK');
         }
 
-        $outlet = DB::table('outlets')
-            ->select(['name', 'timezone'])
-            ->where('id', $outletId)
-            ->first();
+        $outletFilter = $this->resolveOutletFilter($v);
+        $timezone = $outletFilter['timezone'];
+        $outletIds = $outletFilter['outlet_ids'];
 
-        return [
-            'name' => (string) ($outlet->name ?? 'Outlet'),
-            'timezone' => TransactionDate::normalizeTimezone((string) ($outlet->timezone ?: $defaultTimezone), $defaultTimezone),
-        ];
+        $window = $this->resolveLocalDateRange(
+            $v['date_from'] ?? null,
+            $v['date_to'] ?? null,
+            $timezone
+        );
+        [, , $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
+
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+
+        $visibleSaleIds = $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone, true, true, false)
+            ->whereIn('s.id', $saleIds)
+            ->select('s.id')
+            ->pluck('s.id')
+            ->map(fn ($id) => (string) $id)
+            ->values()
+            ->all();
+
+        return ApiResponse::ok([
+            'items_map' => $this->resolveItemsTextBySaleIds($visibleSaleIds),
+        ], 'OK');
+    }
+
+    private function resolveOutletFilter(array $filters): array
+    {
+        return FinanceOutletFilter::resolve((string) ($filters['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
     }
 
     private function resolveLocalDateRange(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
@@ -213,6 +289,10 @@ class SalesCollectedController extends Controller
         return TransactionDate::businessDateWindow($dateFrom, $dateTo, $timezone);
     }
 
+    private function toBool(mixed $value): bool
+    {
+        return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+    }
 
     private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void
     {
@@ -226,18 +306,27 @@ class SalesCollectedController extends Controller
         );
     }
 
-    private function buildBaseQuery(?string $outletId, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
+    private function buildBaseQuery(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, bool $applyChannelFilter = true, bool $applyPaymentFilter = true, bool $includeDecorations = true): Builder
     {
+        $needsChannelJoin = $includeDecorations || ($applyChannelFilter && !empty($filters['channel']));
+        $needsPaymentJoin = $includeDecorations;
+
         $query = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->leftJoinSub($this->paymentSummarySubquery(), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'))
-            ->leftJoinSub($this->channelMapSubquery(), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->when($outletId, fn ($q) => $q->where('s.outlet_id', $outletId));
+            ->when(!empty($outletIds), fn ($q) => $q->whereIn('s.outlet_id', $outletIds))
+            ->when(empty($eligibleSaleIds), fn ($q) => $q->whereRaw('1 = 0'), fn ($q) => $q->whereIn('s.id', $eligibleSaleIds));
 
-        $this->applyBusinessDateScope($query, $fromQuery, $toQuery, $filters, $outletId ? $this->resolveOutletScopeInfo($outletId)['timezone'] : config('app.timezone', 'Asia/Jakarta'));
+        if ($needsPaymentJoin) {
+            $query->leftJoinSub($this->paymentSummarySubquery(), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'));
+        }
 
+        if ($needsChannelJoin) {
+            $query->leftJoinSub($this->channelMapSubquery(), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'));
+        }
+
+        $this->applyBusinessDateScope($query, $fromQuery, $toQuery, $filters, $timezone);
         $this->applySaleNumberFilter($query, (string) ($filters['q'] ?? ''));
 
         if ($applyChannelFilter && !empty($filters['channel'])) {
@@ -262,9 +351,9 @@ class SalesCollectedController extends Controller
         return $query;
     }
 
-    private function buildFilteredSalesIdSubquery(?string $outletId, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
+    private function buildFilteredSalesIdSubquery(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
     {
-        return $this->buildBaseQuery($outletId, $fromQuery, $toQuery, $filters, $applyChannelFilter, $applyPaymentFilter)
+        return $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $filters, $timezone, $applyChannelFilter, $applyPaymentFilter, false)
             ->select('s.id')
             ->distinct();
     }
@@ -286,9 +375,9 @@ class SalesCollectedController extends Controller
         });
     }
 
-    private function resolveChannelOptions(?string $outletId, CarbonInterface $fromLocal, CarbonInterface $toLocal, array $filters): array
+    private function resolveChannelOptions(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromLocal, CarbonInterface $toLocal, array $filters, string $timezone): array
     {
-        return (clone $this->buildBaseQuery($outletId, $fromLocal, $toLocal, $filters, false, true))
+        return (clone $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromLocal, $toLocal, $filters, $timezone, false, true, true))
             ->selectRaw("TRIM(COALESCE(NULLIF(channel_map.display_channel, ''), '')) as channel_value")
             ->distinct()
             ->orderBy('channel_value')
@@ -366,9 +455,9 @@ class SalesCollectedController extends Controller
             ->groupBy('si.sale_id');
     }
 
-    private function resolvePaymentMethodOptions(?string $outletId, CarbonInterface $fromLocal, CarbonInterface $toLocal, array $filters): array
+    private function resolvePaymentMethodOptions(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromLocal, CarbonInterface $toLocal, array $filters, string $timezone): array
     {
-        $filteredSales = $this->buildFilteredSalesIdSubquery($outletId, $fromLocal, $toLocal, $filters, true, false);
+        $filteredSales = $this->buildFilteredSalesIdSubquery($outletIds, $eligibleSaleIds, $fromLocal, $toLocal, $filters, $timezone, true, false);
 
         $snapshotOptions = DB::query()
             ->fromSub($filteredSales, 'fs')

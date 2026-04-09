@@ -262,9 +262,13 @@ class UserManagementState
         $menus = [
             ['id' => 'menu-sales', 'portal_id' => 'portal-finance', 'code' => 'sales', 'name' => 'Sales', 'path' => '/sales', 'sort_order' => 10, 'is_active' => true,
                 'abilities' => ['view' => ['sale.view']]],
+            ['id' => 'menu-finance-overview', 'portal_id' => 'portal-finance', 'code' => 'finance-overview', 'name' => 'Overview Finance', 'path' => '/finance/overview', 'sort_order' => 11, 'is_active' => true,
+                'abilities' => ['view' => ['report.view']]],
             ['id' => 'menu-finance-sales-summary', 'portal_id' => 'portal-finance', 'code' => 'finance-sales-summary', 'name' => 'Sales Summary', 'path' => '/finance/sales-summary', 'sort_order' => 12, 'is_active' => true,
                 'abilities' => ['view' => ['sale.view']]],
             ['id' => 'menu-finance-category-summary', 'portal_id' => 'portal-finance', 'code' => 'finance-category-summary', 'name' => 'Category Summary', 'path' => '/finance/category-summary', 'sort_order' => 14, 'is_active' => true,
+                'abilities' => ['view' => ['report.view']]],
+            ['id' => 'menu-finance-item-summary', 'portal_id' => 'portal-finance', 'code' => 'finance-item-summary', 'name' => 'Item Summary', 'path' => '/finance/item-summary', 'sort_order' => 15, 'is_active' => true,
                 'abilities' => ['view' => ['report.view']]],
             ['id' => 'menu-report', 'portal_id' => 'portal-finance', 'code' => 'report', 'name' => 'Report', 'path' => '/reports', 'sort_order' => 20, 'is_active' => true,
                 'abilities' => ['view' => ['report.view']]],

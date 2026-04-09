@@ -33,6 +33,7 @@ class ListSalesRequest extends FormRequest
 
             'sort' => ['nullable', 'string', Rule::in(['created_at', 'sale_number', 'grand_total'])],
             'dir' => ['nullable', 'string', Rule::in(['asc', 'desc'])],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
         ];
     }
 }

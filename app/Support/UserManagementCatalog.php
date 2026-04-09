@@ -16,6 +16,9 @@ final class UserManagementCatalog
             ['code' => 'customer', 'name' => 'Customer', 'description' => 'Portal Customer', 'sort_order' => 70],
             ['code' => 'operational', 'name' => 'Chambers Operational', 'description' => 'Portal Chambers Operational', 'sort_order' => 80],
             ['code' => 'warehouse', 'name' => 'HPP/COGS', 'description' => 'Portal HPP/COGS', 'sort_order' => 90],
+            ['code' => 'owner-overview', 'name' => 'Owner Overview', 'description' => 'Portal owner overview', 'sort_order' => 100],
+            ['code' => 'omzet-report', 'name' => 'Omzet Report', 'description' => 'Portal report omzet seluruh transaksi POS.', 'sort_order' => 110],
+            ['code' => 'sales-report', 'name' => 'Sales Report', 'description' => 'Portal report transaksi dengan marking 1.', 'sort_order' => 120],
         ];
     }
 
@@ -50,15 +53,28 @@ final class UserManagementCatalog
             ['portal_code' => 'warehouse', 'code' => 'warehouse-bill-of-material', 'name' => 'Bill of Material', 'path' => '/bill-of-material', 'sort_order' => 20],
 
             ['portal_code' => 'finance', 'code' => 'finance-dashboard', 'name' => 'Dashboard', 'path' => '/portal/finance/dashboard', 'sort_order' => 10],
+            ['portal_code' => 'finance', 'code' => 'finance-overview', 'name' => 'Overview Finance', 'path' => '/finance/overview', 'sort_order' => 14, 'permission_view' => 'report.view'],
             ['portal_code' => 'finance', 'code' => 'finance-sales-collected', 'name' => 'Sales Collected', 'path' => '/finance/sales-collected', 'sort_order' => 15, 'permission_view' => 'sale.view'],
             ['portal_code' => 'finance', 'code' => 'finance-sales-summary', 'name' => 'Sales Summary', 'path' => '/finance/sales-summary', 'sort_order' => 16, 'permission_view' => 'sale.view'],
             ['portal_code' => 'finance', 'code' => 'finance-category-summary', 'name' => 'Category Summary', 'path' => '/finance/category-summary', 'sort_order' => 17, 'permission_view' => 'report.view'],
+            ['portal_code' => 'finance', 'code' => 'finance-item-summary', 'name' => 'Item Summary', 'path' => '/finance/item-summary', 'sort_order' => 18, 'permission_view' => 'report.view'],
             ['portal_code' => 'finance', 'code' => 'sales-list', 'name' => 'Sales', 'path' => '/sales', 'sort_order' => 20, 'permission_view' => 'sale.view'],
             ['portal_code' => 'finance', 'code' => 'sales-report', 'name' => 'Report', 'path' => '/reports', 'sort_order' => 30, 'permission_view' => 'report.view'],
             ['portal_code' => 'finance', 'code' => 'finance-cashier-report', 'name' => 'Cashier Report', 'path' => '/finance/cashier-report', 'sort_order' => 35, 'permission_view' => 'report.view'],
             ['portal_code' => 'finance', 'code' => 'sales-cancel', 'name' => 'Cancel Bill', 'path' => '/cancel-requests', 'sort_order' => 40, 'permission_view' => 'sale.cancel.approve', 'permission_create' => 'sale.cancel.request', 'permission_update' => 'sale.cancel.approve', 'permission_delete' => 'sale.cancel.approve'],
             ['portal_code' => 'bank', 'code' => 'bank-dashboard', 'name' => 'Dashboard', 'path' => '/portal/bank/dashboard', 'sort_order' => 10],
             ['portal_code' => 'purchasing', 'code' => 'purchasing-dashboard', 'name' => 'Dashboard', 'path' => '/portal/purchasing/dashboard', 'sort_order' => 10],
+
+            ['portal_code' => 'owner-overview', 'code' => 'owner-overview-dashboard', 'name' => 'Owner Overview', 'path' => '/owner-overview', 'sort_order' => 10, 'permission_view' => 'dashboard.view'],
+            ['portal_code' => 'owner-overview', 'code' => 'owner-overview-detail-sales', 'name' => 'Detail Sales', 'path' => '/owner-overview/detail-sales', 'sort_order' => 20, 'permission_view' => 'sale.view'],
+
+            ['portal_code' => 'omzet-report', 'code' => 'omzet-report-dashboard', 'name' => 'Dashboard', 'path' => '/omzet-report/dashboard', 'sort_order' => 10, 'permission_view' => 'dashboard.view'],
+            ['portal_code' => 'omzet-report', 'code' => 'omzet-report-ledger', 'name' => 'Ledger', 'path' => '/omzet-report/ledger', 'sort_order' => 20, 'permission_view' => 'report.view'],
+            ['portal_code' => 'omzet-report', 'code' => 'omzet-report-report', 'name' => 'Report', 'path' => '/omzet-report/report', 'sort_order' => 30, 'permission_view' => 'report.view'],
+
+            ['portal_code' => 'sales-report', 'code' => 'sales-report-dashboard', 'name' => 'Dashboard', 'path' => '/sales-report/dashboard', 'sort_order' => 10, 'permission_view' => 'dashboard.view'],
+            ['portal_code' => 'sales-report', 'code' => 'sales-report-sales', 'name' => 'Sales', 'path' => '/sales-report/sales', 'sort_order' => 20, 'permission_view' => 'sale.view'],
+            ['portal_code' => 'sales-report', 'code' => 'sales-report-report', 'name' => 'Report', 'path' => '/sales-report/report', 'sort_order' => 30, 'permission_view' => 'report.view'],
         ];
     }
 
@@ -77,6 +93,7 @@ final class UserManagementCatalog
         $permissions[] = 'auth.me';
         $permissions[] = 'admin.access';
         $permissions[] = 'pos.checkout';
+        $permissions[] = 'pos.provision.view';
         $permissions[] = 'sale.cancel.request';
 
         return array_values(array_unique($permissions));

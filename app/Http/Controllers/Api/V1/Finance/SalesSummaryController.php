@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListSalesSummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
+use App\Services\CashierAlignedSaleScopeService;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
@@ -13,11 +14,16 @@ use Illuminate\Support\Facades\DB;
 
 class SalesSummaryController extends Controller
 {
+    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
+    {
+    }
+
     public function index(ListSalesSummaryRequest $request)
     {
         $v = $request->validated();
         $sort = (string) ($v['sort'] ?? 'outlet_name');
         $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
+        $isExport = filter_var($v['export'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
         $outletFilter = FinanceOutletFilter::resolve((string) ($v['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
         $timezone = $outletFilter['timezone'];
@@ -30,7 +36,8 @@ class SalesSummaryController extends Controller
         );
         [$fromLocal, $toLocal, $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
 
-        $rows = $this->buildRows($outletIds, $fromQuery, $toQuery, $v, $timezone, $sort, $dir)->get();
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+        $rows = $this->buildRows($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone, $sort, $dir)->get();
 
         $items = $rows->map(function ($row) {
             $grossSales = (int) round((float) ($row->gross_sales ?? 0));
@@ -64,7 +71,7 @@ class SalesSummaryController extends Controller
             'total_collected' => (int) $items->sum('total_collected'),
         ];
 
-        return ApiResponse::ok([
+        $payload = [
             'items' => $items,
             'summary' => $summary,
             'filters' => [
@@ -84,17 +91,26 @@ class SalesSummaryController extends Controller
                 'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                 'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
             ],
-        ], 'OK');
+        ];
+
+        if ($isExport) {
+            $payload['export'] = [
+                'filename' => $this->buildExportFilename((string) $outletFilter['label'], $fromLocal->format('Y-m-d'), $toLocal->format('Y-m-d')),
+                'total_rows' => $items->count(),
+                'columns' => ['Outlet Name', 'Gross Sales', 'Discount', 'Net Sales', 'Tax', 'Rounding', 'Total Collected'],
+            ];
+        }
+
+        return ApiResponse::ok($payload, 'OK');
     }
 
-    private function buildRows(array $outletIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, string $sort, string $dir): Builder
+    private function buildRows(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, string $sort, string $dir): Builder
     {
         $aggSub = DB::table('sales as s')
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->when(!empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds));
-
-        $this->applyBusinessDateScope($aggSub, $fromQuery, $toQuery, $filters, $timezone, 's.sale_number', 's.created_at');
+            ->when(!empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds))
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
         $aggSub
             ->groupBy('s.outlet_id')
@@ -133,6 +149,13 @@ class SalesSummaryController extends Controller
             'total_collected' => $query->orderBy('total_collected', $dir)->orderBy('outlet_name'),
             default => $query->orderBy('outlet_name', $dir),
         };
+    }
+
+
+    private function buildExportFilename(string $label, string $dateFrom, string $dateTo): string
+    {
+        $safe = trim(preg_replace('/[^a-zA-Z0-9]+/', '_', strtolower($label)), '_');
+        return 'sales_summary_' . ($safe !== '' ? $safe : 'all_outlet') . '_' . $dateFrom . '_to_' . $dateTo . '.csv';
     }
 
     private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void

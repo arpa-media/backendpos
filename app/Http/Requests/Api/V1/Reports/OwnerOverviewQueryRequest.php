@@ -17,6 +17,7 @@ class OwnerOverviewQueryRequest extends FormRequest
             'date_from' => ['nullable', 'date'],
             'date_to' => ['nullable', 'date'],
             'outlet_id' => ['nullable', 'string', 'max:64'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
             'top_limit' => ['nullable', 'integer', 'min:1', 'max:10'],
             'recent_limit' => ['nullable', 'integer', 'min:1', 'max:20'],
         ];

@@ -9,8 +9,11 @@ use App\Models\AccessRole;
 use App\Models\AccessRoleMenuPermission;
 use App\Models\AccessRolePortalPermission;
 use App\Models\AccessUserType;
+use App\Models\Assignment;
+use App\Models\Employee;
 use App\Models\User;
 use App\Models\UserAccessAssignment;
+use App\Support\UserManagementCatalog;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
@@ -397,6 +400,88 @@ class UserManagementService
         return count($rows);
     }
 
+
+    public function updateUserProfile(User $actor, User $subject, array $payload): array
+    {
+        return DB::transaction(function () use ($actor, $subject, $payload) {
+            $subject->fill([
+                'username' => trim((string) ($payload['username'] ?? $subject->username ?? '')),
+                'nisj' => $this->nullableString($payload['nisj'] ?? $subject->nisj),
+                'outlet_id' => $this->nullableString($payload['outlet_id'] ?? $subject->outlet_id),
+            ]);
+            $subject->save();
+
+            $employee = $subject->employee;
+            $assignmentTitle = $this->nullableString($payload['assignment_role_title'] ?? null);
+            $targetOutletId = $this->nullableString($payload['outlet_id'] ?? $subject->outlet_id);
+            $needsEmployee = $employee || $assignmentTitle !== null || $targetOutletId !== null || $this->nullableString($payload['nisj'] ?? null) !== null;
+
+            if (! $employee && $needsEmployee) {
+                $employee = Employee::query()->create([
+                    'user_id' => $subject->id,
+                    'assignment_id' => null,
+                    'nisj' => $this->nullableString($payload['nisj'] ?? $subject->nisj),
+                    'full_name' => $subject->name,
+                    'nickname' => $subject->name,
+                    'employment_status' => 'manual',
+                ]);
+            }
+
+            if ($employee) {
+                $employee->fill([
+                    'nisj' => $this->nullableString($payload['nisj'] ?? $subject->nisj),
+                    'full_name' => $employee->full_name ?: $subject->name,
+                    'nickname' => $employee->nickname ?: $subject->name,
+                ]);
+                $employee->save();
+
+                $assignment = $employee->assignment;
+                if (! $assignment && ($assignmentTitle !== null || $targetOutletId !== null)) {
+                    $assignment = Assignment::query()->create([
+                        'employee_id' => $employee->id,
+                        'outlet_id' => $targetOutletId,
+                        'role_title' => $assignmentTitle,
+                        'is_primary' => true,
+                        'status' => 'manual',
+                    ]);
+                    $employee->assignment_id = $assignment->id;
+                    $employee->save();
+                } elseif ($assignment) {
+                    $assignment->fill([
+                        'outlet_id' => $targetOutletId,
+                        'role_title' => $assignmentTitle,
+                        'is_primary' => true,
+                        'status' => $assignment->status ?: 'manual',
+                    ]);
+                    $assignment->save();
+                }
+            }
+
+            $subject->refresh()->loadMissing([
+                'employee.assignment.outlet',
+                'outlet',
+                'roles',
+                'accessAssignment.role.userType',
+                'accessAssignment.level',
+            ]);
+
+            return [
+                'user' => $subject,
+                'current_actor_session' => $this->currentSessionSnapshot($actor),
+            ];
+        });
+    }
+
+    private function nullableString(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $trimmed = trim((string) $value);
+        return $trimmed === '' ? null : $trimmed;
+    }
+
     public function listUsers(): Collection
     {
         return User::query()->with(['accessAssignment.role.userType', 'accessAssignment.level', 'roles', 'outlet'])->orderBy('name')->get();
@@ -465,10 +550,9 @@ class UserManagementService
             );
         }
 
-        foreach ([
-            ['code' => 'omzet-report', 'name' => 'Omzet Report', 'description' => 'Portal report omzet seluruh transaksi POS.', 'sort_order' => 16],
-            ['code' => 'sales-report', 'name' => 'Sales Report', 'description' => 'Portal report transaksi dengan marking 1.', 'sort_order' => 17],
-        ] as $portalSeed) {
+        foreach (array_merge(UserManagementCatalog::portals(), [
+            ['code' => 'pos', 'name' => 'POS', 'description' => 'Portal POS', 'sort_order' => 15],
+        ]) as $portalSeed) {
             AccessPortal::query()->updateOrCreate(
                 ['code' => $portalSeed['code']],
                 [
@@ -490,17 +574,8 @@ class UserManagementService
             return;
         }
 
-        $menuSeeds = [
-            [
-                'portal_code' => 'operational',
-                'code' => 'operational-outlet',
-                'legacy_codes' => ['sales-outlet', 'outlet'],
-                'name' => 'Outlet',
-                'path' => '/settings/outlet',
-                'sort_order' => 100,
-                'permission_view' => 'outlet.view',
-                'permission_update' => 'outlet.update',
-            ],
+        $menuSeeds = array_map(fn (array $seed) => $seed + ['legacy_codes' => []], UserManagementCatalog::menus());
+        $menuSeeds = array_merge($menuSeeds, [
             [
                 'portal_code' => 'pos',
                 'code' => 'pos-offline-transactions',
@@ -511,58 +586,28 @@ class UserManagementService
                 'permission_view' => 'pos.offline_sync.view',
             ],
             [
-                'portal_code' => 'omzet-report',
-                'code' => 'omzet-report-dashboard',
+                'portal_code' => 'pos',
+                'code' => 'pos-dashboard',
+                'legacy_codes' => ['cashier-dashboard'],
                 'name' => 'Dashboard',
-                'path' => '/omzet-report/dashboard',
+                'path' => '/c/dashboard',
                 'sort_order' => 10,
-                'permission_view' => 'dashboard.view',
+                'permission_view' => 'pos.checkout',
             ],
             [
-                'portal_code' => 'omzet-report',
-                'code' => 'omzet-report-ledger',
-                'name' => 'Ledger',
-                'path' => '/omzet-report/ledger',
-                'sort_order' => 20,
-                'permission_view' => 'report.view',
+                'portal_code' => 'pos',
+                'code' => 'pos-provision',
+                'legacy_codes' => ['sales-provision', 'cashier-provision'],
+                'name' => 'Provision',
+                'path' => '/c/provision',
+                'sort_order' => 36,
+                'permission_view' => 'pos.provision.view',
             ],
-            [
-                'portal_code' => 'omzet-report',
-                'code' => 'omzet-report-report',
-                'name' => 'Report',
-                'path' => '/omzet-report/report',
-                'sort_order' => 30,
-                'permission_view' => 'report.view',
-            ],
-            [
-                'portal_code' => 'sales-report',
-                'code' => 'sales-report-dashboard',
-                'name' => 'Dashboard',
-                'path' => '/sales-report/dashboard',
-                'sort_order' => 10,
-                'permission_view' => 'dashboard.view',
-            ],
-            [
-                'portal_code' => 'sales-report',
-                'code' => 'sales-report-sales',
-                'name' => 'Sales',
-                'path' => '/sales-report/sales',
-                'sort_order' => 20,
-                'permission_view' => 'sale.view',
-            ],
-            [
-                'portal_code' => 'sales-report',
-                'code' => 'sales-report-report',
-                'name' => 'Report',
-                'path' => '/sales-report/report',
-                'sort_order' => 30,
-                'permission_view' => 'report.view',
-            ],
-        ];
+        ]);
 
         foreach ($menuSeeds as $seed) {
             $portalId = $portalMap->get($seed['portal_code']);
-            if (!$portalId) {
+            if (! $portalId) {
                 continue;
             }
 

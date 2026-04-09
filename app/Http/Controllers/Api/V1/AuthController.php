@@ -7,11 +7,13 @@ use App\Http\Requests\Api\V1\Auth\LoginRequest;
 use App\Http\Resources\Api\V1\Auth\MeResource;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Models\User;
+use App\Services\PosProvisionService;
 use App\Services\ReportPortalAccessService;
 use App\Services\UserManagementService;
 use App\Support\Auth\UserAuthContextResolver;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
@@ -21,6 +23,7 @@ class AuthController extends Controller
         private readonly UserAuthContextResolver $resolver,
         private readonly UserManagementService $userManagement,
         private readonly ReportPortalAccessService $reportPortalAccess,
+        private readonly PosProvisionService $posProvision,
     ) {
     }
 
@@ -111,6 +114,72 @@ class AuthController extends Controller
             'report_access' => $snapshot['report_access'] ?? $this->reportPortalAccess->snapshot($user),
             'permissions' => $snapshot['permissions'] ?? [],
         ], 'Login success');
+    }
+
+    public function changePassword(Request $request)
+    {
+        $user = $request->user();
+
+        $data = $request->validate([
+            'current_password' => ['required', 'string'],
+            'password' => ['required', 'string', 'min:8', 'confirmed', 'different:current_password'],
+        ]);
+
+        if (! Hash::check((string) $data['current_password'], (string) $user->password)) {
+            throw ValidationException::withMessages([
+                'current_password' => ['Password saat ini tidak sesuai.'],
+            ]);
+        }
+
+        $user->forceFill([
+            'password' => (string) $data['password'],
+        ])->save();
+
+        $freshUser = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+
+        return ApiResponse::ok([
+            'user' => new MeResource($freshUser),
+            'permissions' => $this->userManagement->currentSessionSnapshot($freshUser)['permissions'] ?? [],
+        ], 'Password berhasil diperbarui');
+    }
+
+    public function posProvisionPayload(Request $request)
+    {
+        try {
+            $payload = $this->posProvision->buildForUser($request->user());
+
+            return ApiResponse::ok($payload, 'OK');
+        } catch (\Throwable $exception) {
+            Log::error('POS provision payload failed', [
+                'user_id' => optional($request->user())->id,
+                'message' => $exception->getMessage(),
+                'trace' => $exception->getTraceAsString(),
+            ]);
+
+            return ApiResponse::ok([
+                'ready' => false,
+                'reason' => 'PROVISION_PAYLOAD_FAILED',
+                'outlet' => null,
+                'outlet_id' => null,
+                'outlet_code' => null,
+                'outlet_name' => null,
+                'outlet_timezone' => null,
+                'channel' => 'PROVISION',
+                'channels' => ['DINE_IN', 'TAKEAWAY', 'DELIVERY'],
+                'default_channel' => 'DINE_IN',
+                'users' => [],
+                'snapshot' => null,
+                'snapshots' => [],
+                'manifest' => null,
+                'manifests' => [],
+                'meta' => [
+                    'generated_at' => now()->toIso8601String(),
+                    'contract' => 'pos-device-provision-package',
+                    'version' => 3,
+                    'error' => $exception->getMessage(),
+                ],
+            ], 'Provision payload fallback');
+        }
     }
 
     public function me(Request $request)

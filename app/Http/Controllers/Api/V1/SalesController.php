@@ -8,6 +8,7 @@ use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Http\Resources\Api\V1\Sales\SaleListResource;
 use App\Models\Sale;
+use App\Support\BackofficeOutletScope;
 use App\Support\OutletScope;
 use App\Support\TransactionDate;
 use Illuminate\Http\Request;
@@ -22,10 +23,12 @@ class SalesController extends Controller
         $sort = $v['sort'] ?? 'created_at';
         $dir = $v['dir'] ?? 'desc';
 
-        $outletId = OutletScope::id($request); // null => ALL
+        $scope = BackofficeOutletScope::resolve($request, (string) ($v['outlet_filter'] ?? ''));
+        $scopeIds = array_values(array_filter(array_map('strval', $scope['outlet_ids'] ?? [])));
+        $outletId = count($scopeIds) === 1 ? $scopeIds[0] : null;
 
-        // Date filters should follow outlet timezone / request timezone.
-        $tz = TransactionDate::normalizeTimezone((string) config('app.timezone', 'Asia/Jakarta'), 'Asia/Jakarta');
+        // Date filters should follow selected outlet timezone / request timezone.
+        $tz = TransactionDate::normalizeTimezone((string) ($scope['timezone'] ?? config('app.timezone', 'Asia/Jakarta')), 'Asia/Jakarta');
         if ($outletId) {
             $tz = TransactionDate::normalizeTimezone(
                 (string) (DB::table('outlets')->where('id', $outletId)->value('timezone') ?: $tz),
@@ -33,8 +36,13 @@ class SalesController extends Controller
             );
         }
 
-        $q = Sale::query()
-            ->when($outletId, fn ($qq) => $qq->where('outlet_id', $outletId))
+        $q = Sale::query();
+        if (count($scopeIds) === 1) {
+            $q->where('outlet_id', $scopeIds[0]);
+        } elseif (count($scopeIds) > 1) {
+            $q->whereIn('outlet_id', $scopeIds);
+        }
+        $q
             ->with(['outlet:id,timezone'])
             ->withCount('items')
             ->withCount([

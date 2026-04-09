@@ -3,7 +3,9 @@
 namespace App\Services;
 
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
+use App\Services\CashierAlignedSaleScopeService;
 use App\Models\Sale;
+use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -11,15 +13,9 @@ use Illuminate\Support\Facades\DB;
 
 class OwnerOverviewService
 {
-    private const OUTLET_GROUPS = [
-        'PT_BKJB' => ['KJN', 'SWJ', 'IJN', 'SMR', 'FEB', 'KPD', 'SKN', 'SHT', 'MOG', 'DPN', 'BGN', 'CFT', 'MDC'],
-        'PT_MDMF' => ['TNS', 'BD', 'FIA', 'BJ', 'KTA'],
-    ];
-
-    /**
-     * @var array<string, array<int, string>>
-     */
-    private array $groupOutletIdsCache = [];
+    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
+    {
+    }
 
 
     public function saleDetail(array $params, string $saleId): array
@@ -41,12 +37,15 @@ class OwnerOverviewService
             $timezone,
         );
 
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scope['allowed_outlet_ids'], $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone);
+
         $sale = Sale::query()
             ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer'])
             ->where('id', $saleId)
             ->whereNull('deleted_at')
             ->where('status', '=', 'PAID')
-            ->whereIn('outlet_id', $scope['allowed_outlet_ids']);
+            ->whereIn('outlet_id', $scope['allowed_outlet_ids'])
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('id', $eligibleSaleIds));
 
         if (! empty($scope['selected_outlet_id'])) {
             $sale->where('outlet_id', '=', $scope['selected_outlet_id']);
@@ -73,12 +72,13 @@ class OwnerOverviewService
 
     public function detailScope(array $params): array
     {
-        $selectedOutletId = $this->normalizeOutletId($params['outlet_id'] ?? null);
-        $allowedOutlets = $this->resolveAllowedOutlets($selectedOutletId);
+        $outletFilter = $this->resolveOutletFilter($params);
+        $allowedOutlets = $this->resolveAllowedOutlets($outletFilter['outlet_ids'] ?? []);
+        $selectedFilterValue = (string) ($outletFilter['value'] ?? FinanceOutletFilter::FILTER_ALL);
         $selectedOutlet = null;
 
-        if ($selectedOutletId && ! $this->isOutletGroup($selectedOutletId)) {
-            $selectedOutlet = collect($allowedOutlets)->first(fn (array $outlet) => (string) ($outlet['id'] ?? '') === (string) $selectedOutletId);
+        if ($this->isSingleOutletFilter($selectedFilterValue)) {
+            $selectedOutlet = collect($allowedOutlets)->first(fn (array $outlet) => (string) ($outlet['id'] ?? '') === $selectedFilterValue);
         }
 
         return [
@@ -87,19 +87,22 @@ class OwnerOverviewService
             'mode' => 'owner_overview',
             'marking_rule' => 'ignore_marking',
             'marked_only' => false,
+            'filter_value' => $selectedFilterValue,
+            'filter_label' => (string) ($outletFilter['label'] ?? 'All Outlet'),
             'allowed_outlets' => $allowedOutlets,
             'allowed_outlet_ids' => array_values(array_map(fn (array $outlet) => (string) ($outlet['id'] ?? ''), $allowedOutlets)),
             'selected_outlet_id' => $selectedOutlet ? (string) ($selectedOutlet['id'] ?? '') : null,
-            'selected_outlet_code' => $selectedOutlet ? (string) ($selectedOutlet['code'] ?? '') : ($selectedOutletId ? (string) $selectedOutletId : 'ALL'),
-            'selected_outlet_name' => $selectedOutlet ? (string) ($selectedOutlet['name'] ?? '') : ($selectedOutletId ? (string) $selectedOutletId : 'ALL'),
-            'uses_all_outlets' => $selectedOutletId === null || $this->isOutletGroup($selectedOutletId),
+            'selected_outlet_code' => $selectedOutlet ? (string) ($selectedOutlet['code'] ?? '') : $selectedFilterValue,
+            'selected_outlet_name' => $selectedOutlet ? (string) ($selectedOutlet['name'] ?? '') : (string) ($outletFilter['label'] ?? 'All Outlet'),
+            'uses_all_outlets' => ! $this->isSingleOutletFilter($selectedFilterValue),
         ];
     }
 
     public function overview(array $params): array
     {
-        $selectedOutletId = $this->normalizeOutletId($params['outlet_id'] ?? null);
-        $timezone = $this->resolveTimezone($selectedOutletId);
+        $outletFilter = $this->resolveOutletFilter($params);
+        $timezone = (string) ($outletFilter['timezone'] ?? config('app.timezone', 'Asia/Jakarta'));
+        $outletIds = array_values(array_filter(array_map(fn ($id) => (string) $id, $outletFilter['outlet_ids'] ?? [])));
         [$fromLocal, $toLocal, $fromQuery, $toQuery] = TransactionDate::dateRange(
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
@@ -108,14 +111,15 @@ class OwnerOverviewService
 
         $topLimit = max(1, min(10, (int) ($params['top_limit'] ?? 5)));
         $recentLimit = max(1, min(20, (int) ($params['recent_limit'] ?? 10)));
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone);
 
         $salesBase = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
-        $this->applyOutletScope($salesBase, $selectedOutletId, 's');
-        $this->applyBusinessDateScope($salesBase, $fromQuery, $toQuery, $params, $timezone, 's.sale_number', 's.created_at');
+        $this->applyOutletScope($salesBase, $outletIds, 's');
 
         $metrics = (clone $salesBase)
             ->selectRaw('COUNT(*) as trx_count')
@@ -138,7 +142,7 @@ class OwnerOverviewService
             ->leftJoinSub($outletSummaryAgg, 'agg', fn ($join) => $join->on('agg.outlet_id', '=', 'o.id'))
             ->whereRaw('LOWER(COALESCE(o.type, ?)) = ?', ['outlet', 'outlet']);
 
-        $this->applyOutletRowScope($outletSalesSummary, $selectedOutletId, 'o.id');
+        $this->applyOutletRowScope($outletSalesSummary, $outletIds, 'o.id');
 
         $outletSalesSummary = $outletSalesSummary
             ->orderBy('o.name')
@@ -201,7 +205,7 @@ class OwnerOverviewService
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->whereNull('s.deleted_at')
             ->where('s.status', '=', 'PAID');
-        $this->applyOutletScope($topVariantsBase, $selectedOutletId, 's');
+        $this->applyOutletScope($topVariantsBase, $outletIds, 's');
         $this->applyBusinessDateScope($topVariantsBase, $fromQuery, $toQuery, $params, $timezone, 's.sale_number', 's.created_at');
 
         $topVariants = (clone $topVariantsBase)
@@ -271,7 +275,7 @@ class OwnerOverviewService
             ->leftJoin('categories as c', 'c.id', '=', 'p.category_id')
             ->whereNull('s.deleted_at')
             ->where('s.status', '=', 'PAID');
-        $this->applyOutletScope($categoryBase, $selectedOutletId, 's');
+        $this->applyOutletScope($categoryBase, $outletIds, 's');
         $this->applyBusinessDateScope($categoryBase, $fromQuery, $toQuery, $params, $timezone, 's.sale_number', 's.created_at');
 
         $categorySummary = $categoryBase
@@ -295,10 +299,12 @@ class OwnerOverviewService
             'filters' => [
                 'date_from' => $fromLocal->toDateString(),
                 'date_to' => $toLocal->toDateString(),
-                'outlet_id' => $selectedOutletId ?: 'ALL',
+                'outlet_id' => (string) ($outletFilter['value'] ?? FinanceOutletFilter::FILTER_ALL),
+                'outlet_filter' => (string) ($outletFilter['value'] ?? FinanceOutletFilter::FILTER_ALL),
             ],
             'meta' => [
                 'timezone' => $timezone,
+                'outlet_scope_name' => (string) ($outletFilter['label'] ?? 'All Outlet'),
                 'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
             ],
             'metrics' => [
@@ -333,21 +339,13 @@ class OwnerOverviewService
     /**
      * @return array<int, array{id:string,code:string,name:string,type:string,timezone:string}>
      */
-    private function resolveAllowedOutlets(?string $outletId): array
+    private function resolveAllowedOutlets(array $outletIds): array
     {
         $query = DB::table('outlets')
             ->whereRaw('LOWER(COALESCE(type, ?)) = ?', ['outlet', 'outlet']);
 
-        if ($outletId) {
-            if ($this->isOutletGroup($outletId)) {
-                $ids = $this->resolveGroupOutletIds($outletId);
-                if (empty($ids)) {
-                    return [];
-                }
-                $query->whereIn('id', $ids);
-            } else {
-                $query->where('id', '=', $outletId);
-            }
+        if (! empty($outletIds)) {
+            $query->whereIn('id', $outletIds);
         }
 
         return $query
@@ -364,23 +362,46 @@ class OwnerOverviewService
             ->all();
     }
 
-    private function normalizeOutletId(?string $value): ?string
+    private function resolveOutletFilter(array $params): array
+    {
+        $rawFilter = $params['outlet_filter'] ?? $params['outlet_id'] ?? FinanceOutletFilter::FILTER_ALL;
+        $normalized = $this->normalizeOutletFilter($rawFilter);
+
+        return FinanceOutletFilter::resolve($normalized);
+    }
+
+    private function normalizeOutletFilter($value): string
     {
         $raw = strtoupper(trim((string) ($value ?? '')));
         if ($raw === '' || $raw === 'ALL') {
-            return null;
+            return FinanceOutletFilter::FILTER_ALL;
         }
 
-        if ($this->isOutletGroup($raw)) {
-            return $raw;
+        if ($raw === 'PT_BKJB' || $raw === FinanceOutletFilter::FILTER_GROUP_BKJB) {
+            return FinanceOutletFilter::FILTER_GROUP_BKJB;
         }
 
-        return trim((string) $value);
+        if ($raw === 'PT_MDMF' || $raw === FinanceOutletFilter::FILTER_GROUP_MDMF) {
+            return FinanceOutletFilter::FILTER_GROUP_MDMF;
+        }
+
+        return trim((string) ($value ?? ''));
     }
+
+    private function isSingleOutletFilter(?string $value): bool
+    {
+        $raw = trim((string) ($value ?? ''));
+
+        return $raw !== ''
+            && strtoupper($raw) !== FinanceOutletFilter::FILTER_ALL
+            && strtoupper($raw) !== FinanceOutletFilter::FILTER_GROUP_BKJB
+            && strtoupper($raw) !== FinanceOutletFilter::FILTER_GROUP_MDMF;
+    }
+
 
     private function resolveTimezone(?string $outletId): string
     {
-        if (! $outletId || $this->isOutletGroup($outletId)) {
+        if (! $outletId) {
             return TransactionDate::normalizeTimezone(config('app.timezone', 'Asia/Jakarta'));
         }
 
@@ -389,72 +410,22 @@ class OwnerOverviewService
         return TransactionDate::normalizeTimezone((string) ($timezone ?: config('app.timezone', 'Asia/Jakarta')));
     }
 
-    private function applyOutletScope(Builder $query, ?string $outletId, string $saleAlias = 's'): void
+    private function applyOutletScope(Builder $query, array $outletIds, string $saleAlias = 's'): void
     {
-        if (! $outletId) {
+        if (empty($outletIds)) {
             return;
         }
 
-        if ($this->isOutletGroup($outletId)) {
-            $ids = $this->resolveGroupOutletIds($outletId);
-            if (empty($ids)) {
-                $query->whereRaw('1 = 0');
-                return;
-            }
-            $query->whereIn($saleAlias . '.outlet_id', $ids);
-            return;
-        }
-
-        $query->where($saleAlias . '.outlet_id', '=', $outletId);
+        $query->whereIn($saleAlias . '.outlet_id', $outletIds);
     }
 
-    private function applyOutletRowScope(Builder $query, ?string $outletId, string $outletColumn = 'o.id'): void
+    private function applyOutletRowScope(Builder $query, array $outletIds, string $outletColumn = 'o.id'): void
     {
-        if (! $outletId) {
+        if (empty($outletIds)) {
             return;
         }
 
-        if ($this->isOutletGroup($outletId)) {
-            $ids = $this->resolveGroupOutletIds($outletId);
-            if (empty($ids)) {
-                $query->whereRaw('1 = 0');
-                return;
-            }
-            $query->whereIn($outletColumn, $ids);
-            return;
-        }
-
-        $query->where($outletColumn, '=', $outletId);
-    }
-
-    private function isOutletGroup(?string $value): bool
-    {
-        return isset(self::OUTLET_GROUPS[strtoupper((string) $value)]);
-    }
-
-    /**
-     * @return array<int, string>
-     */
-    private function resolveGroupOutletIds(string $groupKey): array
-    {
-        $groupKey = strtoupper($groupKey);
-        if (isset($this->groupOutletIdsCache[$groupKey])) {
-            return $this->groupOutletIdsCache[$groupKey];
-        }
-
-        $codes = self::OUTLET_GROUPS[$groupKey] ?? [];
-        if (empty($codes)) {
-            return $this->groupOutletIdsCache[$groupKey] = [];
-        }
-
-        return $this->groupOutletIdsCache[$groupKey] = DB::table('outlets')
-            ->whereRaw('LOWER(COALESCE(type, ?)) = ?', ['outlet', 'outlet'])
-            ->whereIn('code', $codes)
-            ->pluck('id')
-            ->map(fn ($id) => (string) $id)
-            ->filter(fn ($id) => $id !== '')
-            ->values()
-            ->all();
+        $query->whereIn($outletColumn, $outletIds);
     }
 
 
@@ -529,7 +500,8 @@ class OwnerOverviewService
         $taxTotal = max(0, (int) ($sale['tax_total'] ?? 0));
         $taxPercent = max(0, (int) ($sale['tax_percent'] ?? 0));
         if ($taxTotal <= 0 && $taxPercent > 0 && $subtotal > 0) {
-            $taxTotal = (int) round($subtotal * $taxPercent / 100);
+            $taxBase = max(0, $subtotal - $discountTotal);
+            $taxTotal = (int) round($taxBase * $taxPercent / 100);
         }
 
         $serviceChargeTotal = max(0, (int) ($sale['service_charge_total'] ?? 0));

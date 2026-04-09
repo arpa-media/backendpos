@@ -31,9 +31,16 @@ class CheckoutRequest extends FormRequest
             $discountSquadNisj = $discountSquadNisj !== '' ? $discountSquadNisj : null;
         }
 
+        $repairDiscountSquadNisj = $this->input('repair_discount_squad_nisj');
+        if ($repairDiscountSquadNisj !== null) {
+            $repairDiscountSquadNisj = trim((string) $repairDiscountSquadNisj);
+            $repairDiscountSquadNisj = $repairDiscountSquadNisj !== '' ? $repairDiscountSquadNisj : null;
+        }
+
         $this->merge([
             'table_number' => $tableNumber,
             'discount_squad_nisj' => $discountSquadNisj,
+            'repair_discount_squad_nisj' => $repairDiscountSquadNisj,
         ]);
     }
 
@@ -70,6 +77,7 @@ class CheckoutRequest extends FormRequest
             'discounts' => ['nullable', 'array', 'max:10'],
             'discounts.*.discount_id' => ['required_with:discounts', 'string', 'max:50'],
             'discount_squad_nisj' => ['nullable', 'string', 'max:100'],
+            'repair_discount_squad_nisj' => ['nullable', 'string', 'max:100'],
 
             // Backward compat (old payload)
             'discount_reason' => ['nullable', 'string', Rule::in(['member', 'promo', 'squad'])],

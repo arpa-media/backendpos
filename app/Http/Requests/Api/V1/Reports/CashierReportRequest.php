@@ -9,6 +9,7 @@ class CashierReportRequest extends ReportRangeRequest
         return array_merge(parent::rules(), [
             'date' => ['nullable', 'date_format:Y-m-d'],
             'cashier_id' => ['nullable', 'string'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
         ]);
     }
 }

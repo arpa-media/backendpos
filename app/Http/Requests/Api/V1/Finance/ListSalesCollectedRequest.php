@@ -18,6 +18,7 @@ class ListSalesCollectedRequest extends FormRequest
             'q' => ['nullable', 'string', 'max:60'],
             'channel' => ['nullable', 'string', 'max:60'],
             'payment_method_name' => ['nullable', 'string', 'max:120'],
+            'outlet_filter' => ['nullable', 'string', 'max:64'],
 
             'date_from' => ['nullable', 'date'],
             'date_to' => ['nullable', 'date'],
@@ -25,6 +26,10 @@ class ListSalesCollectedRequest extends FormRequest
             'page' => ['nullable', 'integer', 'min:1'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:200'],
             'export' => ['nullable', 'boolean'],
+            'include_items' => ['nullable', 'boolean'],
+            'include_filter_options' => ['nullable', 'boolean'],
+            'sale_ids' => ['nullable', 'array', 'max:200'],
+            'sale_ids.*' => ['nullable', 'string', 'max:64'],
 
             'sort' => ['nullable', 'string', Rule::in([
                 'sale_number', 'outlet', 'date', 'time',

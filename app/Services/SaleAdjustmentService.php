@@ -6,6 +6,7 @@ use App\Models\Sale;
 use App\Models\SaleCancelRequest;
 use App\Models\SaleItem;
 use App\Models\User;
+use App\Support\SaleAmountBreakdown;
 use App\Support\SaleRounding;
 use App\Support\SaleStatuses;
 use Illuminate\Support\Collection;
@@ -117,20 +118,25 @@ class SaleAdjustmentService
 
         $subtotal = (int) $sale->items->sum(fn (SaleItem $item) => max(0, (int) $item->line_total));
         $discountTotal = max(0, min($subtotal, (int) ($sale->discount_total ?? $sale->discount_amount ?? 0)));
-        $netSubtotal = max(0, $subtotal - $discountTotal);
         $taxPercent = max(0, (int) ($sale->tax_percent_snapshot ?? 0));
-        $taxTotal = (int) floor(($subtotal * $taxPercent) / 100);
         $serviceChargeTotal = max(0, (int) ($sale->service_charge_total ?? 0));
-        $beforeRounding = (int) ($netSubtotal + $taxTotal + $serviceChargeTotal);
 
-        $roundingSnapshot = SaleRounding::apply($beforeRounding);
+        $preRounding = SaleAmountBreakdown::canonical($subtotal, $discountTotal, $taxPercent, 0, $serviceChargeTotal);
+        $roundingSnapshot = SaleRounding::apply((int) $preRounding['before_rounding']);
+        $canonical = SaleAmountBreakdown::canonical(
+            $subtotal,
+            $discountTotal,
+            $taxPercent,
+            (int) ($roundingSnapshot['rounding_total'] ?? 0),
+            $serviceChargeTotal
+        );
 
         $sale->subtotal = $subtotal;
         $sale->discount_amount = $discountTotal;
         $sale->discount_total = $discountTotal;
-        $sale->tax_total = $taxTotal;
-        $sale->rounding_total = (int) ($roundingSnapshot['rounding_total'] ?? 0);
-        $sale->grand_total = (int) ($roundingSnapshot['after_rounding'] ?? 0);
+        $sale->tax_total = (int) $canonical['tax_total'];
+        $sale->rounding_total = (int) $canonical['rounding_total'];
+        $sale->grand_total = (int) $canonical['grand_total'];
         $sale->paid_total = (int) $sale->grand_total;
         $sale->change_total = 0;
         $sale->save();

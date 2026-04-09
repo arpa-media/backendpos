@@ -32,6 +32,7 @@ class DashboardSummaryRequest extends FormRequest
             'by_channel_page' => ['nullable', 'integer', 'min:1'],
             'by_payment_page' => ['nullable', 'integer', 'min:1'],
             'top_items_page' => ['nullable', 'integer', 'min:1'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
         ];
     }
 }

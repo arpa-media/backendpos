@@ -23,8 +23,11 @@ class ResolveOutletScope
         }
 
         $ctx = $this->resolver->resolve($user);
-        $requested = $request->header(self::HEADER);
-        $resolved = $this->resolver->resolveRequestedScopeOutletId($user, is_string($requested) ? $requested : null);
+        $skipScope = filter_var($request->header('X-Skip-Outlet-Scope', $request->header('x-skip-outlet-scope', false)), FILTER_VALIDATE_BOOL);
+        $requested = $skipScope ? null : $request->header(self::HEADER);
+        $resolved = $skipScope
+            ? null
+            : $this->resolver->resolveRequestedScopeOutletId($user, is_string($requested) ? $requested : null);
 
         if ($resolved === '__INVALID__') {
             return response()->json([

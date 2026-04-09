@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Reports\OwnerOverviewQueryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\OwnerOverviewService;
+use Illuminate\Support\Facades\Cache;
 
 class OwnerOverviewController extends Controller
 {
@@ -15,7 +16,15 @@ class OwnerOverviewController extends Controller
 
     public function index(OwnerOverviewQueryRequest $request)
     {
-        return ApiResponse::ok($this->service->overview($request->validated()), 'OK');
+        $params = $request->validated();
+        $cacheKey = 'owner-overview:' . sha1(json_encode([
+            'user_id' => (string) ($request->user()?->id ?? ''),
+            'params' => $params,
+        ]));
+
+        $payload = Cache::remember($cacheKey, now()->addSeconds(30), fn () => $this->service->overview($params));
+
+        return ApiResponse::ok($payload, 'OK');
     }
 
     public function saleDetail(OwnerOverviewQueryRequest $request, string $saleId)

@@ -183,4 +183,30 @@ class PosController extends Controller
             'rescue_applied' => true,
         ], 'Offline sync rescue success', 201);
     }
+
+    public function offlineSyncRepairSquad(CheckoutRequest $request)
+    {
+        $outletId = $this->resolveOutletId($request);
+
+        if (!$outletId) {
+            return ApiResponse::error('Outlet scope is required for POS offline squad repair', 'OUTLET_SCOPE_REQUIRED', 422);
+        }
+
+        $payload = $request->validated();
+        $repairNisj = trim((string) ($payload['repair_discount_squad_nisj'] ?? ''));
+        if ($repairNisj === '') {
+            return ApiResponse::error('NISJ repair squad wajib diisi.', 'DISCOUNT_SQUAD_REPAIR_NISJ_REQUIRED', 422);
+        }
+
+        $rescuedPayload = $this->service->rescueOfflinePayload($outletId, $payload);
+        $sale = $this->service->checkout($request->user(), $outletId, $rescuedPayload);
+
+        return ApiResponse::ok([
+            'sale' => new SaleResource($sale),
+            'audit' => $this->service->auditOfflinePayload($outletId, $rescuedPayload),
+            'rescue_applied' => true,
+            'squad_repair_applied' => true,
+            'discount_squad_nisj' => $repairNisj,
+        ], 'Offline sync squad repair success', 201);
+    }
 }

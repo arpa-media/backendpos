@@ -11,6 +11,7 @@ use App\Models\AccessRole;
 use App\Models\AccessRoleMenuPermission;
 use App\Models\AccessRolePortalPermission;
 use App\Models\AccessUserType;
+use App\Models\Outlet;
 use App\Models\User;
 use App\Services\UserManagementService;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
@@ -299,6 +300,78 @@ class UserManagementController extends Controller
         ], 'User access updated');
     }
 
+
+    public function updateUserProfile(Request $request, string $userId)
+    {
+        $this->userManagement->ensureMasters();
+
+        $subject = User::query()->with(['employee.assignment.outlet', 'outlet', 'roles', 'accessAssignment.role.userType', 'accessAssignment.level'])->find($userId);
+        if (! $subject) {
+            return ApiResponse::error('User tidak ditemukan.', 'USER_NOT_FOUND', 404);
+        }
+
+        $data = $request->validate([
+            'username' => ['required', 'string', 'max:100', Rule::unique('users', 'username')->ignore($subject->id)],
+            'nisj' => ['nullable', 'string', 'max:100'],
+            'assignment_role_title' => ['nullable', 'string', 'max:255'],
+            'outlet_id' => ['nullable', 'string', Rule::exists('outlets', 'id')],
+            'password' => ['nullable', 'string', 'min:8', 'confirmed'],
+        ]);
+
+        $result = $this->userManagement->updateUserProfile($request->user(), $subject, $data);
+        $fresh = $result['user'];
+        $employee = $fresh->employee;
+        $assignment = $employee?->assignment;
+        $outlet = $assignment?->outlet ?: $fresh->outlet;
+        $accessAssignment = $fresh->accessAssignment;
+        $accessRole = $accessAssignment?->role;
+        $accessLevel = $accessAssignment?->level;
+
+        return ApiResponse::ok([
+            'user' => [
+                'id' => (string) $fresh->id,
+                'name' => $fresh->name,
+                'username' => $fresh->username,
+                'nisj' => $fresh->nisj,
+                'email' => $fresh->email,
+                'is_active' => (bool) $fresh->is_active,
+                'employee' => $employee ? [
+                    'id' => (string) $employee->id,
+                    'name' => $employee->full_name ?: $employee->nickname,
+                    'nisj' => $employee->nisj,
+                    'employee_no' => $employee->hr_employee_id,
+                    'status' => $employee->employment_status,
+                ] : null,
+                'assignment' => $assignment ? [
+                    'id' => (string) $assignment->id,
+                    'role_title' => $assignment->role_title,
+                    'status' => $assignment->status,
+                    'is_primary' => (bool) $assignment->is_primary,
+                ] : null,
+                'outlet' => $outlet ? [
+                    'id' => (string) $outlet->id,
+                    'name' => $outlet->name,
+                    'code' => $outlet->code,
+                    'type' => $outlet->type,
+                    'timezone' => $outlet->timezone,
+                ] : null,
+                'access' => [
+                    'role' => $accessRole ? [
+                        'id' => (string) $accessRole->id,
+                        'code' => (string) $accessRole->code,
+                        'name' => (string) $accessRole->name,
+                    ] : null,
+                    'level' => $accessLevel ? [
+                        'id' => (string) $accessLevel->id,
+                        'code' => (string) $accessLevel->code,
+                        'name' => (string) $accessLevel->name,
+                    ] : null,
+                ],
+            ],
+            'current_actor_session' => $result['current_actor_session'] ?? $this->userManagement->currentSessionSnapshot($request->user()),
+        ], 'User profile updated');
+    }
+
     public function updatePortalPermission(Request $request)
     {
         $this->userManagement->ensureMasters();
@@ -444,12 +517,28 @@ class UserManagementController extends Controller
         $portals = AccessPortal::query()->orderBy('sort_order')->orderBy('name')->get()->map(fn (AccessPortal $item) => $this->serializePortal($item))->values()->all();
         $menus = AccessMenu::query()->with('portal')->orderBy('sort_order')->orderBy('name')->get()->map(fn (AccessMenu $item) => $this->serializeMenu($item))->values()->all();
 
+        $outlets = Outlet::query()
+            ->where('is_active', true)
+            ->orderByRaw("case when lower(coalesce(type, '')) = 'outlet' then 0 else 1 end")
+            ->orderBy('name')
+            ->get()
+            ->map(fn (Outlet $item) => [
+                'id' => (string) $item->id,
+                'code' => (string) ($item->code ?? ''),
+                'name' => (string) ($item->name ?? ''),
+                'type' => $item->type,
+                'timezone' => $item->timezone,
+            ])
+            ->values()
+            ->all();
+
         return [
             'user_types' => $userTypes,
             'roles' => $roles,
             'levels' => $levels,
             'portals' => $portals,
             'menus' => $menus,
+            'outlets' => $outlets,
             'spatie_permissions' => Permission::query()->orderBy('name')->pluck('name')->values()->all(),
         ];
     }

@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Sale;
 use App\Models\SaleItem;
+use App\Services\CashierAlignedSaleScopeService;
 use App\Support\SaleStatuses;
 use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
@@ -11,6 +12,10 @@ use Illuminate\Support\Facades\DB;
 
 class DashboardService
 {
+    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
+    {
+    }
+
     private function rawCreatedAtValue($value)
     {
         if ($value instanceof Sale) {
@@ -38,20 +43,23 @@ class DashboardService
     {
         $status = $filters['status'] ?? SaleStatuses::PAID;
         $recentLimit = (int) ($filters['recent_limit'] ?? 10);
-        $timezone = $this->resolveTimezone($outletId);
+        $timezone = $this->resolveTimezone($outletId, $filters);
         $window = $this->resolveDashboardBusinessWindow(
             $filters['date_from'] ?? null,
             $filters['date_to'] ?? null,
             $timezone
         );
 
-        if ($outletId && $this->isMakassarDashboardBusinessTimezone($timezone)) {
-            return $this->summaryForMakassarBusinessWindow($outletId, $filters, $status, $recentLimit, $timezone, $window);
+        $selectedOutletIds = $this->selectedOutletIds($outletId, $filters);
+        if (empty($selectedOutletIds)) {
+            $selectedOutletIds = DB::table('outlets')->whereRaw('LOWER(COALESCE(type, ?)) = ?', ['outlet', 'outlet'])->pluck('id')->map(fn ($id) => (string) $id)->all();
         }
 
-        $salesBase = Sale::query()
-            ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
-            ->where('status', $status);
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($selectedOutletIds, $filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
+
+        $salesBase = Sale::query()->where('status', $status)
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('id', $eligibleSaleIds));
+        $this->applyOutletSelection($salesBase, $outletId, $filters, 'outlet_id');
 
         [$from, $to, $fromQuery, $toQuery] = $this->applyBusinessDateScope($salesBase, $outletId, $filters);
 
@@ -67,8 +75,9 @@ class DashboardService
 
         $itemsSoldQuery = SaleItem::query()
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
-            ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
-            ->where('sales.status', $status);
+            ->where('sales.status', $status)
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('sales.id', $eligibleSaleIds));
+        $this->applyOutletSelection($itemsSoldQuery, $outletId, $filters, 'sales.outlet_id');
         $this->applyBusinessDateScope($itemsSoldQuery, $outletId, $filters, 'sales.created_at', 'sales.sale_number');
         $itemsSold = (int) $itemsSoldQuery
             ->selectRaw('COALESCE(SUM(sale_items.qty),0) as qty_sum')
@@ -109,8 +118,9 @@ class DashboardService
 
         $topItemsQuery = SaleItem::query()
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
-            ->when($outletId, fn ($q) => $q->where('sales.outlet_id', $outletId))
-            ->where('sales.status', $status);
+            ->where('sales.status', $status)
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('sales.id', $eligibleSaleIds));
+        $this->applyOutletSelection($topItemsQuery, $outletId, $filters, 'sales.outlet_id');
         $this->applyBusinessDateScope($topItemsQuery, $outletId, $filters, 'sales.created_at', 'sales.sale_number');
         $topItems = $topItemsQuery
             ->select('sale_items.variant_id', 'sale_items.product_name', 'sale_items.variant_name')
@@ -174,6 +184,8 @@ class DashboardService
                 'date_to' => $to->toDateString(),
                 'status' => (string) $status,
                 'outlet_id' => $outletId,
+                'outlet_filter' => (string) ($filters['outlet_filter'] ?? ($outletId ?: 'ALL')),
+                'outlet_scope_name' => (string) ($filters['scope_label'] ?? ($outletId ?: 'All Outlet')),
             ],
             'metrics' => [
                 'trx_count' => $trxCount,
@@ -190,9 +202,8 @@ class DashboardService
 
     private function summaryForMakassarBusinessWindow(string $outletId, array $filters, string $status, int $recentLimit, string $timezone, array $window): array
     {
-        $candidateQuery = Sale::query()
-            ->where('outlet_id', $outletId)
-            ->where('status', $status);
+        $candidateQuery = Sale::query()->where('status', $status);
+        $this->applyOutletSelection($candidateQuery, $outletId, $filters, 'outlet_id');
 
         $candidateFilters = $filters;
         $candidateFilters['date_from'] = $window['requested_from']->toDateString();
@@ -415,7 +426,7 @@ class DashboardService
 
     private function applyBusinessDateScope($query, ?string $outletId, array $filters, string $createdAtColumn = 'created_at', string $saleNumberColumn = 'sale_number'): array
     {
-        $timezone = $this->resolveTimezone($outletId);
+        $timezone = $this->resolveTimezone($outletId, $filters);
         [$fromLocal, $toLocal, $fromQuery, $toQuery] = TransactionDate::dateRange(
             $filters['date_from'] ?? null,
             $filters['date_to'] ?? null,
@@ -443,9 +454,36 @@ class DashboardService
         return [$fromLocal, $toLocal, $fromQuery, $toQuery, $timezone];
     }
 
-    private function resolveTimezone(?string $outletId): string
+    private function selectedOutletIds(?string $outletId, array $filters = []): array
+    {
+        $ids = array_values(array_filter(array_map('strval', $filters['scope_outlet_ids'] ?? [])));
+        if (!empty($ids)) {
+            return $ids;
+        }
+
+        return $outletId ? [(string) $outletId] : [];
+    }
+
+    private function applyOutletSelection($query, ?string $outletId, array $filters = [], string $column = 'outlet_id'): void
+    {
+        $ids = $this->selectedOutletIds($outletId, $filters);
+        if (count($ids) === 1) {
+            $query->where($column, $ids[0]);
+            return;
+        }
+
+        if (count($ids) > 1) {
+            $query->whereIn($column, $ids);
+        }
+    }
+
+    private function resolveTimezone(?string $outletId, array $filters = []): string
     {
         $defaultTimezone = TransactionDate::normalizeTimezone((string) config('app.timezone', 'Asia/Jakarta'), 'Asia/Jakarta');
+
+        if (!empty($filters['scope_timezone'])) {
+            return TransactionDate::normalizeTimezone((string) $filters['scope_timezone'], $defaultTimezone);
+        }
 
         if (!$outletId) {
             return $defaultTimezone;

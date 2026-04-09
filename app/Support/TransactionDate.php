@@ -285,6 +285,8 @@ class TransactionDate
         $window = self::businessDateWindow($dateFrom, $dateTo, $timezone);
         $resolvedLocalExpr = self::resolvedSaleLocalSqlExpression($createdAtColumn, $saleNumberColumn, $window['timezone']);
 
+        self::applyCoarseBusinessDatePrefilter($query, $createdAtColumn, $window);
+
         $query->whereRaw(
             "({$resolvedLocalExpr} >= ? AND {$resolvedLocalExpr} < ?)",
             [
@@ -294,6 +296,27 @@ class TransactionDate
         );
 
         return $window;
+    }
+
+    /**
+     * Apply a coarse pre-filter on the raw created_at column before resolving the exact business date.
+     *
+     * Historical sales rows may store created_at either in UTC or in outlet-local time. To stay safe,
+     * we prefilter using the union of both candidate ranges, then keep the existing exact predicate.
+     */
+    private static function applyCoarseBusinessDatePrefilter(object $query, string $createdAtColumn, array $window): void
+    {
+        $localFrom = $window['from_local']->format('Y-m-d H:i:s');
+        $localToExclusive = $window['to_exclusive_local']->format('Y-m-d H:i:s');
+        $utcFrom = $window['from_utc']->setTimezone('UTC')->format('Y-m-d H:i:s');
+        $utcToExclusive = $window['to_exclusive_local']->setTimezone('UTC')->format('Y-m-d H:i:s');
+
+        $coarseFrom = min($localFrom, $utcFrom);
+        $coarseToExclusive = max($localToExclusive, $utcToExclusive);
+
+        $query
+            ->where($createdAtColumn, '>=', $coarseFrom)
+            ->where($createdAtColumn, '<', $coarseToExclusive);
     }
 
     private static function coerce($value): ?Carbon

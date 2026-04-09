@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
+use App\Services\CashierAlignedSaleScopeService;
 use App\Support\TransactionDate;
 use App\Models\Sale;
 use Carbon\CarbonImmutable;
@@ -14,9 +15,10 @@ class ReportPortalAnalyticsService
 {
     private ?string $contextTimezone = null;
 
-    public function __construct(private readonly ReportPortalScopeService $scopeService)
+    public function __construct(private readonly ReportPortalScopeService $scopeService, private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
     {
     }
+
 
     private function setScopeTimezone(array $scope): void
     {
@@ -68,12 +70,13 @@ class ReportPortalAnalyticsService
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $recentLimit = max(1, min(20, (int) ($params['recent_limit'] ?? 5)));
         $topLimit = max(1, min(10, (int) ($params['top_limit'] ?? 5)));
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scope['allowed_outlet_ids'] ?? [], $params['date_from'] ?? null, $params['date_to'] ?? null, $this->contextTimezone);
 
         $salesBase = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
-        $this->applyDateRange($salesBase, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($salesBase, $scope, 's');
 
@@ -89,9 +92,9 @@ class ReportPortalAnalyticsService
 
         $itemsSoldQuery = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
-        $this->applyDateRange($itemsSoldQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($itemsSoldQuery, $scope, 's');
 
@@ -134,7 +137,8 @@ class ReportPortalAnalyticsService
 
         $topVariantsQuery = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
         $this->applyDateRange($topVariantsQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
@@ -160,7 +164,8 @@ class ReportPortalAnalyticsService
 
         $topProductsQuery = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
         $this->applyDateRange($topProductsQuery, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
@@ -256,7 +261,8 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
         $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
@@ -302,7 +308,8 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
         $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
@@ -344,7 +351,8 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
         $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
@@ -388,9 +396,9 @@ class ReportPortalAnalyticsService
 
         $query = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($builder) => $builder->whereRaw('1 = 0'), fn ($builder) => $builder->whereIn('s.id', $eligibleSaleIds));
 
-        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 
@@ -464,11 +472,14 @@ class ReportPortalAnalyticsService
     public function saleDetail(array $scope, string $saleId): array
     {
         $this->setScopeTimezone($scope);
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scope['allowed_outlet_ids'] ?? [], request('date_from'), request('date_to'), $this->contextTimezone);
+
         $sale = Sale::query()
             ->with(['outlet', 'items.product.category', 'payments', 'customer'])
             ->where('id', $saleId)
             ->where('status', '=', 'PAID')
-            ->whereIn('outlet_id', $scope['allowed_outlet_ids'] ?? []);
+            ->whereIn('outlet_id', $scope['allowed_outlet_ids'] ?? [])
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('id', $eligibleSaleIds));
 
         if (!empty($scope['selected_outlet_id'])) {
             $sale->where('outlet_id', '=', $scope['selected_outlet_id']);
@@ -501,12 +512,13 @@ class ReportPortalAnalyticsService
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? $defaultPerPage)));
         $page = max(1, (int) ($params['page'] ?? 1));
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scope['allowed_outlet_ids'] ?? [], $params['date_from'] ?? null, $params['date_to'] ?? null, $this->contextTimezone);
 
         $query = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($builder) => $builder->whereRaw('1 = 0'), fn ($builder) => $builder->whereIn('s.id', $eligibleSaleIds));
 
-        $this->applyDateRange($query, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, 's.sale_number');
 
         $this->scopeService->applySalesScope($query, $scope, 's');
 

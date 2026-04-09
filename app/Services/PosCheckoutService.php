@@ -14,6 +14,7 @@ use App\Models\SalePayment;
 use App\Models\Tax;
 use App\Models\User;
 use App\Support\PaymentMethodTypes;
+use App\Support\SaleAmountBreakdown;
 use App\Support\SaleRounding;
 use App\Support\SalesChannels;
 use App\Support\SaleStatuses;
@@ -86,158 +87,12 @@ class PosCheckoutService
         ];
     }
 
-    private function normalizeStringIdList(array $values): array
-    {
-        return collect($values)
-            ->map(fn ($value) => trim((string) $value))
-            ->filter(fn ($value) => $value !== '')
-            ->values()
-            ->all();
-    }
-
-    private function sumSaleItemsForProductIds(array $saleItems, array $productIds): int
-    {
-        $ids = $this->normalizeStringIdList($productIds);
-        if (empty($ids)) {
-            return 0;
-        }
-
-        $total = 0;
-        foreach ($saleItems as $row) {
-            if (!is_array($row)) {
-                continue;
-            }
-
-            if (in_array((string) ($row['product_id'] ?? ''), $ids, true)) {
-                $total += (int) ($row['line_total'] ?? 0);
-            }
-        }
-
-        return max(0, (int) $total);
-    }
-
-    private function resolveDiscountBase(string $appliesTo, int $subtotal, array $saleItems, array $productIds = [], array $customerIds = [], ?Customer $customer = null, string $discountSquadNisj = ''): int
-    {
-        $applies = strtoupper(trim((string) $appliesTo));
-
-        if ($applies === 'PRODUCT') {
-            return $this->sumSaleItemsForProductIds($saleItems, $productIds);
-        }
-
-        if ($applies === 'CUSTOMER') {
-            $customerId = (string) ($customer?->id ?? '');
-            $allowedCustomerIds = $this->normalizeStringIdList($customerIds);
-            return ($customerId !== '' && in_array($customerId, $allowedCustomerIds, true)) ? max(0, (int) $subtotal) : 0;
-        }
-
-        if ($applies === 'SQUAD') {
-            if (trim($discountSquadNisj) === '') {
-                return 0;
-            }
-
-            return $this->sumSaleItemsForProductIds($saleItems, $productIds);
-        }
-
-        return max(0, (int) $subtotal);
-    }
-
-    private function calculateDiscountAmountFromBase(string $discountType, int $discountValue, int $base): int
-    {
-        $normalizedBase = max(0, (int) $base);
-        $normalizedType = strtoupper(trim((string) $discountType));
-        $normalizedValue = max(0, (int) $discountValue);
-
-        if ($normalizedType === 'PERCENT') {
-            $pct = max(0, min(100, $normalizedValue));
-            return (int) floor(($normalizedBase * $pct) / 100);
-        }
-
-        if ($normalizedType === 'FIXED') {
-            return (int) min($normalizedBase, $normalizedValue);
-        }
-
-        return 0;
-    }
-
-    private function recalculateDiscountSnapshots(array $discountSnapshots, int $subtotal, array $saleItems, ?Customer $customer, string $discountSquadNisj, iterable $discountPackages = []): array
-    {
-        $packagesById = [];
-        foreach ($discountPackages as $pkg) {
-            if ($pkg instanceof Discount) {
-                $packagesById[(string) $pkg->id] = $pkg;
-            }
-        }
-
-        $normalized = [];
-        foreach ($discountSnapshots as $row) {
-            if (!is_array($row)) {
-                continue;
-            }
-
-            $discountId = trim((string) ($row['id'] ?? ''));
-            $package = $discountId !== '' ? ($packagesById[$discountId] ?? null) : null;
-            $appliesTo = strtoupper(trim((string) ($row['applies_to'] ?? ($package?->applies_to ?? 'GLOBAL'))));
-            $spec = $this->normalizedDiscountSpec(
-                $appliesTo,
-                (string) ($row['discount_type'] ?? ($package?->discount_type ?? 'NONE')),
-                (int) ($row['discount_value'] ?? ($package?->discount_value ?? 0))
-            );
-            $productIds = $this->normalizeStringIdList(is_array($row['product_ids'] ?? null)
-                ? $row['product_ids']
-                : ($package ? $package->products->pluck('id')->all() : []));
-            $customerIds = $this->normalizeStringIdList(is_array($row['customer_ids'] ?? null)
-                ? $row['customer_ids']
-                : ($package ? $package->customers->pluck('id')->all() : []));
-            $base = $this->resolveDiscountBase($appliesTo, $subtotal, $saleItems, $productIds, $customerIds, $customer, $discountSquadNisj);
-            $amount = $this->calculateDiscountAmountFromBase((string) $spec['type'], (int) $spec['value'], $base);
-
-            $normalized[] = array_merge($row, [
-                'id' => $discountId !== '' ? $discountId : (string) ($package?->id ?? ''),
-                'code' => array_key_exists('code', $row) ? $row['code'] : ($package?->code ?? null),
-                'name' => array_key_exists('name', $row) ? $row['name'] : ($package?->name ?? null),
-                'applies_to' => $appliesTo,
-                'discount_type' => (string) $spec['type'],
-                'discount_value' => (int) $spec['value'],
-                'product_ids' => $productIds,
-                'customer_ids' => $customerIds,
-                'base' => $base,
-                'amount' => $amount,
-            ]);
-        }
-
-        return array_values($normalized);
-    }
-
-    private function buildDiscountSnapshotsFromPackages(iterable $discountPackages, int $subtotal, array $saleItems, ?Customer $customer, string $discountSquadNisj): array
-    {
-        $snapshots = [];
-        foreach ($discountPackages as $pkg) {
-            if (!($pkg instanceof Discount)) {
-                continue;
-            }
-
-            $snapshots[] = [
-                'id' => (string) $pkg->id,
-                'code' => (string) $pkg->code,
-                'name' => (string) $pkg->name,
-                'applies_to' => (string) $pkg->applies_to,
-                'discount_type' => (string) $pkg->discount_type,
-                'discount_value' => (int) $pkg->discount_value,
-                'product_ids' => $pkg->products->pluck('id')->map(fn ($value) => (string) $value)->values()->all(),
-                'customer_ids' => $pkg->customers->pluck('id')->map(fn ($value) => (string) $value)->values()->all(),
-            ];
-        }
-
-        return $this->recalculateDiscountSnapshots($snapshots, $subtotal, $saleItems, $customer, $discountSquadNisj, $discountPackages);
-    }
-
     /**
      * Checkout (atomic).
      *
      * NOTE:
      * - Outlet is resolved by middleware (OutletScope) and passed in from controller.
      * - Tax percent from request is ignored; tax is computed server-side from active default tax.
-     * - Discount reduces subtotal item and tax is computed after discount.
      */
     public function checkout(User $user, string $outletId, array $payload): Sale
     {
@@ -729,28 +584,6 @@ class PosCheckoutService
                 $discountReason = $offlineSnapshot['discount_reason'] ?? $discountReason;
                 $discountAmount = max(0, min((int) $subtotal, (int) ($offlineSnapshot['discount_amount'] ?? 0)));
                 $discountSnapshots = is_array($offlineSnapshot['discounts_snapshot'] ?? null) ? $offlineSnapshot['discounts_snapshot'] : [];
-
-                if (!empty($discountSnapshots)) {
-                    $discountSnapshots = $this->recalculateDiscountSnapshots(
-                        $discountSnapshots,
-                        (int) $subtotal,
-                        $saleItems,
-                        $customer,
-                        $discountSquadNisjInput,
-                        $discountPackages
-                    );
-                    $discountAmount = collect($discountSnapshots)->sum(fn ($row) => max(0, (int) ($row['amount'] ?? 0)));
-                } elseif ($usePackages) {
-                    $discountSnapshots = $this->buildDiscountSnapshotsFromPackages(
-                        $discountPackages,
-                        (int) $subtotal,
-                        $saleItems,
-                        $customer,
-                        $discountSquadNisjInput
-                    );
-                    $discountAmount = collect($discountSnapshots)->sum(fn ($row) => max(0, (int) ($row['amount'] ?? 0)));
-                }
-
                 if (!empty($discountSnapshots[0]['id'])) {
                     $firstDiscount = $discountSnapshots[0];
                     $firstAppliesTo = (string) ($firstDiscount['applies_to'] ?? '');
@@ -768,36 +601,46 @@ class PosCheckoutService
                 foreach ($discountPackages as $pkg) {
                     $appliesTo = strtoupper((string) $pkg->applies_to);
 
-                    $productIdsForDiscount = $pkg->products->pluck('id')->map(fn ($x) => (string) $x)->values()->all();
-                    $customerIdsForDiscount = $pkg->customers->pluck('id')->map(fn ($x) => (string) $x)->values()->all();
-
-                    if ($appliesTo === 'CUSTOMER') {
+                    // base by applies_to
+                    $base = $subtotal;
+                    if ($appliesTo === 'PRODUCT') {
+                        $productIdsForDiscount = $pkg->products->pluck('id')->map(fn ($x) => (string) $x)->all();
+                        $base = 0;
+                        foreach ($saleItems as $row) {
+                            if (in_array((string) $row['product_id'], $productIdsForDiscount, true)) {
+                                $base += (int) $row['line_total'];
+                            }
+                        }
+                    } elseif ($appliesTo === 'CUSTOMER') {
                         if (!$customer) {
                             throw ValidationException::withMessages([
                                 'customer_id' => ['Customer is required for this discount.'],
                             ]);
                         }
+                        $customerIdsForDiscount = $pkg->customers->pluck('id')->map(fn ($x) => (string) $x)->all();
                         if (!in_array((string) $customer->id, $customerIdsForDiscount, true)) {
                             throw ValidationException::withMessages([
                                 'customer_id' => ['Customer not eligible for this discount.'],
                             ]);
                         }
+                        // CUSTOMER => subtotal semua cart (per instruksi)
+                        $base = $subtotal;
+                    } else {
+                        $base = $subtotal;
                     }
 
-                    $base = $this->resolveDiscountBase(
-                        $appliesTo,
-                        (int) $subtotal,
-                        $saleItems,
-                        $productIdsForDiscount,
-                        $customerIdsForDiscount,
-                        $customer,
-                        $discountSquadNisjInput
-                    );
-
+                    $base = max(0, (int) $base);
+                    $amt = 0;
                     $spec = $this->normalizedDiscountSpec($appliesTo, (string) $pkg->discount_type, (int) $pkg->discount_value);
                     $t = $spec['type'];
                     $v = (int) $spec['value'];
-                    $amt = $this->calculateDiscountAmountFromBase($t, $v, (int) $base);
+                    if ($t === 'PERCENT') {
+                        $pct = max(0, min(100, $v));
+                        $amt = (int) floor(($base * $pct) / 100);
+                    } elseif ($t === 'FIXED') {
+                        $amt = min($base, max(0, $v));
+                    }
+                    $amt = max(0, $amt);
 
                     $discountSnapshots[] = [
                         'id' => (string) $pkg->id,
@@ -806,8 +649,6 @@ class PosCheckoutService
                         'applies_to' => $appliesTo,
                         'discount_type' => $t,
                         'discount_value' => (int) $v,
-                        'product_ids' => $productIdsForDiscount,
-                        'customer_ids' => $customerIdsForDiscount,
                         'base' => (int) $base,
                         'amount' => (int) $amt,
                     ];
@@ -832,8 +673,7 @@ class PosCheckoutService
 
             // cap at subtotal
             $discountAmount = max(0, min((int) $subtotal, (int) $discountAmount));
-            $netSubtotal = max(0, (int) $subtotal - (int) $discountAmount);
-            $taxBase = (int) $netSubtotal;
+            $taxableBase = max(0, (int) $subtotal - (int) $discountAmount);
 
             // Snapshot helpers (for receipts/history)
             if (!$useOfflineSnapshot && $usePackages) {
@@ -1007,23 +847,33 @@ class PosCheckoutService
                 $effectiveTaxId = $offlineSnapshot['tax_id'] ?? $taxId;
                 $effectiveTaxName = (string) ($offlineSnapshot['tax_name_snapshot'] ?? $taxName ?? 'Tax');
                 $effectiveTaxPercent = max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
-                $taxTotal = array_key_exists('tax_total', $offlineSnapshot)
-                    ? (int) ($offlineSnapshot['tax_total'] ?? 0)
-                    : (int) floor(($taxBase * $effectiveTaxPercent) / 100);
                 $serviceChargeTotal = 0;
                 $roundingTotal = (int) ($offlineSnapshot['rounding_total'] ?? 0);
-                $grandTotalBeforeRounding = (int) max(0, $netSubtotal + $taxTotal + $serviceChargeTotal);
-                $grandTotal = (int) ($offlineSnapshot['grand_total'] ?? ($grandTotalBeforeRounding + $roundingTotal));
+
+                // Canonical server-side rule: tax must always be applied after discount.
+                // This keeps new clients unchanged while transparently rescuing legacy offline
+                // payloads that still carried tax calculated from subtotal-before-discount.
+                $canonicalAmounts = SaleAmountBreakdown::canonical(
+                    (int) ($offlineSnapshot['subtotal'] ?? $subtotal),
+                    (int) $discountAmount,
+                    (int) $effectiveTaxPercent,
+                    (int) $roundingTotal,
+                    0
+                );
+
+                $taxTotal = (int) $canonicalAmounts['tax_total'];
+                $grandTotalBeforeRounding = (int) $canonicalAmounts['before_rounding'];
+                $grandTotal = (int) $canonicalAmounts['grand_total'];
             } else {
                 $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
                 $effectiveTaxId = $isOnlineNoTax ? null : $taxId;
                 $effectiveTaxName = $isOnlineNoTax ? 'Tax' : $taxName;
                 $effectiveTaxPercent = $isOnlineNoTax ? 0 : (int) $taxPercent;
 
-                $taxTotal = (int) floor(($taxBase * $effectiveTaxPercent) / 100);
+                $taxTotal = (int) floor(($taxableBase * $effectiveTaxPercent) / 100);
                 $serviceChargeTotal = 0;
 
-                $roundingSnapshot = SaleRounding::apply((int) ($netSubtotal + $taxTotal + $serviceChargeTotal));
+                $roundingSnapshot = SaleRounding::apply((int) ($taxableBase + $taxTotal + $serviceChargeTotal));
                 $roundingTotal = (int) ($roundingSnapshot['rounding_total'] ?? 0);
                 $grandTotalBeforeRounding = (int) ($roundingSnapshot['before_rounding'] ?? 0);
                 $grandTotal = (int) ($roundingSnapshot['after_rounding'] ?? 0);
@@ -1033,8 +883,14 @@ class PosCheckoutService
             // 8) Payment rule
             $inputPaid = (int) ($payment['amount'] ?? 0);
             if ($useOfflineSnapshot) {
-                $paid = (int) ($offlineSnapshot['paid_total'] ?? $inputPaid ?? $grandTotal);
-                $change = (int) ($offlineSnapshot['change_total'] ?? max(0, $paid - $grandTotal));
+                $resolvedPayment = SaleAmountBreakdown::resolvePaymentSnapshot(
+                    (string) ($offlineSnapshot['payment_method_type'] ?? $payment['payment_method_type_snapshot'] ?? $pm->type),
+                    (int) $grandTotal,
+                    (int) ($offlineSnapshot['paid_total'] ?? $inputPaid ?? $grandTotal),
+                    (int) ($offlineSnapshot['change_total'] ?? 0)
+                );
+                $paid = (int) $resolvedPayment['paid_total'];
+                $change = (int) $resolvedPayment['change_total'];
                 if ((string) ($payment['payment_method_type_snapshot'] ?? $pm->type) === PaymentMethodTypes::CASH && $paid < $grandTotal) {
                     throw ValidationException::withMessages([
                         'payment.amount' => ['Paid amount is less than grand total.'],

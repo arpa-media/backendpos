@@ -17,6 +17,7 @@ class ReportRangeRequest extends FormRequest
         return [
             'date_from' => ['nullable', 'date'],
             'date_to' => ['nullable', 'date'],
+            'outlet_filter' => ['nullable', 'string', 'max:100'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:200'],
             'page' => ['nullable', 'integer', 'min:1'],
         ];
