@@ -73,6 +73,14 @@ class PosDeviceTokenService
             return null;
         }
 
+        $incomingDeviceId = trim((string) ($request->header('X-Device-Id', $request->input('device_id', ''))));
+        if ($incomingDeviceId !== '') {
+            $resolvedFingerprint = $this->resolveDeviceFingerprint($request, (string) $record->outlet_code);
+            if ($resolvedFingerprint !== (string) $record->device_fingerprint) {
+                return null;
+            }
+        }
+
         $record->forceFill([
             'last_seen_at' => now(),
             'last_user_nisj' => (string) ($user->nisj ?? ''),
@@ -98,6 +106,9 @@ class PosDeviceTokenService
             'issued_at' => optional($record->issued_at)->toIso8601String(),
             'last_seen_at' => optional($record->last_seen_at)->toIso8601String(),
             'expires_at' => optional($record->expires_at)->toIso8601String(),
+            'binding_status' => 'BOUND',
+            'rebind_required' => false,
+            'token_present' => $plainToken !== null,
         ];
     }
 

@@ -36,6 +36,7 @@ Route::prefix('v1')->group(function () {
     Route::prefix('auth')->group(function () {
         Route::post('/login', [AuthController::class, 'login']);
         Route::get('/pos-outlets', [OutletController::class, 'posLoginOptions']);
+        Route::get('/pos-login-probe', [AuthController::class, 'posLoginProbe']);
     });
 
     Route::prefix('public')->group(function () {
@@ -115,6 +116,7 @@ Route::prefix('v1')->group(function () {
                 ->middleware('permission:discount.view');
         });
 
+    });
 
     Route::middleware(['pos_sync_auth', 'outlet_scope', 'outlet_timezone'])->group(function () {
         Route::get('/auth/pos-device-session', [AuthController::class, 'posDeviceSession']);
@@ -134,6 +136,7 @@ Route::prefix('v1')->group(function () {
         });
     });
 
+    Route::middleware(['auth:sanctum', 'outlet_scope', 'outlet_timezone'])->group(function () {
         /**
          * CUSTOMERS
          */

@@ -122,6 +122,15 @@ class AuthController extends Controller
         ], 'Login success');
     }
 
+    public function posLoginProbe(Request $request)
+    {
+        return ApiResponse::ok([
+            'reachable' => true,
+            'server_time' => now()->toIso8601String(),
+            'app_env' => (string) config('app.env', 'production'),
+        ], 'POS login probe OK');
+    }
+
     public function changePassword(Request $request)
     {
         $user = $request->user();

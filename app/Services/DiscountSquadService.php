@@ -32,7 +32,7 @@ class DiscountSquadService
                 return Carbon::parse($moment)->setTimezone($tz)->format('ymd');
             }
         } catch (\Throwable) {
-            // fall through to current period
+            // fallback below
         }
 
         return $this->currentPeriodKey($tz);
