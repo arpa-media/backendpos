@@ -94,6 +94,27 @@ class PosCheckoutService
      * - Outlet is resolved by middleware (OutletScope) and passed in from controller.
      * - Tax percent from request is ignored; tax is computed server-side from active default tax.
      */
+
+    public function findOfflineSalesByClientSyncIds(string $outletId, array $clientSyncIds)
+    {
+        $ids = collect($clientSyncIds)
+            ->map(fn ($value) => trim((string) $value))
+            ->filter()
+            ->unique()
+            ->values();
+
+        if ($ids->isEmpty()) {
+            return collect();
+        }
+
+        return Sale::query()
+            ->where('outlet_id', $outletId)
+            ->whereIn('client_sync_id', $ids->all())
+            ->with(['items', 'payments', 'customer', 'outlet'])
+            ->get()
+            ->keyBy(fn (Sale $sale) => trim((string) ($sale->client_sync_id ?? '')));
+    }
+
     public function checkout(User $user, string $outletId, array $payload): Sale
     {
         if ($this->isOfflineLikePayload($payload)) {
@@ -754,7 +775,7 @@ class PosCheckoutService
                     ]);
                 }
 
-                $selectedSquadPeriodKey = $discountSquadService->currentPeriodKey($outletTimezone);
+                $selectedSquadPeriodKey = $discountSquadService->periodKeyForMoment($transactionAtTz, $outletTimezone);
                 if (!$discountSquadService->isAvailableForNisj((string) $selectedSquadUser->nisj, $selectedSquadPeriodKey)) {
                     throw ValidationException::withMessages([
                         'discount_squad_nisj' => ['Jatah discount squad untuk NISJ tersebut sudah terpakai hari ini.'],
@@ -843,20 +864,16 @@ class PosCheckoutService
             }
 
             // 7) Tax (default tax per outlet, except online/delivery which are always no-tax)
-            $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
             if ($useOfflineSnapshot) {
-                $effectiveTaxId = $isOnlineNoTax ? null : ($offlineSnapshot['tax_id'] ?? $taxId);
-                $effectiveTaxName = $isOnlineNoTax
-                    ? 'Tax'
-                    : (string) ($offlineSnapshot['tax_name_snapshot'] ?? $taxName ?? 'Tax');
-                $effectiveTaxPercent = $isOnlineNoTax
-                    ? 0
-                    : max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
+                $effectiveTaxId = $offlineSnapshot['tax_id'] ?? $taxId;
+                $effectiveTaxName = (string) ($offlineSnapshot['tax_name_snapshot'] ?? $taxName ?? 'Tax');
+                $effectiveTaxPercent = max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
                 $serviceChargeTotal = 0;
                 $roundingTotal = (int) ($offlineSnapshot['rounding_total'] ?? 0);
 
-                // Canonical server-side rule: DELIVERY is always no-tax, even when legacy
-                // offline payloads still carry tax snapshots from the client.
+                // Canonical server-side rule: tax must always be applied after discount.
+                // This keeps new clients unchanged while transparently rescuing legacy offline
+                // payloads that still carried tax calculated from subtotal-before-discount.
                 $canonicalAmounts = SaleAmountBreakdown::canonical(
                     (int) ($offlineSnapshot['subtotal'] ?? $subtotal),
                     (int) $discountAmount,
@@ -869,6 +886,7 @@ class PosCheckoutService
                 $grandTotalBeforeRounding = (int) $canonicalAmounts['before_rounding'];
                 $grandTotal = (int) $canonicalAmounts['grand_total'];
             } else {
+                $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
                 $effectiveTaxId = $isOnlineNoTax ? null : $taxId;
                 $effectiveTaxName = $isOnlineNoTax ? 'Tax' : $taxName;
                 $effectiveTaxPercent = $isOnlineNoTax ? 0 : (int) $taxPercent;

@@ -121,6 +121,9 @@ Route::prefix('v1')->group(function () {
 
             Route::post('/offline-sync-rescue', [PosController::class, 'offlineSyncRescue'])
                 ->middleware('permission:pos.checkout');
+
+            Route::post('/offline-sync-reconcile', [PosController::class, 'offlineSyncReconcile'])
+                ->middleware('permission:pos.checkout');
         });
 
 

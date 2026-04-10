@@ -8,6 +8,7 @@ use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Pos\SaleResource;
 use App\Models\Discount;
 use App\Models\Outlet;
+use App\Models\Sale;
 use App\Services\DiscountSquadService;
 use App\Services\PosCheckoutService;
 use App\Support\OutletScope;
@@ -182,6 +183,50 @@ class PosController extends Controller
             'audit' => $this->service->auditOfflinePayload($outletId, $rescuedPayload),
             'rescue_applied' => true,
         ], 'Offline sync rescue success', 201);
+    }
+
+
+    public function offlineSyncReconcile(Request $request)
+    {
+        $outletId = $this->resolveOutletId($request);
+
+        if (! $outletId) {
+            return ApiResponse::error('Outlet scope is required for POS offline reconcile', 'OUTLET_SCOPE_REQUIRED', 422);
+        }
+
+        $items = array_values(array_filter(
+            is_array($request->input('items')) ? $request->input('items') : [],
+            fn ($row) => is_array($row)
+        ));
+
+        $clientSyncIds = collect($items)
+            ->map(fn ($row) => trim((string) ($row['client_sync_id'] ?? '')))
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+
+        $sales = $this->service->findOfflineSalesByClientSyncIds($outletId, $clientSyncIds);
+
+        $rows = collect($items)->map(function (array $row) use ($sales, $request) {
+            $clientSyncId = trim((string) ($row['client_sync_id'] ?? ''));
+            $localId = trim((string) ($row['local_id'] ?? $row['id'] ?? ''));
+            /** @var Sale|null $sale */
+            $sale = $clientSyncId !== '' ? $sales->get($clientSyncId) : null;
+
+            return [
+                'local_id' => $localId !== '' ? $localId : null,
+                'client_sync_id' => $clientSyncId !== '' ? $clientSyncId : null,
+                'found' => (bool) $sale,
+                'sale_number' => $sale ? (string) $sale->sale_number : null,
+                'sale_id' => $sale ? (string) $sale->id : null,
+                'sale' => $sale ? (new SaleResource($sale))->toArray($request) : null,
+            ];
+        })->values()->all();
+
+        return ApiResponse::ok([
+            'items' => $rows,
+        ], 'Offline sync reconcile success');
     }
 
     public function offlineSyncRepairSquad(CheckoutRequest $request)
