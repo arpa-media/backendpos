@@ -8,6 +8,7 @@ use App\Models\Outlet;
 use App\Models\Sale;
 use App\Models\User;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Validation\ValidationException;
 
@@ -16,6 +17,25 @@ class DiscountSquadService
     public function currentPeriodKey(?string $timezone = null): string
     {
         return now($this->normalizeTimezone($timezone))->format('ymd');
+    }
+
+    public function periodKeyForMoment($moment, ?string $timezone = null): string
+    {
+        $tz = $this->normalizeTimezone($timezone);
+
+        try {
+            if ($moment instanceof \DateTimeInterface) {
+                return Carbon::instance($moment)->setTimezone($tz)->format('ymd');
+            }
+
+            if (is_string($moment) && trim($moment) !== '') {
+                return Carbon::parse($moment)->setTimezone($tz)->format('ymd');
+            }
+        } catch (\Throwable) {
+            // fall through to current period
+        }
+
+        return $this->currentPeriodKey($tz);
     }
 
     public function normalizeTimezone(?string $timezone = null): string
