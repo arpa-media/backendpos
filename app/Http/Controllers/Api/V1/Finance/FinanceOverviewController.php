@@ -7,6 +7,7 @@ use App\Http\Requests\Api\V1\Finance\ListFinanceOverviewRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Support\FinanceOutletFilter;
+use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Illuminate\Support\Facades\DB;
 
@@ -54,15 +55,15 @@ class FinanceOverviewController extends Controller
             ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
         $summaryRow = (clone $base)
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as gross_sales')
-            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN s.grand_total ELSE 0 END), 0) as marking_gross_sales')
-            ->selectRaw('COALESCE(SUM(s.tax_total), 0) as total_tax')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN ' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ELSE 0 END), 0) as marking_gross_sales')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as total_tax')
             ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
             ->first();
 
         $paymentSelects = [];
         foreach (self::PAYMENT_BUCKETS as $key => $label) {
-            $paymentSelects[] = 'COALESCE(SUM(CASE WHEN ' . $this->bucketSqlCondition($key) . ' THEN s.grand_total ELSE 0 END), 0) as ' . $key;
+            $paymentSelects[] = 'COALESCE(SUM(CASE WHEN ' . $this->bucketSqlCondition($key) . ' THEN ' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ELSE 0 END), 0) as ' . $key;
         }
 
         $agg = (clone $base)

@@ -9,6 +9,7 @@ use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Models\Sale;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Support\FinanceOutletFilter;
+use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -89,8 +90,8 @@ class SalesCollectedController extends Controller
             ->selectRaw('COALESCE(SUM(s.subtotal), 0) as total_gross_sales')
             ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
             ->selectRaw('COALESCE(SUM(GREATEST(s.subtotal - s.discount_total, 0)), 0) as total_net_sales')
-            ->selectRaw('COALESCE(SUM(s.tax_total), 0) as total_tax')
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as total_collected')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as total_tax')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as total_collected')
             ->first();
 
         $channelOptions = [];
@@ -110,14 +111,18 @@ class SalesCollectedController extends Controller
                 's.created_at',
                 's.subtotal',
                 's.discount_total',
+                's.payment_method_type',
                 's.tax_total',
                 's.rounding_total',
                 's.grand_total',
                 's.paid_total',
                 's.cashier_name',
             ])
-            ->selectRaw('GREATEST(s.subtotal - s.discount_total, 0) as net_sales')
-            ->selectRaw('s.grand_total as total_collected')
+            ->selectRaw('' . DeliveryNoTaxReadModel::sqlNetSales('s') . ' as net_sales')
+            ->selectRaw('' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . ' as tax_total_corrected')
+            ->selectRaw('' . DeliveryNoTaxReadModel::sqlRoundingTotal('s') . ' as rounding_total_corrected')
+            ->selectRaw('' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as grand_total_corrected')
+            ->selectRaw('' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total_collected')
             ->selectRaw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel")
             ->selectRaw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display");
 
@@ -161,11 +166,11 @@ class SalesCollectedController extends Controller
                 'gross_sales' => (int) ($row->subtotal ?? 0),
                 'discount' => (int) ($row->discount_total ?? 0),
                 'net_sales' => (int) ($row->net_sales ?? 0),
-                'tax' => (int) ($row->tax_total ?? 0),
-                'total_collected' => (int) ($row->total_collected ?? 0),
-                'rounding_total' => (int) ($row->rounding_total ?? 0),
-                'grand_total' => (int) ($row->grand_total ?? 0),
-                'paid_total' => (int) ($row->paid_total ?? 0),
+                'tax' => (int) ($row->tax_total_corrected ?? $row->tax_total ?? 0),
+                'total_collected' => (int) ($row->total_collected ?? $row->grand_total_corrected ?? $row->grand_total ?? 0),
+                'rounding_total' => (int) ($row->rounding_total_corrected ?? $row->rounding_total ?? 0),
+                'grand_total' => (int) ($row->grand_total_corrected ?? $row->grand_total ?? 0),
+                'paid_total' => (int) ($row->paid_total ?? $row->grand_total_corrected ?? $row->grand_total ?? 0),
                 'collected_by' => (string) ($row->cashier_name ?? '-'),
                 'items' => $includeItems ? ($itemsMap[(string) $row->id] ?? '-') : '',
                 'channel' => (string) ($row->display_channel ?? '-'),
@@ -516,10 +521,10 @@ class SalesCollectedController extends Controller
                 $query->orderByRaw('GREATEST(s.subtotal - s.discount_total, 0) ' . $dir)->orderBy('s.created_at', 'desc');
                 break;
             case 'tax':
-                $query->orderBy('s.tax_total', $dir)->orderBy('s.created_at', 'desc');
+                $query->orderByRaw(DeliveryNoTaxReadModel::sqlTaxTotal('s') . ' ' . $dir)->orderBy('s.created_at', 'desc');
                 break;
             case 'total_collected':
-                $query->orderByRaw('(GREATEST(s.subtotal - s.discount_total, 0) + s.tax_total) ' . $dir)->orderBy('s.created_at', 'desc');
+                $query->orderByRaw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ' . $dir)->orderBy('s.created_at', 'desc');
                 break;
             case 'collected_by':
                 $query->orderBy('s.cashier_name', $dir)->orderBy('s.created_at', 'desc');

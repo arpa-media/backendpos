@@ -3,6 +3,7 @@
 namespace App\Http\Resources\Api\V1\Pos;
 
 use App\Http\Resources\Api\V1\Customers\CustomerResource;
+use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
@@ -37,7 +38,7 @@ class SaleResource extends JsonResource
         $rawCreatedAt = method_exists($s, 'getRawOriginal') ? $s->getRawOriginal('created_at') : $s->created_at;
         $rawUpdatedAt = method_exists($s, 'getRawOriginal') ? $s->getRawOriginal('updated_at') : $s->updated_at;
 
-        return [
+        $payload = [
             'id' => (string) $s->id,
             'outlet_id' => (string) $s->outlet_id,
             'cashier_id' => (string) $s->cashier_id,
@@ -107,5 +108,7 @@ class SaleResource extends JsonResource
             'updated_at_text' => TransactionDate::formatSaleLocal($rawUpdatedAt, $timezone, (string) $s->sale_number),
             'deleted_at' => optional($s->deleted_at)->toISOString(),
         ];
+
+        return DeliveryNoTaxReadModel::normalizeSaleArray($payload);
     }
 }

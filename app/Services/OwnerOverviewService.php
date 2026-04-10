@@ -6,6 +6,7 @@ use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Models\Sale;
 use App\Support\FinanceOutletFilter;
+use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -123,19 +124,19 @@ class OwnerOverviewService
 
         $metrics = (clone $salesBase)
             ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as gross_sales')
-            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN s.grand_total ELSE 0 END), 0) as marking_gross_sales')
-            ->selectRaw("COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.payment_method_type, '')) IN ('cash', 'tunai') OR LOWER(COALESCE(s.payment_method_name, '')) IN ('cash', 'tunai') THEN s.grand_total ELSE 0 END), 0) as cash_sales")
-            ->selectRaw('COALESCE(SUM(s.tax_total), 0) as tax_total')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN ' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ELSE 0 END), 0) as marking_gross_sales')
+            ->selectRaw("COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.payment_method_type, '')) IN ('cash', 'tunai') OR LOWER(COALESCE(s.payment_method_name, '')) IN ('cash', 'tunai') THEN " . DeliveryNoTaxReadModel::sqlGrandTotal('s') . " ELSE 0 END), 0) as cash_sales")
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as tax_total')
             ->first();
 
         $outletSummaryAgg = (clone $salesBase)
             ->selectRaw('s.outlet_id as outlet_id')
             ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as gross_sales')
-            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN s.grand_total ELSE 0 END), 0) as marking_gross_sales')
-            ->selectRaw("COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.payment_method_type, '')) IN ('cash', 'tunai') OR LOWER(COALESCE(s.payment_method_name, '')) IN ('cash', 'tunai') THEN s.grand_total ELSE 0 END), 0) as cash_sales")
-            ->selectRaw('COALESCE(SUM(s.tax_total), 0) as tax_total')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN ' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ELSE 0 END), 0) as marking_gross_sales')
+            ->selectRaw("COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.payment_method_type, '')) IN ('cash', 'tunai') OR LOWER(COALESCE(s.payment_method_name, '')) IN ('cash', 'tunai') THEN " . DeliveryNoTaxReadModel::sqlGrandTotal('s') . " ELSE 0 END), 0) as cash_sales")
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as tax_total')
             ->groupBy('s.outlet_id');
 
         $outletSalesSummary = DB::table('outlets as o')
@@ -172,7 +173,7 @@ class OwnerOverviewService
         $byChannel = (clone $salesBase)
             ->select('s.channel')
             ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
             ->groupBy('s.channel')
             ->orderByDesc('gross_sales')
             ->get()
@@ -187,7 +188,7 @@ class OwnerOverviewService
         $byPaymentMethod = (clone $salesBase)
             ->select('s.payment_method_name', 's.payment_method_type')
             ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
             ->groupBy('s.payment_method_name', 's.payment_method_type')
             ->orderByDesc('gross_sales')
             ->get()
@@ -496,6 +497,8 @@ class OwnerOverviewService
         if ($discountTotal <= 0) {
             $discountTotal = max(0, (int) ($sale['discount_amount'] ?? 0));
         }
+
+        $sale = DeliveryNoTaxReadModel::normalizeSaleArray($sale);
 
         $taxTotal = max(0, (int) ($sale['tax_total'] ?? 0));
         $taxPercent = max(0, (int) ($sale['tax_percent'] ?? 0));

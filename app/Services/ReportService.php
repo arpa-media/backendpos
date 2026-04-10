@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Sale;
 use App\Services\CashierAlignedSaleScopeService;
+use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
@@ -223,7 +224,7 @@ class ReportService
         $paginator = $this->paginate($q, $perPage, $page);
 
         $items = collect($paginator->items())->map(function ($r) {
-            return [
+            $payload = [
                 'sale_id' => (string) $r->sale_id,
                 'outlet_code' => (string) ($r->outlet_code ?? ''),
                 'sale_number' => (string) $r->sale_number,
@@ -254,7 +255,7 @@ class ReportService
         if (!empty($params['channel'])) $saleSummaryQ->where('s.channel', '=', $params['channel']);
 
         $salesSummary = $saleSummaryQ->selectRaw('
-            COALESCE(SUM(s.grand_total),0) as grand_total,
+            COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '),0) as grand_total,
             COUNT(DISTINCT s.id) as transaction_count
         ')->first();
 
@@ -326,7 +327,7 @@ class ReportService
             'o.code as outlet_code',
             's.sale_number',
             DB::raw('COALESCE(SUM(si.qty),0) as items_sold'),
-            's.grand_total as total',
+            DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total'),
             's.paid_total as paid',
             's.created_at',
         ])
@@ -503,7 +504,7 @@ class ReportService
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
             DB::raw('GREATEST(COALESCE(s.grand_total, 0) - COALESCE(s.rounding_total, 0), 0) as total_before_rounding'),
             's.rounding_total as rounding',
-            's.grand_total as total',
+            DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total'),
             's.created_at',
         ])->orderByDesc('s.created_at');
 
@@ -586,8 +587,8 @@ class ReportService
             's.sale_number',
             's.channel',
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
-            's.grand_total as total',
-            's.tax_total as tax',
+            DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total'),
+            DB::raw(DeliveryNoTaxReadModel::sqlTaxTotal('s') . ' as tax'),
             's.created_at',
         ])
         ->orderByDesc('s.created_at');
@@ -665,7 +666,7 @@ class ReportService
             's.sale_number',
             's.channel',
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
-            's.grand_total as total',
+            DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total'),
             's.discount_amount as discount',
             's.discount_name_snapshot',
             's.discounts_snapshot',
@@ -1045,6 +1046,7 @@ class ReportService
             'grand_total' => (int) ($sale->grand_total ?? 0),
             'paid_total' => (int) ($sale->paid_total ?? 0),
             'change_total' => (int) ($sale->change_total ?? 0),
+            'payment_method_type' => (string) ($sale->payment_method_type ?? ''),
             'payment_method_name' => $this->resolveSalePaymentMethodName($sale),
             'payments' => $sale->payments->map(fn ($payment) => [
                 'id' => (string) $payment->id,
@@ -1066,6 +1068,8 @@ class ReportService
                 ];
             })->values()->all(),
         ];
+
+        return DeliveryNoTaxReadModel::normalizeSaleArray($payload);
     }
 
     private function transformCashierReportSale(Sale $sale): array

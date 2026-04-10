@@ -7,6 +7,7 @@ use App\Http\Requests\Api\V1\Finance\ListSalesSummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Support\FinanceOutletFilter;
+use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -118,9 +119,9 @@ class SalesSummaryController extends Controller
             ->selectRaw('COALESCE(SUM(s.subtotal), 0) as gross_sales')
             ->selectRaw('COALESCE(SUM(s.discount_total), 0) as discount')
             ->selectRaw('COALESCE(SUM(GREATEST(s.subtotal - s.discount_total, 0)), 0) as net_sales')
-            ->selectRaw('COALESCE(SUM(s.tax_total), 0) as tax')
-            ->selectRaw('COALESCE(SUM(s.rounding_total), 0) as rounding')
-            ->selectRaw('COALESCE(SUM(GREATEST(s.subtotal - s.discount_total, 0) + s.tax_total + s.rounding_total), 0) as total_collected');
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as tax')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlRoundingTotal('s') . '), 0) as rounding')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as total_collected');
 
         $query = DB::table('outlets as o')
             ->leftJoinSub($aggSub, 'agg', fn ($join) => $join->on('agg.outlet_id', '=', 'o.id'))

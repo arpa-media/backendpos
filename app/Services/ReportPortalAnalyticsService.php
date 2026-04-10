@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Services\CashierAlignedSaleScopeService;
+use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use App\Models\Sale;
 use Carbon\CarbonImmutable;
@@ -82,7 +83,7 @@ class ReportPortalAnalyticsService
 
         $metrics = (clone $salesBase)
             ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
             ->selectRaw('COALESCE(SUM(s.paid_total), 0) as paid_total')
             ->selectRaw('COALESCE(SUM(s.change_total), 0) as change_total')
             ->first();
@@ -107,7 +108,7 @@ class ReportPortalAnalyticsService
         $byChannel = (clone $salesBase)
             ->select('s.channel')
             ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
             ->groupBy('s.channel')
             ->orderByDesc('gross_sales')
             ->get()
@@ -122,7 +123,7 @@ class ReportPortalAnalyticsService
         $byPaymentMethod = (clone $salesBase)
             ->select('s.payment_method_type', 's.payment_method_name')
             ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(s.grand_total), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
             ->groupBy('s.payment_method_type', 's.payment_method_name')
             ->orderByDesc('gross_sales')
             ->get()
@@ -420,10 +421,10 @@ class ReportPortalAnalyticsService
                 's.sale_number',
                 's.channel',
                 's.payment_method_name',
-                's.tax_name_snapshot',
-                's.tax_percent_snapshot',
-                's.tax_total',
-                's.grand_total',
+                DB::raw(DeliveryNoTaxReadModel::sqlTaxName('s') . ' as tax_name_snapshot'),
+                DB::raw(DeliveryNoTaxReadModel::sqlTaxPercent('s') . ' as tax_percent_snapshot'),
+                DB::raw(DeliveryNoTaxReadModel::sqlTaxTotal('s') . ' as tax_total'),
+                DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as grand_total'),
                 's.marking',
                 's.created_at',
                 'o.code as outlet_code',
@@ -604,7 +605,7 @@ class ReportPortalAnalyticsService
         $timezone = (string) ($row->outlet_timezone ?? config('app.timezone', 'Asia/Jakarta'));
         $createdAtText = TransactionDate::formatSaleLocal($row->created_at ?? null, $timezone, (string) ($row->sale_number ?? ''));
 
-        return [
+        $payload = [
             'sale_id' => (string) $row->sale_id,
             'sale_number' => (string) ($row->sale_number ?? ''),
             'outlet_code' => (string) ($row->outlet_code ?? ''),
@@ -613,14 +614,21 @@ class ReportPortalAnalyticsService
             'channel' => (string) ($row->channel ?? '-'),
             'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
             'payment_method_type' => (string) ($row->payment_method_type ?? ''),
-            'total' => (int) ($row->grand_total ?? 0),
-            'paid' => (int) ($row->paid_total ?? 0),
-            'change' => (int) ($row->change_total ?? 0),
+            'grand_total' => (int) ($row->grand_total ?? 0),
+            'paid_total' => (int) ($row->paid_total ?? 0),
+            'change_total' => (int) ($row->change_total ?? 0),
             'marking' => (int) ($row->marking ?? 1),
             'created_at' => TransactionDate::toSaleIso($row->created_at ?? null, $timezone, (string) ($row->sale_number ?? '')),
             'created_at_text' => $createdAtText,
             'created_at_time' => $createdAtText ? substr($createdAtText, 11, 5) : '-',
         ];
+
+        $payload = DeliveryNoTaxReadModel::normalizeSaleArray($payload);
+        $payload['total'] = (int) ($payload['grand_total'] ?? 0);
+        $payload['paid'] = (int) ($payload['paid_total'] ?? 0);
+        $payload['change'] = (int) ($payload['change_total'] ?? 0);
+
+        return $payload;
     }
 
     private function scopeMeta(array $scope): array

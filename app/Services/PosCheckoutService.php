@@ -855,9 +855,8 @@ class PosCheckoutService
                 $serviceChargeTotal = 0;
                 $roundingTotal = (int) ($offlineSnapshot['rounding_total'] ?? 0);
 
-                // Canonical server-side rule: tax must always be applied after discount.
-                // DELIVERY is always no-tax, even when legacy offline payloads still carry
-                // tax snapshots from the client.
+                // Canonical server-side rule: DELIVERY is always no-tax, even when legacy
+                // offline payloads still carry tax snapshots from the client.
                 $canonicalAmounts = SaleAmountBreakdown::canonical(
                     (int) ($offlineSnapshot['subtotal'] ?? $subtotal),
                     (int) $discountAmount,
