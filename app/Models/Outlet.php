@@ -11,6 +11,8 @@ class Outlet extends Model
     use HasFactory;
     use HasUlids;
 
+
+
     protected $fillable = [
         'hr_outlet_id',
         'code',
