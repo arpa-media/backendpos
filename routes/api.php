@@ -58,6 +58,7 @@ Route::prefix('v1')->group(function () {
             Route::get('/me', [AuthController::class, 'me'])
                 ->middleware('permission:auth.me');
             Route::get('/pos-provision-payload', [AuthController::class, 'posProvisionPayload']);
+            Route::post('/pos-device-bind', [AuthController::class, 'posDeviceBind']);
         });
 
         /**
@@ -112,7 +113,13 @@ Route::prefix('v1')->group(function () {
 
             Route::get('/squad-users', [PosController::class, 'squadUsers'])
                 ->middleware('permission:discount.view');
+        });
 
+
+    Route::middleware(['pos_sync_auth', 'outlet_scope', 'outlet_timezone'])->group(function () {
+        Route::get('/auth/pos-device-session', [AuthController::class, 'posDeviceSession']);
+
+        Route::prefix('pos')->group(function () {
             Route::post('/checkout', [PosController::class, 'checkout'])
                 ->middleware('permission:pos.checkout');
 
@@ -125,7 +132,7 @@ Route::prefix('v1')->group(function () {
             Route::post('/offline-sync-reconcile', [PosController::class, 'offlineSyncReconcile'])
                 ->middleware('permission:pos.checkout');
         });
-
+    });
 
         /**
          * CUSTOMERS

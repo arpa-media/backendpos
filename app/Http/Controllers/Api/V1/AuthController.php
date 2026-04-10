@@ -7,6 +7,7 @@ use App\Http\Requests\Api\V1\Auth\LoginRequest;
 use App\Http\Resources\Api\V1\Auth\MeResource;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Models\User;
+use App\Services\PosDeviceTokenService;
 use App\Services\PosProvisionService;
 use App\Services\ReportPortalAccessService;
 use App\Services\UserManagementService;
@@ -24,6 +25,7 @@ class AuthController extends Controller
         private readonly UserManagementService $userManagement,
         private readonly ReportPortalAccessService $reportPortalAccess,
         private readonly PosProvisionService $posProvision,
+        private readonly PosDeviceTokenService $deviceTokens,
     ) {
     }
 
@@ -101,12 +103,16 @@ class AuthController extends Controller
         }
 
         $token = $this->issueToken($request, $user, $loginAs, $validated, $abilities);
+        $deviceSync = $loginAs === 'POS'
+            ? $this->deviceTokens->issueForPosSession($user, $ctx, $request, (string) ($validated['outlet_code'] ?? ''))
+            : null;
 
         return ApiResponse::ok([
             'token' => $token->plainTextToken,
             'token_type' => 'Bearer',
             'abilities' => $abilities,
             'auth_context' => $ctx,
+            'device_sync' => $deviceSync,
             'user' => new MeResource($user),
             'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
             'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
@@ -141,6 +147,50 @@ class AuthController extends Controller
             'user' => new MeResource($freshUser),
             'permissions' => $this->userManagement->currentSessionSnapshot($freshUser)['permissions'] ?? [],
         ], 'Password berhasil diperbarui');
+    }
+
+    public function posDeviceBind(Request $request)
+    {
+        $user = $request->user()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+        $ctx = $this->resolver->resolve($user);
+
+        if (!($ctx['is_active'] ?? true)) {
+            return ApiResponse::error('User is inactive', 'USER_INACTIVE', 403);
+        }
+
+        if (($ctx['classification'] ?? null) !== 'squad') {
+            return ApiResponse::error('Only squad users can bind POS device sync token', 'FORBIDDEN', 403);
+        }
+
+        $outletCode = strtoupper(trim((string) ($request->input('outlet_code') ?: ($ctx['resolved_outlet_code'] ?? ''))));
+        if ($outletCode === '') {
+            return ApiResponse::error('Outlet code is required for POS device bind', 'OUTLET_CODE_REQUIRED', 422);
+        }
+
+        $resolvedCode = strtoupper((string) ($ctx['resolved_outlet_code'] ?? ''));
+        if ($resolvedCode === '' || $resolvedCode !== $outletCode) {
+            return ApiResponse::error('Outlet code does not match this user assignment.', 'OUTLET_CODE_MISMATCH', 422);
+        }
+
+        return ApiResponse::ok([
+            'device_sync' => $this->deviceTokens->issueForPosSession($user, $ctx, $request, $outletCode),
+            'auth_context' => $ctx,
+        ], 'POS device sync token bound');
+    }
+
+    public function posDeviceSession(Request $request)
+    {
+        $user = $request->user()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+        $ctx = $this->resolver->resolve($user);
+        $record = $request->attributes->get('pos_device_sync_record');
+
+        return ApiResponse::ok([
+            'ready' => true,
+            'auth_mode' => (string) $request->attributes->get('pos_auth_mode', 'sanctum'),
+            'auth_context' => $ctx,
+            'user' => new MeResource($user),
+            'device_sync' => $record ? $this->deviceTokens->toPayload($record) : null,
+        ], 'POS server session ready');
     }
 
     public function posProvisionPayload(Request $request)
