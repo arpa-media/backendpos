@@ -22,8 +22,6 @@ return [
         'require_hr_assignment' => env('POS_AUTH_REQUIRE_HR_ASSIGNMENT', false),
     ],
 
-    'device_token_ttl_days' => env('POS_DEVICE_SYNC_TOKEN_TTL_DAYS', 45),
-
     'legacy_bridge' => [
         'sync_on_import' => env('POS_SYNC_LEGACY_USER_OUTLET_BRIDGE', true),
         'mirror_squad_assignment_outlet' => env('POS_MIRROR_SQUAD_ASSIGNMENT_OUTLET', true),
@@ -53,4 +51,6 @@ return [
             ],
         ],
     ],
+
+    'device_token_ttl_days' => env('POS_DEVICE_SYNC_TOKEN_TTL_DAYS', 45),
 ];

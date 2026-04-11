@@ -50,11 +50,11 @@ class PosDeviceToken extends Model
 
     public function isRevoked(): bool
     {
-        return $this->revoked_at !== null;
+        return !is_null($this->revoked_at);
     }
 
     public function isExpired(): bool
     {
-        return $this->expires_at !== null && $this->expires_at->isPast();
+        return $this->expires_at && $this->expires_at->isPast();
     }
 }

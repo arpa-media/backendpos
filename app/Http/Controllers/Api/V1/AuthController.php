@@ -106,6 +106,9 @@ class AuthController extends Controller
         $deviceSync = $loginAs === 'POS'
             ? $this->deviceTokens->issueForPosSession($user, $ctx, $request, (string) ($validated['outlet_code'] ?? ''))
             : null;
+        $offlineSeed = $loginAs === 'POS'
+            ? $this->posProvision->buildOfflineSeedForUser($user, (string) ($validated['outlet_code'] ?? ''))
+            : null;
 
         return ApiResponse::ok([
             'token' => $token->plainTextToken,
@@ -113,6 +116,7 @@ class AuthController extends Controller
             'abilities' => $abilities,
             'auth_context' => $ctx,
             'device_sync' => $deviceSync,
+            'offline_seed' => $offlineSeed,
             'user' => new MeResource($user),
             'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
             'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
@@ -122,41 +126,6 @@ class AuthController extends Controller
         ], 'Login success');
     }
 
-    public function posLoginProbe(Request $request)
-    {
-        return ApiResponse::ok([
-            'reachable' => true,
-            'server_time' => now()->toIso8601String(),
-            'app_env' => (string) config('app.env', 'production'),
-        ], 'POS login probe OK');
-    }
-
-    public function changePassword(Request $request)
-    {
-        $user = $request->user();
-
-        $data = $request->validate([
-            'current_password' => ['required', 'string'],
-            'password' => ['required', 'string', 'min:8', 'confirmed', 'different:current_password'],
-        ]);
-
-        if (! Hash::check((string) $data['current_password'], (string) $user->password)) {
-            throw ValidationException::withMessages([
-                'current_password' => ['Password saat ini tidak sesuai.'],
-            ]);
-        }
-
-        $user->forceFill([
-            'password' => (string) $data['password'],
-        ])->save();
-
-        $freshUser = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
-
-        return ApiResponse::ok([
-            'user' => new MeResource($freshUser),
-            'permissions' => $this->userManagement->currentSessionSnapshot($freshUser)['permissions'] ?? [],
-        ], 'Password berhasil diperbarui');
-    }
 
     public function posDeviceBind(Request $request)
     {
@@ -200,6 +169,33 @@ class AuthController extends Controller
             'user' => new MeResource($user),
             'device_sync' => $record ? $this->deviceTokens->toPayload($record) : null,
         ], 'POS server session ready');
+    }
+
+    public function changePassword(Request $request)
+    {
+        $user = $request->user();
+
+        $data = $request->validate([
+            'current_password' => ['required', 'string'],
+            'password' => ['required', 'string', 'min:8', 'confirmed', 'different:current_password'],
+        ]);
+
+        if (! Hash::check((string) $data['current_password'], (string) $user->password)) {
+            throw ValidationException::withMessages([
+                'current_password' => ['Password saat ini tidak sesuai.'],
+            ]);
+        }
+
+        $user->forceFill([
+            'password' => (string) $data['password'],
+        ])->save();
+
+        $freshUser = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+
+        return ApiResponse::ok([
+            'user' => new MeResource($freshUser),
+            'permissions' => $this->userManagement->currentSessionSnapshot($freshUser)['permissions'] ?? [],
+        ], 'Password berhasil diperbarui');
     }
 
     public function posProvisionPayload(Request $request)

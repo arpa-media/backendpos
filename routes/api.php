@@ -36,7 +36,6 @@ Route::prefix('v1')->group(function () {
     Route::prefix('auth')->group(function () {
         Route::post('/login', [AuthController::class, 'login']);
         Route::get('/pos-outlets', [OutletController::class, 'posLoginOptions']);
-        Route::get('/pos-login-probe', [AuthController::class, 'posLoginProbe']);
     });
 
     Route::prefix('public')->group(function () {
@@ -116,27 +115,7 @@ Route::prefix('v1')->group(function () {
                 ->middleware('permission:discount.view');
         });
 
-    });
 
-    Route::middleware(['pos_sync_auth', 'outlet_scope', 'outlet_timezone'])->group(function () {
-        Route::get('/auth/pos-device-session', [AuthController::class, 'posDeviceSession']);
-
-        Route::prefix('pos')->group(function () {
-            Route::post('/checkout', [PosController::class, 'checkout'])
-                ->middleware('permission:pos.checkout');
-
-            Route::post('/offline-sync-audit', [PosController::class, 'offlineSyncAudit'])
-                ->middleware('permission:pos.checkout');
-
-            Route::post('/offline-sync-rescue', [PosController::class, 'offlineSyncRescue'])
-                ->middleware('permission:pos.checkout');
-
-            Route::post('/offline-sync-reconcile', [PosController::class, 'offlineSyncReconcile'])
-                ->middleware('permission:pos.checkout');
-        });
-    });
-
-    Route::middleware(['auth:sanctum', 'outlet_scope', 'outlet_timezone'])->group(function () {
         /**
          * CUSTOMERS
          */
@@ -411,4 +390,24 @@ Route::put('/outlet', [OutletController::class, 'update'])
         });
 
     });
+
+
+    Route::middleware(['pos_sync_auth', 'outlet_scope', 'outlet_timezone'])->group(function () {
+        Route::get('/auth/pos-device-session', [AuthController::class, 'posDeviceSession']);
+
+        Route::prefix('pos')->group(function () {
+            Route::post('/checkout', [PosController::class, 'checkout'])
+                ->middleware('permission:pos.checkout');
+
+            Route::post('/offline-sync-audit', [PosController::class, 'offlineSyncAudit'])
+                ->middleware('permission:pos.checkout');
+
+            Route::post('/offline-sync-rescue', [PosController::class, 'offlineSyncRescue'])
+                ->middleware('permission:pos.checkout');
+
+            Route::post('/offline-sync-reconcile', [PosController::class, 'offlineSyncReconcile'])
+                ->middleware('permission:pos.checkout');
+        });
+    });
+
 });

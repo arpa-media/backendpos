@@ -983,15 +983,20 @@ class PosCheckoutService
 
             // 7) Tax (default tax per outlet, except online/delivery which are always no-tax)
             if ($useOfflineSnapshot) {
-                $effectiveTaxId = $offlineSnapshot['tax_id'] ?? $taxId;
-                $effectiveTaxName = (string) ($offlineSnapshot['tax_name_snapshot'] ?? $taxName ?? 'Tax');
-                $effectiveTaxPercent = max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
+                $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
+                $effectiveTaxId = $isOnlineNoTax ? null : ($offlineSnapshot['tax_id'] ?? $taxId);
+                $effectiveTaxName = $isOnlineNoTax
+                    ? 'Tax'
+                    : (string) ($offlineSnapshot['tax_name_snapshot'] ?? $taxName ?? 'Tax');
+                $effectiveTaxPercent = $isOnlineNoTax
+                    ? 0
+                    : max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
                 $serviceChargeTotal = 0;
                 $roundingTotal = (int) ($offlineSnapshot['rounding_total'] ?? 0);
 
                 // Canonical server-side rule: tax must always be applied after discount.
-                // This keeps new clients unchanged while transparently rescuing legacy offline
-                // payloads that still carried tax calculated from subtotal-before-discount.
+                // DELIVERY is always forced to no-tax, even when legacy offline payloads still
+                // carry stale tax snapshots from the active outlet default tax.
                 $canonicalAmounts = SaleAmountBreakdown::canonical(
                     (int) ($offlineSnapshot['subtotal'] ?? $subtotal),
                     (int) $discountAmount,

@@ -35,8 +35,8 @@ return Application::configure(basePath: dirname(__DIR__))
             'role_or_permission' => RoleOrPermissionMiddleware::class,
             // Run AFTER auth:sanctum so $request->user() is available.
             'outlet_scope' => ResolveOutletScope::class,
-            'pos_sync_auth' => AuthenticatePosSync::class,
             'outlet_timezone' => SetOutletTimezone::class,
+            'pos_sync_auth' => AuthenticatePosSync::class,
         ]);
 
         // Middleware API kamu tetap jalan, setelah CORS

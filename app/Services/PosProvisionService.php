@@ -117,6 +117,29 @@ class PosProvisionService
         ];
     }
 
+    public function buildOfflineSeedForUser(User $user, ?string $forcedOutletCode = null): ?array
+    {
+        $resolvedUser = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+        $ctx = $this->resolver->resolve($resolvedUser);
+        $outletCode = strtoupper(trim((string) ($forcedOutletCode ?: ($ctx['resolved_outlet_code'] ?? $resolvedUser->outlet?->code ?? ''))));
+
+        if ($outletCode === '') {
+            return null;
+        }
+
+        $roleName = optional($resolvedUser->roles->first())->name ?: 'cashier';
+        $seed = $this->buildProvisionUserPayload($resolvedUser, $outletCode, (string) $roleName);
+        if (! $seed) {
+            return null;
+        }
+
+        $seed['seed_version'] = 1;
+        $seed['seeded_at'] = now()->toIso8601String();
+        $seed['seed_source'] = 'login-refresh';
+
+        return $seed;
+    }
+
     protected function supportedProvisionChannels(): array
     {
         return [
@@ -173,38 +196,15 @@ class PosProvisionService
 
                     $resolvedUser = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
                     $roleName = optional($resolvedUser->roles->first())->name ?: (string) ($assignment->role_title ?: 'cashier');
-                    $sessionSnapshot = $this->userManagement->currentSessionSnapshot($resolvedUser);
-                    $authContext = $this->resolver->resolve($resolvedUser);
-                    $userResource = new MeResource($resolvedUser);
-                    $userPayload = $userResource->toArray(request());
+                    $payload = $this->buildProvisionUserPayload($resolvedUser, $outletCode, (string) $roleName);
+                    if (! $payload) {
+                        return null;
+                    }
 
-                    return [
-                        'id' => (string) $resolvedUser->id,
-                        'user_id' => (string) $resolvedUser->id,
-                        'nisj' => $nisj,
-                        'username' => (string) ($resolvedUser->username ?? $nisj),
-                        'name' => trim((string) ($employee->full_name ?? $resolvedUser->name ?? $nisj)),
-                        'outlet_code' => $outletCode,
-                        'role_name' => Str::upper((string) $roleName),
-                        'assignment_role_title' => (string) ($assignment->role_title ?? ''),
-                        'password_seeded' => filled($resolvedUser->password),
-                        'password_hash' => filled($resolvedUser->password) ? (string) $resolvedUser->password : null,
-                        'offline_auth_scheme' => 'bcrypt',
-                        'offline_grant' => true,
-                        'offline_session' => [
-                            'token' => null,
-                            'token_type' => 'Offline',
-                            'abilities' => $sessionSnapshot['permissions'] ?? [],
-                            'auth_context' => $authContext,
-                            'user' => $userPayload,
-                            'access' => $sessionSnapshot['access'] ?? ['portals' => [], 'menus' => []],
-                            'visible_backoffice_portals' => $sessionSnapshot['visible_backoffice_portals'] ?? [],
-                            'can_edit_user_management' => (bool) ($sessionSnapshot['can_edit_user_management'] ?? false),
-                            'report_access' => $sessionSnapshot['report_access'] ?? $this->reportPortalAccess->snapshot($resolvedUser),
-                            'permissions' => $sessionSnapshot['permissions'] ?? [],
-                        ],
-                        'updated_at' => optional($assignment->updated_at)->toIso8601String() ?: now()->toIso8601String(),
-                    ];
+                    $payload['assignment_role_title'] = (string) ($assignment->role_title ?? '');
+                    $payload['updated_at'] = optional($assignment->updated_at)->toIso8601String() ?: now()->toIso8601String();
+
+                    return $payload;
                 } catch (\Throwable $exception) {
                     Log::warning('POS provision user skipped', [
                         'assignment_id' => $assignment->id,
@@ -219,6 +219,52 @@ class PosProvisionService
             ->sortBy(fn (array $item) => $item['nisj'])
             ->values()
             ->all();
+    }
+
+    protected function buildProvisionUserPayload(User $resolvedUser, string $outletCode, string $roleName = 'cashier'): ?array
+    {
+        $resolvedUser = $resolvedUser->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+        if (($resolvedUser->is_active ?? true) === false) {
+            return null;
+        }
+
+        $employee = $resolvedUser->employee;
+        $nisj = trim((string) ($employee?->nisj ?? $resolvedUser->nisj ?? ''));
+        if ($nisj === '') {
+            return null;
+        }
+
+        $sessionSnapshot = $this->userManagement->currentSessionSnapshot($resolvedUser);
+        $authContext = $this->resolver->resolve($resolvedUser);
+        $userResource = new MeResource($resolvedUser);
+        $userPayload = $userResource->toArray(request());
+
+        return [
+            'id' => (string) $resolvedUser->id,
+            'user_id' => (string) $resolvedUser->id,
+            'nisj' => $nisj,
+            'username' => (string) ($resolvedUser->username ?? $nisj),
+            'name' => trim((string) ($employee?->full_name ?? $resolvedUser->name ?? $nisj)),
+            'outlet_code' => $outletCode,
+            'role_name' => Str::upper(trim($roleName) !== '' ? $roleName : 'cashier'),
+            'password_seeded' => filled($resolvedUser->password),
+            'password_hash' => filled($resolvedUser->password) ? (string) $resolvedUser->password : null,
+            'offline_auth_scheme' => 'bcrypt',
+            'offline_grant' => true,
+            'offline_session' => [
+                'token' => null,
+                'token_type' => 'Offline',
+                'abilities' => $sessionSnapshot['permissions'] ?? [],
+                'auth_context' => $authContext,
+                'user' => $userPayload,
+                'access' => $sessionSnapshot['access'] ?? ['portals' => [], 'menus' => []],
+                'visible_backoffice_portals' => $sessionSnapshot['visible_backoffice_portals'] ?? [],
+                'can_edit_user_management' => (bool) ($sessionSnapshot['can_edit_user_management'] ?? false),
+                'report_access' => $sessionSnapshot['report_access'] ?? $this->reportPortalAccess->snapshot($resolvedUser),
+                'permissions' => $sessionSnapshot['permissions'] ?? [],
+            ],
+            'updated_at' => optional($resolvedUser->updated_at)->toIso8601String() ?: now()->toIso8601String(),
+        ];
     }
 
     protected function buildTransactionSnapshot(Outlet $outlet, string $channel = SalesChannels::DINE_IN): array

@@ -6,7 +6,6 @@ use App\Models\PosDeviceToken;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Arr;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
 
 class PosDeviceTokenService
