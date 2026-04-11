@@ -395,7 +395,22 @@ Route::put('/outlet', [OutletController::class, 'update'])
     Route::middleware(['pos_sync_auth', 'outlet_scope', 'outlet_timezone'])->group(function () {
         Route::get('/auth/pos-device-session', [AuthController::class, 'posDeviceSession']);
 
+        Route::get('/dashboard/summary', [DashboardController::class, 'summary'])
+            ->middleware('permission_or_snapshot:dashboard.view');
+
+        Route::prefix('reports')->group(function () {
+            Route::get('/cashier-report', [ReportController::class, 'cashierReport'])
+                ->middleware('permission_or_snapshot:report.view');
+            Route::get('/cashier-report/cashiers', [ReportController::class, 'cashierReportCashiers'])
+                ->middleware('permission_or_snapshot:report.view');
+            Route::get('/cashier-report/{cashierId}', [ReportController::class, 'cashierReportByCashier'])
+                ->middleware('permission_or_snapshot:report.view');
+        });
+
         Route::prefix('pos')->group(function () {
+            Route::get('/squad-users', [PosController::class, 'squadUsers'])
+                ->middleware('permission_or_snapshot:discount.view');
+
             Route::post('/checkout', [PosController::class, 'checkout'])
                 ->middleware('permission:pos.checkout');
 
