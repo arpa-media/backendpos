@@ -54,26 +54,6 @@ class PosCheckoutService
         return trim((string) $value);
     }
 
-    private function normalizeStringIdList(array $values): array
-    {
-        $normalized = [];
-
-        foreach ($values as $value) {
-            if ($value === null) {
-                continue;
-            }
-
-            $string = trim((string) $value);
-            if ($string === '') {
-                continue;
-            }
-
-            $normalized[] = $string;
-        }
-
-        return array_values(array_unique($normalized));
-    }
-
     private function resolveSquadDiscountPackageFromSnapshots(array $discountSnapshots): ?array
     {
         foreach ($discountSnapshots as $row) {
@@ -105,6 +85,124 @@ class PosCheckoutService
             'type' => $type,
             'value' => max(0, (int) $discountValue),
         ];
+    }
+
+    private function normalizeStringIdList(array $values): array
+    {
+        $normalized = [];
+
+        foreach ($values as $value) {
+            if ($value === null) {
+                continue;
+            }
+
+            $string = trim((string) $value);
+            if ($string === '') {
+                continue;
+            }
+
+            $normalized[] = $string;
+        }
+
+        return array_values(array_unique($normalized));
+    }
+
+    private function calculateDiscountAmountFromBase(string $discountType, int $discountValue, int $base): int
+    {
+        $base = max(0, (int) $base);
+        $spec = $this->normalizedDiscountSpec('GLOBAL', $discountType, $discountValue);
+        $type = strtoupper((string) ($spec['type'] ?? 'NONE'));
+        $value = max(0, (int) ($spec['value'] ?? 0));
+
+        if ($type === 'PERCENT') {
+            $pct = max(0, min(100, $value));
+            return (int) floor(($base * $pct) / 100);
+        }
+
+        if ($type === 'FIXED') {
+            return min($base, $value);
+        }
+
+        return 0;
+    }
+
+    private function resolveDiscountBase(
+        string $appliesTo,
+        int $subtotal,
+        array $saleItems,
+        array $productIds = [],
+        array $customerIds = [],
+        ?Customer $customer = null,
+        ?string $discountSquadNisj = null
+    ): int {
+        $applies = strtoupper(trim((string) $appliesTo));
+        $subtotal = max(0, (int) $subtotal);
+        $normalizedProductIds = $this->normalizeStringIdList($productIds);
+        $normalizedCustomerIds = $this->normalizeStringIdList($customerIds);
+        $customerId = trim((string) ($customer?->id ?? ''));
+        $squadNisj = trim((string) ($discountSquadNisj ?? ''));
+
+        if ($applies === 'CUSTOMER') {
+            if ($customerId === '') {
+                return 0;
+            }
+
+            if (!empty($normalizedCustomerIds) && !in_array($customerId, $normalizedCustomerIds, true)) {
+                return 0;
+            }
+
+            return $subtotal;
+        }
+
+        if ($applies === 'PRODUCT') {
+            if (empty($normalizedProductIds)) {
+                return 0;
+            }
+
+            $base = 0;
+            foreach ($saleItems as $row) {
+                $productId = trim((string) ($row['product_id'] ?? ''));
+                if ($productId === '' || !in_array($productId, $normalizedProductIds, true)) {
+                    continue;
+                }
+
+                $base += max(0, (int) ($row['line_total'] ?? 0));
+            }
+
+            return max(0, (int) $base);
+        }
+
+        if ($applies === 'SQUAD') {
+            if ($squadNisj === '') {
+                return 0;
+            }
+
+            if (!empty($normalizedCustomerIds)) {
+                if ($customerId === '' || !in_array($customerId, $normalizedCustomerIds, true)) {
+                    return 0;
+                }
+            }
+
+            if (!empty($normalizedProductIds)) {
+                $base = 0;
+                foreach ($saleItems as $row) {
+                    $productId = trim((string) ($row['product_id'] ?? ''));
+                    if ($productId === '' || !in_array($productId, $normalizedProductIds, true)) {
+                        continue;
+                    }
+
+                    $base += max(0, (int) ($row['line_total'] ?? 0));
+                }
+
+                if ($base > 0) {
+                    return max(0, (int) $base);
+                }
+            }
+
+            return $subtotal;
+        }
+
+        return $subtotal;
     }
 
     /**
