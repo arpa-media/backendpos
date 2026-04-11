@@ -54,6 +54,26 @@ class PosCheckoutService
         return trim((string) $value);
     }
 
+    private function normalizeStringIdList(array $values): array
+    {
+        $normalized = [];
+
+        foreach ($values as $value) {
+            if ($value === null) {
+                continue;
+            }
+
+            $string = trim((string) $value);
+            if ($string === '') {
+                continue;
+            }
+
+            $normalized[] = $string;
+        }
+
+        return array_values(array_unique($normalized));
+    }
+
     private function resolveSquadDiscountPackageFromSnapshots(array $discountSnapshots): ?array
     {
         foreach ($discountSnapshots as $row) {
