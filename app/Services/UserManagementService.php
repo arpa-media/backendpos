@@ -492,6 +492,107 @@ class UserManagementService
         return $this->getSessionSnapshot($user);
     }
 
+    public function currentPosSessionSnapshot(User $user): array
+    {
+        $snapshot = $this->getSessionSnapshot($user);
+
+        return [
+            'permissions' => collect($snapshot['permissions'] ?? [])->filter()->map(fn ($value) => (string) $value)->unique()->values()->all(),
+            'access' => $this->compactSessionAccess($snapshot['access'] ?? ['portals' => [], 'menus' => []]),
+            'visible_backoffice_portals' => [],
+            'can_edit_user_management' => false,
+            'report_access' => ['portals' => []],
+        ];
+    }
+
+    public function buildPosUserPayload(User $user, array $authContext = []): array
+    {
+        $user->loadMissing(['roles', 'employee.assignment.outlet', 'outlet']);
+
+        $employee = $user->employee;
+        $assignment = $employee?->assignment;
+        $resolvedOutlet = $assignment?->outlet ?: $user->outlet;
+        $resolvedTimezone = (string) ($authContext['resolved_outlet_timezone'] ?? $resolvedOutlet?->timezone ?? 'Asia/Jakarta');
+
+        return [
+            'id' => (string) $user->id,
+            'name' => (string) $user->name,
+            'nisj' => $user->nisj ? (string) $user->nisj : ($employee?->nisj ? (string) $employee->nisj : null),
+            'username' => $user->username ? (string) $user->username : null,
+            'email' => (string) $user->email,
+            'is_active' => (bool) ($user->is_active ?? true),
+            'outlet_id' => $resolvedOutlet?->id ? (string) $resolvedOutlet->id : null,
+            'outlet_code' => $resolvedOutlet?->code ? (string) $resolvedOutlet->code : null,
+            'outlet_type' => $resolvedOutlet?->type ? (string) $resolvedOutlet->type : null,
+            'timezone' => $resolvedTimezone,
+            'resolved_outlet_timezone' => $resolvedTimezone,
+            'scope_locked' => (bool) ($authContext['scope_locked'] ?? false),
+            'can_adjust_scope' => (bool) ($authContext['can_adjust_scope'] ?? false),
+            'outlet' => $resolvedOutlet ? [
+                'id' => (string) $resolvedOutlet->id,
+                'code' => (string) $resolvedOutlet->code,
+                'name' => (string) $resolvedOutlet->name,
+                'type' => (string) ($resolvedOutlet->type ?? 'outlet'),
+                'timezone' => (string) ($resolvedOutlet->timezone ?? 'Asia/Jakarta'),
+            ] : null,
+            'assignment' => $assignment ? [
+                'id' => (string) $assignment->id,
+                'role_title' => $assignment->role_title,
+                'status' => $assignment->status,
+                'is_primary' => (bool) $assignment->is_primary,
+                'outlet_id' => $assignment->outlet_id ? (string) $assignment->outlet_id : null,
+                'outlet_code' => $assignment->outlet?->code ? (string) $assignment->outlet->code : null,
+                'outlet_name' => $assignment->outlet?->name ? (string) $assignment->outlet->name : null,
+            ] : null,
+            'auth_context' => $authContext,
+            'roles' => $user->roles?->pluck('name')->values()->all() ?? [],
+        ];
+    }
+
+    protected function compactSessionAccess(array $access): array
+    {
+        $portals = collect($access['portals'] ?? [])
+            ->filter(fn ($portal) => !empty($portal['can_view']))
+            ->map(fn ($portal) => [
+                'id' => isset($portal['id']) ? (string) $portal['id'] : null,
+                'code' => (string) ($portal['code'] ?? ''),
+                'name' => (string) ($portal['name'] ?? ($portal['code'] ?? '')),
+                'can_view' => true,
+            ])
+            ->values()
+            ->all();
+
+        $menus = collect($access['menus'] ?? [])
+            ->filter(function ($menu) {
+                return !empty($menu['can_view'])
+                    || !empty($menu['can_create'])
+                    || !empty($menu['can_edit'])
+                    || !empty($menu['can_delete']);
+            })
+            ->map(fn ($menu) => [
+                'id' => isset($menu['id']) ? (string) $menu['id'] : null,
+                'code' => (string) ($menu['code'] ?? ''),
+                'name' => (string) ($menu['name'] ?? ($menu['code'] ?? '')),
+                'path' => (string) ($menu['path'] ?? ''),
+                'portal_id' => isset($menu['portal_id']) && $menu['portal_id'] !== null ? (string) $menu['portal_id'] : null,
+                'portal_code' => (string) ($menu['portal_code'] ?? ''),
+                'can_view' => (bool) ($menu['can_view'] ?? false),
+                'can_create' => (bool) ($menu['can_create'] ?? false),
+                'can_edit' => (bool) ($menu['can_edit'] ?? false),
+                'can_delete' => (bool) ($menu['can_delete'] ?? false),
+            ])
+            ->values()
+            ->all();
+
+        return [
+            'role' => $access['role'] ?? null,
+            'user_type' => $access['user_type'] ?? null,
+            'level' => $access['level'] ?? null,
+            'portals' => $portals,
+            'menus' => $menus,
+        ];
+    }
+
     public function getSessionSnapshot(User $user): array
     {
         $access = $this->buildSessionAccess($user);

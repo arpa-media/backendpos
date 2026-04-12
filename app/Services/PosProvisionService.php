@@ -2,7 +2,6 @@
 
 namespace App\Services;
 
-use App\Http\Resources\Api\V1\Auth\MeResource;
 use App\Models\Assignment;
 use App\Models\Discount;
 use App\Models\Outlet;
@@ -177,11 +176,13 @@ class PosProvisionService
                 ->get();
         }
 
-        $provisionControlMap = PosProvisionControl::query()
-            ->where('outlet_id', $outletId)
-            ->get(['user_id', 'allow_provision'])
-            ->mapWithKeys(fn (PosProvisionControl $control) => [(string) $control->user_id => (bool) $control->allow_provision])
-            ->all();
+        $provisionControlMap = DB::getSchemaBuilder()->hasTable('pos_provision_controls')
+            ? PosProvisionControl::query()
+                ->where('outlet_id', $outletId)
+                ->get(['user_id', 'allow_provision'])
+                ->mapWithKeys(fn (PosProvisionControl $control) => [(string) $control->user_id => (bool) $control->allow_provision])
+                ->all()
+            : [];
 
         return $assignments
             ->map(function (Assignment $assignment) use ($outletCode, $provisionControlMap) {
@@ -245,10 +246,9 @@ class PosProvisionService
             return null;
         }
 
-        $sessionSnapshot = $this->userManagement->currentSessionSnapshot($resolvedUser);
+        $sessionSnapshot = $this->userManagement->currentPosSessionSnapshot($resolvedUser);
         $authContext = $this->resolver->resolve($resolvedUser);
-        $userResource = new MeResource($resolvedUser);
-        $userPayload = $userResource->toArray(request());
+        $userPayload = $this->userManagement->buildPosUserPayload($resolvedUser, $authContext);
 
         return [
             'id' => (string) $resolvedUser->id,
@@ -271,7 +271,7 @@ class PosProvisionService
                 'access' => $sessionSnapshot['access'] ?? ['portals' => [], 'menus' => []],
                 'visible_backoffice_portals' => $sessionSnapshot['visible_backoffice_portals'] ?? [],
                 'can_edit_user_management' => (bool) ($sessionSnapshot['can_edit_user_management'] ?? false),
-                'report_access' => $sessionSnapshot['report_access'] ?? $this->reportPortalAccess->snapshot($resolvedUser),
+                'report_access' => $sessionSnapshot['report_access'] ?? ['portals' => []],
                 'permissions' => $sessionSnapshot['permissions'] ?? [],
             ],
             'updated_at' => optional($resolvedUser->updated_at)->toIso8601String() ?: now()->toIso8601String(),

@@ -95,8 +95,9 @@ class AuthController extends Controller
         $this->userManagement->syncUserPermissions($user);
 
         $user = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
-        $snapshot = $this->userManagement->currentSessionSnapshot($user);
-        $abilities = $snapshot['permissions'] ?? [];
+        $fullSnapshot = $this->userManagement->currentSessionSnapshot($user);
+        $snapshot = $loginAs === 'POS' ? $this->userManagement->currentPosSessionSnapshot($user) : $fullSnapshot;
+        $abilities = $fullSnapshot['permissions'] ?? [];
 
         if ($user->hasRole('admin') && empty($abilities)) {
             $abilities = ['*'];
@@ -117,7 +118,9 @@ class AuthController extends Controller
             'auth_context' => $ctx,
             'device_sync' => $deviceSync,
             'offline_seed' => $offlineSeed,
-            'user' => new MeResource($user),
+            'user' => $loginAs === 'POS'
+                ? $this->userManagement->buildPosUserPayload($user, $ctx)
+                : new MeResource($user),
             'access' => $snapshot['access'] ?? ['portals' => [], 'menus' => []],
             'visible_backoffice_portals' => $snapshot['visible_backoffice_portals'] ?? [],
             'can_edit_user_management' => (bool) ($snapshot['can_edit_user_management'] ?? false),
@@ -166,7 +169,7 @@ class AuthController extends Controller
             'ready' => true,
             'auth_mode' => (string) $request->attributes->get('pos_auth_mode', 'sanctum'),
             'auth_context' => $ctx,
-            'user' => new MeResource($user),
+            'user' => $this->userManagement->buildPosUserPayload($user, $ctx),
             'device_sync' => $record ? $this->deviceTokens->toPayload($record) : null,
         ], 'POS server session ready');
     }
@@ -240,10 +243,17 @@ class AuthController extends Controller
     public function me(Request $request)
     {
         $user = $request->user()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
-        $snapshot = $this->userManagement->currentSessionSnapshot($user);
+        $tokenName = strtolower((string) optional($user->currentAccessToken())->name);
+        $isPosSession = $tokenName === 'pos' || str_starts_with($tokenName, 'pos:');
+        $authContext = $this->resolver->resolve($user);
+        $snapshot = $isPosSession
+            ? $this->userManagement->currentPosSessionSnapshot($user)
+            : $this->userManagement->currentSessionSnapshot($user);
 
         return ApiResponse::ok([
-            'user' => new MeResource($user),
+            'user' => $isPosSession
+                ? $this->userManagement->buildPosUserPayload($user, $authContext)
+                : new MeResource($user),
             'abilities' => $snapshot['permissions'] ?? [],
             'permissions' => $snapshot['permissions'] ?? [],
             'report_access' => $snapshot['report_access'] ?? $this->reportPortalAccess->snapshot($user),
