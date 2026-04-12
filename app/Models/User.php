@@ -63,5 +63,10 @@ class User extends Authenticatable
     {
         return $this->hasMany(UserReportOutletAssignment::class);
     }
+
+    public function posProvisionControls()
+    {
+        return $this->hasMany(PosProvisionControl::class);
+    }
 }
 

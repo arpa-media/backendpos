@@ -7,6 +7,7 @@ use App\Models\Assignment;
 use App\Models\Discount;
 use App\Models\Outlet;
 use App\Models\PaymentMethod;
+use App\Models\PosProvisionControl;
 use App\Models\Product;
 use App\Models\User;
 use App\Support\Auth\UserAuthContextResolver;
@@ -176,8 +177,14 @@ class PosProvisionService
                 ->get();
         }
 
+        $provisionControlMap = PosProvisionControl::query()
+            ->where('outlet_id', $outletId)
+            ->get(['user_id', 'allow_provision'])
+            ->mapWithKeys(fn (PosProvisionControl $control) => [(string) $control->user_id => (bool) $control->allow_provision])
+            ->all();
+
         return $assignments
-            ->map(function (Assignment $assignment) use ($outletCode) {
+            ->map(function (Assignment $assignment) use ($outletCode, $provisionControlMap) {
                 try {
                     $employee = $assignment->employee;
                     $user = $employee?->user;
@@ -186,6 +193,10 @@ class PosProvisionService
                     }
 
                     if (($user->is_active ?? true) === false) {
+                        return null;
+                    }
+
+                    if (array_key_exists((string) $user->id, $provisionControlMap) && $provisionControlMap[(string) $user->id] === false) {
                         return null;
                     }
 

@@ -12,6 +12,7 @@ use App\Models\AccessRoleMenuPermission;
 use App\Models\AccessRolePortalPermission;
 use App\Models\AccessUserType;
 use App\Models\Outlet;
+use App\Models\PosProvisionControl;
 use App\Models\User;
 use App\Services\UserManagementService;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
@@ -32,6 +33,7 @@ class UserManagementController extends Controller
         $q = trim((string) $request->string('q', ''));
         $perPage = max(1, min(100, (int) $request->integer('per_page', 10)));
         $page = max(1, (int) $request->integer('page', 1));
+        $outletId = trim((string) $request->string('outlet_id', ''));
 
         $usersQuery = User::query()->with([
             'employee.assignment.outlet',
@@ -47,6 +49,15 @@ class UserManagementController extends Controller
                     ->orWhere('username', 'like', "%{$q}%")
                     ->orWhere('nisj', 'like', "%{$q}%")
                     ->orWhere('email', 'like', "%{$q}%");
+            });
+        }
+
+        if ($outletId !== '') {
+            $usersQuery->where(function ($inner) use ($outletId) {
+                $inner->where('outlet_id', $outletId)
+                    ->orWhereHas('employee.assignment', function ($assignmentQuery) use ($outletId) {
+                        $assignmentQuery->where('outlet_id', $outletId);
+                    });
             });
         }
 
@@ -68,13 +79,19 @@ class UserManagementController extends Controller
         $masters = $this->buildMasters();
         $matrix = $this->buildMatrix();
 
-        $payloadUsers = $users->map(function (User $user) {
+        $provisionControlRows = PosProvisionControl::query()
+            ->whereIn('user_id', $users->pluck('id')->all())
+            ->get(['user_id', 'outlet_id', 'allow_provision', 'notes', 'updated_at'])
+            ->groupBy(fn (PosProvisionControl $row) => (string) $row->user_id);
+
+        $payloadUsers = $users->map(function (User $user) use ($provisionControlRows) {
             $employee = $user->employee;
             $hrAssignment = $employee?->assignment;
             $outlet = $hrAssignment?->outlet ?: $user->outlet;
             $accessAssignment = $user->accessAssignment;
             $accessRole = $accessAssignment?->role;
             $accessLevel = $accessAssignment?->level;
+            $provisionControl = $this->resolveProvisionControlPayload($user, $outlet, $provisionControlRows->get((string) $user->id));
 
             return [
                 'id' => (string) $user->id,
@@ -135,10 +152,15 @@ class UserManagementController extends Controller
                 'legacy' => [
                     'roles' => $user->roles->pluck('name')->values()->all(),
                 ],
+                'provision_control' => $provisionControl,
             ];
         })->values()->all();
 
         return ApiResponse::ok([
+            'active_filters' => [
+                'q' => $q !== '' ? $q : null,
+                'outlet_id' => $outletId !== '' ? $outletId : null,
+            ],
             'summary' => [
                 'users' => User::query()->count(),
                 'roles' => count($masters['roles']),
@@ -371,6 +393,83 @@ class UserManagementController extends Controller
             'current_actor_session' => $result['current_actor_session'] ?? $this->userManagement->currentSessionSnapshot($request->user()),
         ], 'User profile updated');
     }
+
+    public function updateUserProvisionControl(Request $request, string $userId)
+    {
+        $this->userManagement->ensureMasters();
+
+        $subject = User::query()->with(['employee.assignment.outlet', 'outlet'])->find($userId);
+        if (! $subject) {
+            return ApiResponse::error('User tidak ditemukan.', 'USER_NOT_FOUND', 404);
+        }
+
+        $resolvedOutlet = $subject->employee?->assignment?->outlet ?: $subject->outlet;
+        if (! $resolvedOutlet) {
+            return ApiResponse::error('User belum punya outlet assignment aktif sehingga tidak bisa diatur untuk provision.', 'USER_OUTLET_CONTEXT_MISSING', 422);
+        }
+
+        $data = $request->validate([
+            'allow_provision' => ['required', 'boolean'],
+            'notes' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        $control = PosProvisionControl::query()->updateOrCreate(
+            [
+                'user_id' => (string) $subject->id,
+                'outlet_id' => (string) $resolvedOutlet->id,
+            ],
+            [
+                'allow_provision' => (bool) $data['allow_provision'],
+                'notes' => isset($data['notes']) && trim((string) $data['notes']) !== '' ? trim((string) $data['notes']) : null,
+                'updated_by_user_id' => (string) $request->user()->id,
+            ]
+        );
+
+        return ApiResponse::ok([
+            'provision_control' => $this->serializeProvisionControl($control->fresh(), $resolvedOutlet),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+        ], (bool) $control->allow_provision ? 'Provision user diaktifkan.' : 'Provision user diblokir.');
+    }
+
+    protected function resolveProvisionControlPayload(User $user, $outlet, $controlRows = null): array
+    {
+        $rows = $controlRows instanceof EloquentCollection ? $controlRows : new EloquentCollection(collect($controlRows)->all());
+        $effectiveOutletId = $outlet?->id ? (string) $outlet->id : null;
+        $match = null;
+        if ($effectiveOutletId) {
+            $match = $rows->first(fn (PosProvisionControl $row) => (string) $row->outlet_id === $effectiveOutletId);
+        }
+        $match = $match ?: $rows->first();
+
+        if (! $match) {
+            return [
+                'allow_provision' => true,
+                'notes' => null,
+                'source' => 'default_allow',
+                'outlet_id' => $effectiveOutletId,
+                'outlet_code' => $outlet?->code ? (string) $outlet->code : null,
+                'updated_at' => null,
+            ];
+        }
+
+        return $this->serializeProvisionControl($match, $outlet);
+    }
+
+    protected function serializeProvisionControl(PosProvisionControl $control, $outlet = null): array
+    {
+        $resolvedOutlet = $outlet ?: $control->outlet;
+
+        return [
+            'id' => (string) $control->id,
+            'allow_provision' => (bool) $control->allow_provision,
+            'notes' => $control->notes,
+            'source' => 'explicit_control',
+            'outlet_id' => $control->outlet_id ? (string) $control->outlet_id : ($resolvedOutlet?->id ? (string) $resolvedOutlet->id : null),
+            'outlet_code' => $resolvedOutlet?->code ? (string) $resolvedOutlet->code : null,
+            'updated_at' => optional($control->updated_at)->toIso8601String(),
+        ];
+    }
+
 
     public function updatePortalPermission(Request $request)
     {
