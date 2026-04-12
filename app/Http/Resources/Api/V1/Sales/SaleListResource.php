@@ -42,6 +42,14 @@ class SaleListResource extends JsonResource
 
             'cancel_requests_pending_count' => isset($s->cancel_requests_pending_count) ? (int) $s->cancel_requests_pending_count : 0,
             'has_cancel_request_pending' => ((int) ($s->cancel_requests_pending_count ?? 0)) > 0,
+            'backoffice_statuses' => array_values(array_filter([
+                ((int) ($s->cancel_requests_pending_count ?? 0)) > 0 ? 'REQUEST_CANCEL' : null,
+                strtoupper((string) ($s->status ?? '')) === 'CANCELLED' ? 'CANCELLED' : null,
+            ])),
+            'backoffice_status_labels' => array_values(array_filter([
+                ((int) ($s->cancel_requests_pending_count ?? 0)) > 0 ? 'Request Cancel' : null,
+                strtoupper((string) ($s->status ?? '')) === 'CANCELLED' ? 'Cancelled' : null,
+            ])),
 
             'created_at' => TransactionDate::toSaleIso($rawCreatedAt, $saleTimezone, (string) $s->sale_number),
             'created_at_text' => TransactionDate::formatSaleLocal($rawCreatedAt, $saleTimezone, (string) $s->sale_number),

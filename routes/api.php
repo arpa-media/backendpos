@@ -194,13 +194,13 @@ Route::prefix('v1')->group(function () {
 
         // Patch-8: Cancel bill request flow
         Route::post('/sales/{id}/cancel-requests', [SaleCancelRequestController::class, 'store'])
-            ->middleware('permission_or_snapshot:sale.cancel.request');
+            ->middleware('permission_or_snapshot:sale.cancel.request,sale.cancel.approve');
         Route::post('/sales/{id}/void-requests', [SaleCancelRequestController::class, 'storeVoid'])
-            ->middleware('permission_or_snapshot:sale.cancel.request');
+            ->middleware('permission_or_snapshot:sale.cancel.request,sale.cancel.approve');
         Route::get('/sales/{id}/cancel-requests', [SaleCancelRequestController::class, 'listForSale'])
-            ->middleware('permission_or_snapshot:sale.cancel.request');
+            ->middleware('permission_or_snapshot:sale.cancel.request,sale.cancel.approve');
         Route::get('/sales/{saleId}/cancel-requests/{requestId}', [SaleCancelRequestController::class, 'showForSale'])
-            ->middleware('permission_or_snapshot:sale.cancel.request');
+            ->middleware('permission_or_snapshot:sale.cancel.request,sale.cancel.approve');
 
         Route::get('/cancel-requests', [SaleCancelRequestController::class, 'index'])
             ->middleware('permission_or_snapshot:sale.cancel.approve');

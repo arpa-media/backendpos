@@ -16,6 +16,34 @@ use Illuminate\Support\Facades\DB;
 
 class SalesController extends Controller
 {
+    private function resolveScopeIds(Request $request): array
+    {
+        $rawFilter = trim((string) ($request->input('outlet_filter', $request->query('outlet_filter', ''))));
+        $canAdjustScope = (bool) $request->attributes->get('outlet_scope_can_adjust', false);
+
+        if ($rawFilter !== '' || $canAdjustScope || OutletScope::isAll($request)) {
+            $scope = BackofficeOutletScope::resolve($request, $rawFilter);
+            return array_values(array_filter(array_map('strval', $scope['outlet_ids'] ?? [])));
+        }
+
+        $outletId = OutletScope::id($request);
+        return $outletId ? [(string) $outletId] : [];
+    }
+
+    private function scopedSaleQuery(Request $request)
+    {
+        $scopeIds = $this->resolveScopeIds($request);
+        $query = Sale::query();
+
+        if (count($scopeIds) === 1) {
+            $query->where('outlet_id', $scopeIds[0]);
+        } elseif (count($scopeIds) > 1) {
+            $query->whereIn('outlet_id', $scopeIds);
+        }
+
+        return $query;
+    }
+
     public function index(ListSalesRequest $request)
     {
         $v = $request->validated();
@@ -27,7 +55,6 @@ class SalesController extends Controller
         $scopeIds = array_values(array_filter(array_map('strval', $scope['outlet_ids'] ?? [])));
         $outletId = count($scopeIds) === 1 ? $scopeIds[0] : null;
 
-        // Date filters should follow selected outlet timezone / request timezone.
         $tz = TransactionDate::normalizeTimezone((string) ($scope['timezone'] ?? config('app.timezone', 'Asia/Jakarta')), 'Asia/Jakarta');
         if ($outletId) {
             $tz = TransactionDate::normalizeTimezone(
@@ -101,12 +128,15 @@ class SalesController extends Controller
             return ApiResponse::error('User does not have the right permissions.', 'FORBIDDEN', 403);
         }
 
-        $outletId = OutletScope::id($request); // null => ALL
-
-        $sale = Sale::query()
-            ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
+        $sale = $this->scopedSaleQuery($request)
             ->where('id', $id)
-            ->with(['items.product.category', 'payments', 'customer', 'outlet', 'cancelRequests' => fn ($q) => $q->with(['outlet', 'sale'])->orderByDesc('created_at')])
+            ->with([
+                'items.product.category',
+                'payments',
+                'customer',
+                'outlet',
+                'cancelRequests' => fn ($q) => $q->with(['outlet', 'sale'])->orderByDesc('created_at'),
+            ])
             ->first();
 
         if (!$sale) {
@@ -118,10 +148,7 @@ class SalesController extends Controller
 
     public function cancel(Request $request, string $id)
     {
-        $outletId = OutletScope::id($request); // null => ALL
-
-        $sale = Sale::query()
-            ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
+        $sale = $this->scopedSaleQuery($request)
             ->where('id', $id)
             ->first();
 
@@ -132,15 +159,15 @@ class SalesController extends Controller
         $sale->status = 'CANCELLED';
         $sale->save();
 
-        return ApiResponse::ok(new SaleDetailResource($sale->load(['items.product.category','payments','customer','outlet'])), 'Sale cancelled');
+        return ApiResponse::ok(new SaleDetailResource($sale->load(['items.product.category', 'payments', 'customer', 'outlet', 'cancelRequests' => fn ($q) => $q->with(['outlet', 'sale'])->orderByDesc('created_at')])), 'Sale cancelled');
     }
 
     public function destroy(Request $request, string $id)
     {
-        $outletId = OutletScope::id($request); // null => ALL
-
+        $scopeIds = $this->resolveScopeIds($request);
         $sale = Sale::query()
-            ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
+            ->when(count($scopeIds) === 1, fn ($q) => $q->where('outlet_id', $scopeIds[0]))
+            ->when(count($scopeIds) > 1, fn ($q) => $q->whereIn('outlet_id', $scopeIds))
             ->where('id', $id)
             ->withTrashed()
             ->first();
@@ -153,10 +180,8 @@ class SalesController extends Controller
             return ApiResponse::error('Sale must be CANCELLED before delete', 'INVALID_STATE', 422);
         }
 
-        // hard delete
         $sale->forceDelete();
 
         return ApiResponse::ok(null, 'Sale deleted');
     }
-
 }

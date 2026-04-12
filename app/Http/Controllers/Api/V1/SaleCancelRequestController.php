@@ -17,16 +17,32 @@ use Illuminate\Validation\Rule;
 
 class SaleCancelRequestController extends Controller
 {
-    private function resolveScopedOutletId(Request $request): ?string
+    private function resolveSaleScopeIds(Request $request): array
     {
+        $rawFilter = trim((string) ($request->input('outlet_filter', $request->query('outlet_filter', ''))));
         $canAdjustScope = (bool) $request->attributes->get('outlet_scope_can_adjust', false);
-        $requestAllOutlets = $request->boolean('all_outlets');
 
-        if ($canAdjustScope && $requestAllOutlets) {
-            return null;
+        if ($rawFilter !== '' || $canAdjustScope || OutletScope::isAll($request)) {
+            $scope = BackofficeOutletScope::resolve($request, $rawFilter);
+            return array_values(array_filter(array_map('strval', $scope['outlet_ids'] ?? [])));
         }
 
-        return OutletScope::id($request);
+        $outletId = OutletScope::id($request);
+        return $outletId ? [(string) $outletId] : [];
+    }
+
+    private function scopedSaleQuery(Request $request)
+    {
+        $ids = $this->resolveSaleScopeIds($request);
+        $query = Sale::query();
+
+        if (count($ids) === 1) {
+            $query->where('outlet_id', $ids[0]);
+        } elseif (count($ids) > 1) {
+            $query->whereIn('outlet_id', $ids);
+        }
+
+        return $query;
     }
 
     private function mapVoidSnapshotItems($sale, array $itemIds = []): array
@@ -68,19 +84,13 @@ class SaleCancelRequestController extends Controller
         return $query;
     }
 
-    /**
-     * Cashier requests to cancel a bill (sale).
-     */
     public function store(Request $request, string $saleId)
     {
         $validated = $request->validate([
             'reason' => ['nullable', 'string', 'max:500'],
         ]);
 
-        $outletId = OutletScope::id($request); // null => ALL
-
-        $sale = Sale::query()
-            ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
+        $sale = $this->scopedSaleQuery($request)
             ->with('items.product.category')
             ->whereKey($saleId)
             ->first();
@@ -122,9 +132,6 @@ class SaleCancelRequestController extends Controller
         return ApiResponse::ok(new SaleCancelRequestResource($req), 'Cancel request created', 201);
     }
 
-    /**
-     * Cashier/backoffice requests to void selected sale items.
-     */
     public function storeVoid(Request $request, string $saleId)
     {
         $validated = $request->validate([
@@ -133,10 +140,7 @@ class SaleCancelRequestController extends Controller
             'item_ids.*' => ['required', 'string'],
         ]);
 
-        $outletId = OutletScope::id($request);
-
-        $sale = Sale::query()
-            ->when($outletId, fn ($q) => $q->where('outlet_id', $outletId))
+        $sale = $this->scopedSaleQuery($request)
             ->with('items.product.category')
             ->whereKey($saleId)
             ->first();
@@ -184,9 +188,6 @@ class SaleCancelRequestController extends Controller
         return ApiResponse::ok(new SaleCancelRequestResource($req->load(['sale.items.product.category', 'outlet'])), 'Void request created', 201);
     }
 
-    /**
-     * Admin/manager: list cancel requests.
-     */
     public function index(Request $request)
     {
         $validated = $request->validate([
@@ -284,9 +285,6 @@ class SaleCancelRequestController extends Controller
         return ApiResponse::ok(new SaleCancelRequestResource($req), 'OK');
     }
 
-    /**
-     * Admin/manager: approve/reject.
-     */
     public function decide(Request $request, string $id)
     {
         $validated = $request->validate([
@@ -340,9 +338,6 @@ class SaleCancelRequestController extends Controller
         return ApiResponse::ok(new SaleCancelRequestResource($req), 'Decision saved');
     }
 
-    /**
-     * Backward-compatible alias to approve cancel bill without deleting the sale.
-     */
     public function confirmDelete(Request $request, string $id)
     {
         $validated = $request->validate([

@@ -7,6 +7,7 @@ use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use App\Http\Resources\Api\V1\Pos\SaleItemResource;
 use App\Http\Resources\Api\V1\Pos\SalePaymentResource;
+use App\Http\Resources\Api\V1\Sales\SaleCancelRequestResource;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -96,6 +97,7 @@ class SaleDetailResource extends JsonResource
             'latest_request_type' => method_exists($s, 'cancelRequests') && $s->relationLoaded('cancelRequests') && $s->cancelRequests->count()
                 ? (string) optional($s->cancelRequests->sortByDesc('created_at')->first())->request_type
                 : null,
+            'cancel_requests' => SaleCancelRequestResource::collection($this->whenLoaded('cancelRequests')),
             'created_at' => TransactionDate::toSaleIso($rawCreatedAt, $timezone, (string) $s->sale_number),
             'updated_at' => TransactionDate::toSaleIso($rawUpdatedAt, $timezone, (string) $s->sale_number),
             'created_at_text' => TransactionDate::formatSaleLocal($rawCreatedAt, $timezone, (string) $s->sale_number),
