@@ -498,10 +498,54 @@ class UserManagementService
 
         return [
             'permissions' => collect($snapshot['permissions'] ?? [])->filter()->map(fn ($value) => (string) $value)->unique()->values()->all(),
-            'access' => $this->compactSessionAccess($snapshot['access'] ?? ['portals' => [], 'menus' => []]),
+            'access' => $this->compactPosRuntimeAccess($snapshot['access'] ?? ['portals' => [], 'menus' => []]),
             'visible_backoffice_portals' => [],
             'can_edit_user_management' => false,
             'report_access' => ['portals' => []],
+        ];
+    }
+
+    protected function compactPosRuntimeAccess(array $access): array
+    {
+        $menus = collect($access['menus'] ?? [])
+            ->filter(function ($menu) {
+                $path = trim((string) ($menu['path'] ?? ''));
+                if ($path === '') {
+                    return false;
+                }
+
+                $hasAnyPermission = !empty($menu['can_view'])
+                    || !empty($menu['can_create'])
+                    || !empty($menu['can_edit'])
+                    || !empty($menu['can_delete']);
+
+                if (! $hasAnyPermission) {
+                    return false;
+                }
+
+                return str_starts_with($path, '/c/');
+            })
+            ->map(fn ($menu) => [
+                'id' => isset($menu['id']) ? (string) $menu['id'] : null,
+                'code' => (string) ($menu['code'] ?? ''),
+                'name' => (string) ($menu['name'] ?? ($menu['code'] ?? '')),
+                'path' => (string) ($menu['path'] ?? ''),
+                'portal_id' => isset($menu['portal_id']) && $menu['portal_id'] !== null ? (string) $menu['portal_id'] : null,
+                'portal_code' => (string) ($menu['portal_code'] ?? ''),
+                'portal_name' => (string) ($menu['portal_name'] ?? ''),
+                'can_view' => (bool) ($menu['can_view'] ?? false),
+                'can_create' => (bool) ($menu['can_create'] ?? false),
+                'can_edit' => (bool) ($menu['can_edit'] ?? false),
+                'can_delete' => (bool) ($menu['can_delete'] ?? false),
+                'permission_view' => isset($menu['permission_view']) ? (string) $menu['permission_view'] : null,
+            ])
+            ->unique(fn ($menu) => strtolower((string) ($menu['path'] ?? '')) . '|' . strtolower((string) ($menu['code'] ?? '')))
+            ->values()
+            ->all();
+
+        return [
+            'portals' => [],
+            'menus' => $menus,
         ];
     }
 
