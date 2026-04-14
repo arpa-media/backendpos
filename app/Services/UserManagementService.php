@@ -523,7 +523,7 @@ class UserManagementService
                     return false;
                 }
 
-                return str_starts_with($path, '/c/');
+                return str_starts_with($path, '/c/') || $path === '/sales';
             })
             ->map(fn ($menu) => [
                 'id' => isset($menu['id']) ? (string) $menu['id'] : null,
