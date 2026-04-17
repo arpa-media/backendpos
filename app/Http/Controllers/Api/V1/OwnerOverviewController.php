@@ -16,13 +16,16 @@ class OwnerOverviewController extends Controller
 
     public function index(OwnerOverviewQueryRequest $request)
     {
+        @ini_set('max_execution_time', '180');
+        @set_time_limit(180);
+
         $params = $request->validated();
         $cacheKey = 'owner-overview:' . sha1(json_encode([
             'user_id' => (string) ($request->user()?->id ?? ''),
             'params' => $params,
         ]));
 
-        $payload = Cache::remember($cacheKey, now()->addSeconds(30), fn () => $this->service->overview($params));
+        $payload = Cache::remember($cacheKey, now()->addSeconds(300), fn () => $this->service->overview($params));
 
         return ApiResponse::ok($payload, 'OK');
     }

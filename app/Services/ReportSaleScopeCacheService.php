@@ -68,6 +68,55 @@ class ReportSaleScopeCacheService
         ];
     }
 
+
+    public function rememberSubquery(string $namespace, array $fingerprint, Builder $saleIdSubquery, int $ttlMinutes = 20): array
+    {
+        $scopeKey = $this->buildScopeKey($namespace, $fingerprint);
+        $now = now();
+
+        $this->cleanupExpiredRows($now->format('Y-m-d H:i:s'));
+
+        $hasRows = DB::table('report_sale_scope_cache')
+            ->where('scope_key', $scopeKey)
+            ->where('expires_at', '>', $now)
+            ->exists();
+
+        if ($hasRows) {
+            return [
+                'scope_key' => $scopeKey,
+                'has_rows' => true,
+            ];
+        }
+
+        DB::table('report_sale_scope_cache')
+            ->where('scope_key', $scopeKey)
+            ->delete();
+
+        $expiresAt = $now->copy()->addMinutes($ttlMinutes)->format('Y-m-d H:i:s');
+        $createdAt = $now->format('Y-m-d H:i:s');
+
+        $source = DB::query()
+            ->fromSub($saleIdSubquery, 'src')
+            ->selectRaw('? as scope_key', [$scopeKey])
+            ->selectRaw('CAST(src.id AS CHAR(64)) as sale_id')
+            ->selectRaw('? as expires_at', [$expiresAt])
+            ->selectRaw('? as created_at', [$createdAt])
+            ->selectRaw('? as updated_at', [$createdAt]);
+
+        DB::table('report_sale_scope_cache')->insertUsing(
+            ['scope_key', 'sale_id', 'expires_at', 'created_at', 'updated_at'],
+            $source
+        );
+
+        return [
+            'scope_key' => $scopeKey,
+            'has_rows' => DB::table('report_sale_scope_cache')
+                ->where('scope_key', $scopeKey)
+                ->where('expires_at', '>', $now)
+                ->exists(),
+        ];
+    }
+
     public function subquery(string $scopeKey): Builder
     {
         return DB::table('report_sale_scope_cache as rssc')

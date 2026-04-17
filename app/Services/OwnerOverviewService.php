@@ -6,7 +6,6 @@ use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Models\Sale;
 use App\Support\FinanceOutletFilter;
-use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
@@ -15,8 +14,10 @@ use Throwable;
 
 class OwnerOverviewService
 {
-    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
-    {
+    public function __construct(
+        private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
+        private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
+    ) {
     }
 
 
@@ -39,21 +40,41 @@ class OwnerOverviewService
             $timezone,
         );
 
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scope['allowed_outlet_ids'], $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone);
+        $saleScope = $this->resolveEligibleSalesScope($scope['allowed_outlet_ids'], $params, $timezone);
+        if (! ($saleScope['has_rows'] ?? false)) {
+            return [
+                'ok' => false,
+                'status' => 404,
+                'message' => 'Transaksi tidak ditemukan pada filter Owner Overview ini.',
+                'error_code' => 'OWNER_OVERVIEW_SALE_NOT_FOUND',
+            ];
+        }
+
+        $visible = DB::table('report_sale_scope_cache as rssc')
+            ->where('rssc.scope_key', (string) $saleScope['scope_key'])
+            ->where('rssc.sale_id', $saleId)
+            ->where('rssc.expires_at', '>', now())
+            ->exists();
+
+        if (! $visible) {
+            return [
+                'ok' => false,
+                'status' => 404,
+                'message' => 'Transaksi tidak ditemukan pada filter Owner Overview ini.',
+                'error_code' => 'OWNER_OVERVIEW_SALE_NOT_FOUND',
+            ];
+        }
 
         $sale = Sale::query()
             ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer', 'cancelRequests'])
             ->where('id', $saleId)
             ->whereNull('deleted_at')
             ->where('status', '=', 'PAID')
-            ->whereIn('outlet_id', $scope['allowed_outlet_ids'])
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('id', $eligibleSaleIds));
+            ->whereIn('outlet_id', $scope['allowed_outlet_ids']);
 
         if (! empty($scope['selected_outlet_id'])) {
             $sale->where('outlet_id', '=', $scope['selected_outlet_id']);
         }
-
-        $this->applyBusinessDateScopeToEloquent($sale, $fromQuery, $toQuery, $params, $timezone, 'sale_number', 'created_at');
 
         $sale = $sale->first();
         if (! $sale) {
@@ -113,150 +134,42 @@ class OwnerOverviewService
 
         $topLimit = max(1, min(10, (int) ($params['top_limit'] ?? 5)));
         $recentLimit = max(1, min(20, (int) ($params['recent_limit'] ?? 10)));
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone);
+        $saleScope = $this->resolveEligibleSalesScope($outletIds, $params, $timezone);
+        $allowedOutlets = $this->resolveAllowedOutlets($outletIds);
 
-        $salesBase = DB::table('sales as s')
-            ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+        if (! ($saleScope['has_rows'] ?? false)) {
+            return $this->emptyOverviewPayload($fromLocal->toDateString(), $toLocal->toDateString(), $outletFilter, $timezone, $allowedOutlets, $recentLimit);
+        }
 
-        $this->applyOutletScope($salesBase, $outletIds, 's');
-
-        $metrics = (clone $salesBase)
-            ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
-            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN ' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ELSE 0 END), 0) as marking_gross_sales')
-            ->selectRaw("COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.payment_method_type, '')) IN ('cash', 'tunai') OR LOWER(COALESCE(s.payment_method_name, '')) IN ('cash', 'tunai') THEN " . DeliveryNoTaxReadModel::sqlGrandTotal('s') . " ELSE 0 END), 0) as cash_sales")
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as tax_total')
-            ->first();
-
-        $outletSummaryAgg = (clone $salesBase)
-            ->selectRaw('s.outlet_id as outlet_id')
-            ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
-            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN ' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ELSE 0 END), 0) as marking_gross_sales')
-            ->selectRaw("COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.payment_method_type, '')) IN ('cash', 'tunai') OR LOWER(COALESCE(s.payment_method_name, '')) IN ('cash', 'tunai') THEN " . DeliveryNoTaxReadModel::sqlGrandTotal('s') . " ELSE 0 END), 0) as cash_sales")
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as tax_total')
-            ->groupBy('s.outlet_id');
-
-        $outletSalesSummary = DB::table('outlets as o')
-            ->leftJoinSub($outletSummaryAgg, 'agg', fn ($join) => $join->on('agg.outlet_id', '=', 'o.id'))
-            ->whereRaw('LOWER(COALESCE(o.type, ?)) = ?', ['outlet', 'outlet']);
-
-        $this->applyOutletRowScope($outletSalesSummary, $outletIds, 'o.id');
-
-        $outletSalesSummary = $outletSalesSummary
-            ->orderBy('o.name')
-            ->get([
-                'o.id as outlet_id',
-                'o.code as outlet_code',
-                'o.name as outlet_name',
-                DB::raw('COALESCE(agg.trx_count, 0) as trx_count'),
-                DB::raw('COALESCE(agg.gross_sales, 0) as gross_sales'),
-                DB::raw('COALESCE(agg.marking_gross_sales, 0) as marking_gross_sales'),
-                DB::raw('COALESCE(agg.cash_sales, 0) as cash_sales'),
-                DB::raw('COALESCE(agg.tax_total, 0) as tax_total'),
-            ])
-            ->map(fn ($row) => [
-                'outlet_id' => (string) ($row->outlet_id ?? ''),
-                'outlet_code' => (string) ($row->outlet_code ?? ''),
-                'outlet_name' => (string) ($row->outlet_name ?? '-'),
-                'trx_count' => (int) ($row->trx_count ?? 0),
-                'gross_sales' => (int) ($row->gross_sales ?? 0),
-                'marking_gross_sales' => (int) ($row->marking_gross_sales ?? 0),
-                'cash_sales' => (int) ($row->cash_sales ?? 0),
-                'tax_total' => (int) ($row->tax_total ?? 0),
-            ])
-            ->values()
-            ->all();
-
-        $byChannel = (clone $salesBase)
-            ->select('s.channel')
-            ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
-            ->groupBy('s.channel')
-            ->orderByDesc('gross_sales')
-            ->get()
-            ->map(fn ($row) => [
-                'channel' => (string) ($row->channel ?? '-'),
-                'trx_count' => (int) ($row->trx_count ?? 0),
-                'gross_sales' => (int) ($row->gross_sales ?? 0),
-            ])
-            ->values()
-            ->all();
-
-        $byPaymentMethod = (clone $salesBase)
-            ->select('s.payment_method_name', 's.payment_method_type')
-            ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
-            ->groupBy('s.payment_method_name', 's.payment_method_type')
-            ->orderByDesc('gross_sales')
-            ->get()
-            ->map(fn ($row) => [
-                'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
-                'payment_method_type' => (string) ($row->payment_method_type ?? ''),
-                'trx_count' => (int) ($row->trx_count ?? 0),
-                'gross_sales' => (int) ($row->gross_sales ?? 0),
-            ])
-            ->values()
-            ->all();
-
-        $topVariantsBase = DB::table('sale_items as si')
-            ->join('sales as s', 's.id', '=', 'si.sale_id')
+        $salesRows = DB::table('sales as s')
+            ->join('report_sale_scope_cache as rssc', function ($join) use ($saleScope) {
+                $join->on('rssc.sale_id', '=', 's.id')
+                    ->where('rssc.scope_key', '=', (string) ($saleScope['scope_key'] ?? ''))
+                    ->where('rssc.expires_at', '>', now());
+            })
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->whereNull('s.deleted_at')
             ->where('s.status', '=', 'PAID');
-        $this->applyOutletScope($topVariantsBase, $outletIds, 's');
-        $this->applyBusinessDateScope($topVariantsBase, $fromQuery, $toQuery, $params, $timezone, 's.sale_number', 's.created_at');
 
-        $topVariants = (clone $topVariantsBase)
-            ->select('si.product_name', 'si.variant_name')
-            ->selectRaw('COALESCE(SUM(si.qty), 0) as qty_sold')
-            ->selectRaw('COALESCE(SUM(si.line_total), 0) as revenue')
-            ->groupBy('si.product_name', 'si.variant_name')
-            ->orderByDesc('qty_sold')
-            ->orderByDesc('revenue')
-            ->limit($topLimit)
-            ->get()
-            ->map(fn ($row) => [
-                'product_name' => (string) ($row->product_name ?? '-'),
-                'variant_name' => (string) ($row->variant_name ?? '-'),
-                'qty_sold' => (int) ($row->qty_sold ?? 0),
-                'revenue' => (int) ($row->revenue ?? 0),
-            ])
-            ->values()
-            ->all();
+        $this->applyOutletScope($salesRows, $outletIds, 's');
 
-        $topProducts = (clone $topVariantsBase)
-            ->select('si.product_name')
-            ->selectRaw('COALESCE(SUM(si.qty), 0) as qty_sold')
-            ->selectRaw('COALESCE(SUM(si.line_total), 0) as revenue')
-            ->groupBy('si.product_name')
-            ->orderByDesc('qty_sold')
-            ->orderByDesc('revenue')
-            ->limit($topLimit)
-            ->get()
-            ->map(fn ($row) => [
-                'product_name' => (string) ($row->product_name ?? '-'),
-                'qty_sold' => (int) ($row->qty_sold ?? 0),
-                'revenue' => (int) ($row->revenue ?? 0),
-            ])
-            ->values()
-            ->all();
-
-        $recentSales = (clone $salesBase)
-            ->select([
+        $salesRows = $salesRows
+            ->leftJoinSub($this->paymentSummarySubquery((string) ($saleScope['scope_key'] ?? '')), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'))
+            ->leftJoinSub($this->channelMapSubquery((string) ($saleScope['scope_key'] ?? '')), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
+            ->get([
                 's.id as sale_id',
                 's.outlet_id as outlet_id',
                 's.sale_number',
                 's.channel',
+                's.online_order_source',
                 's.payment_method_name',
                 's.payment_method_type',
                 's.subtotal',
                 's.discount_total',
                 's.service_charge_total',
-                DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as grand_total'),
+                DB::raw('COALESCE(s.grand_total, 0) as grand_total'),
+                DB::raw('COALESCE(s.tax_total, 0) as tax_total'),
+                DB::raw('COALESCE(s.rounding_total, 0) as rounding_total'),
                 's.paid_total',
                 's.change_total',
                 's.marking',
@@ -264,41 +177,200 @@ class OwnerOverviewService
                 'o.code as outlet_code',
                 'o.name as outlet_name',
                 'o.timezone as outlet_timezone',
-            ])
-            ->orderByDesc('s.created_at')
-            ->orderByDesc('s.id')
-            ->limit($recentLimit)
-            ->get()
+                DB::raw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel"),
+                DB::raw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display"),
+                DB::raw('COALESCE(payments.cash_amount, 0) as payment_cash_amount'),
+                DB::raw('COALESCE(payments.has_payment_rows, 0) as has_payment_rows'),
+            ]);
+
+        if ($salesRows->isEmpty()) {
+            return $this->emptyOverviewPayload($fromLocal->toDateString(), $toLocal->toDateString(), $outletFilter, $timezone, $allowedOutlets, $recentLimit);
+        }
+
+        $paymentBreakdownRows = $this->resolvePaymentBreakdown($saleScope, $outletIds);
+
+        $metrics = [
+            'gross_sales' => 0,
+            'marking_gross_sales' => 0,
+            'cash_sales' => (int) collect($paymentBreakdownRows)->filter(fn (array $row) => $this->isCashPaymentLabel($row['payment_method_name'] ?? null, $row['payment_method_type'] ?? null))->sum('gross_sales'),
+            'tax_total' => 0,
+        ];
+        $outletAccumulator = [];
+        $channelAccumulator = [];
+
+        foreach ($allowedOutlets as $outlet) {
+            $outletAccumulator[(string) ($outlet['id'] ?? '')] = [
+                'outlet_id' => (string) ($outlet['id'] ?? ''),
+                'outlet_code' => (string) ($outlet['code'] ?? ''),
+                'outlet_name' => (string) ($outlet['name'] ?? '-'),
+                'trx_count' => 0,
+                'gross_sales' => 0,
+                'marking_gross_sales' => 0,
+                'cash_sales' => 0,
+                'tax_total' => 0,
+            ];
+        }
+
+        foreach ($salesRows as $row) {
+            $gross = (int) ($row->grand_total ?? 0);
+            $tax = (int) ($row->tax_total ?? 0);
+            $marking = (int) ($row->marking ?? 0) === 1;
+            $cashAmount = (int) ($row->payment_cash_amount ?? 0);
+            if ((int) ($row->has_payment_rows ?? 0) <= 0 && $this->isCashPaymentLabel((string) ($row->payment_method_name ?? ''), (string) ($row->payment_method_type ?? ''))) {
+                $cashAmount = $gross;
+            }
+
+            $metrics['gross_sales'] += $gross;
+            $metrics['tax_total'] += $tax;
+            if ($marking) {
+                $metrics['marking_gross_sales'] += $gross;
+            }
+
+            $outletKey = (string) ($row->outlet_id ?? '');
+            if (! isset($outletAccumulator[$outletKey])) {
+                $outletAccumulator[$outletKey] = [
+                    'outlet_id' => $outletKey,
+                    'outlet_code' => (string) ($row->outlet_code ?? ''),
+                    'outlet_name' => (string) ($row->outlet_name ?? '-'),
+                    'trx_count' => 0,
+                    'gross_sales' => 0,
+                    'marking_gross_sales' => 0,
+                    'cash_sales' => 0,
+                    'tax_total' => 0,
+                ];
+            }
+            $outletAccumulator[$outletKey]['trx_count']++;
+            $outletAccumulator[$outletKey]['gross_sales'] += $gross;
+            $outletAccumulator[$outletKey]['tax_total'] += $tax;
+            if ($marking) {
+                $outletAccumulator[$outletKey]['marking_gross_sales'] += $gross;
+            }
+            if ($cashAmount > 0) {
+                $outletAccumulator[$outletKey]['cash_sales'] += $cashAmount;
+            }
+
+            $channelKey = (string) ($row->display_channel ?? $row->channel ?? '-');
+            $channelAccumulator[$channelKey] ??= [
+                'channel' => $channelKey,
+                'trx_count' => 0,
+                'gross_sales' => 0,
+            ];
+            $channelAccumulator[$channelKey]['trx_count']++;
+            $channelAccumulator[$channelKey]['gross_sales'] += $gross;
+
+        }
+
+        $outletSalesSummary = collect(array_values($outletAccumulator))
+            ->sortBy(fn (array $row) => mb_strtolower($row['outlet_name']))
+            ->values()
+            ->all();
+
+        $sortGrossThenLabel = function (array $left, array $right, string $labelKey): int {
+            return ($right['gross_sales'] <=> $left['gross_sales'])
+                ?: (($right['trx_count'] ?? 0) <=> ($left['trx_count'] ?? 0))
+                ?: strcmp((string) ($left[$labelKey] ?? ''), (string) ($right[$labelKey] ?? ''));
+        };
+
+        $byChannel = array_values($channelAccumulator);
+        usort($byChannel, fn (array $left, array $right) => $sortGrossThenLabel($left, $right, 'channel'));
+
+        $byPaymentMethod = array_values($paymentBreakdownRows);
+        usort($byPaymentMethod, fn (array $left, array $right) => $sortGrossThenLabel($left, $right, 'payment_method_name'));
+
+        $recentSales = $salesRows
+            ->sort(function ($left, $right) {
+                $createdCompare = strcmp((string) ($right->created_at ?? ''), (string) ($left->created_at ?? ''));
+                if ($createdCompare !== 0) {
+                    return $createdCompare;
+                }
+
+                return strcmp((string) ($right->sale_id ?? ''), (string) ($left->sale_id ?? ''));
+            })
+            ->take($recentLimit)
             ->map(fn ($row) => $this->mapSaleListRow($row))
             ->values()
             ->all();
 
-        $categoryBase = DB::table('sale_items as si')
+        $itemGroups = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->join('outlets as o', 'o.id', '=', 's.outlet_id')
+            ->join('report_sale_scope_cache as rssc_items', function ($join) use ($saleScope) {
+                $join->on('rssc_items.sale_id', '=', 's.id')
+                    ->where('rssc_items.scope_key', '=', (string) ($saleScope['scope_key'] ?? ''))
+                    ->where('rssc_items.expires_at', '>', now());
+            })
             ->leftJoin('products as p', 'p.id', '=', 'si.product_id')
             ->leftJoin('categories as c', 'c.id', '=', 'p.category_id')
             ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-        $this->applyOutletScope($categoryBase, $outletIds, 's');
-        $this->applyBusinessDateScope($categoryBase, $fromQuery, $toQuery, $params, $timezone, 's.sale_number', 's.created_at');
+            ->where('s.status', '=', 'PAID')
+            ->whereNull('si.voided_at');
 
-        $categorySummary = $categoryBase
-            ->selectRaw('p.category_id as category_id')
+        $this->applyOutletScope($itemGroups, $outletIds, 's');
+
+        $itemGroups = $itemGroups
             ->selectRaw("COALESCE(NULLIF(MAX(c.name), ''), 'Uncategorized') as category_name")
+            ->addSelect('si.product_name', 'si.variant_name')
             ->selectRaw('COALESCE(SUM(si.qty), 0) as qty_sold')
-            ->selectRaw('COALESCE(SUM(si.line_total), 0) as gross_sales')
-            ->groupBy('p.category_id')
-            ->orderByDesc('gross_sales')
-            ->orderBy('category_name')
-            ->get()
-            ->map(fn ($row) => [
-                'category_name' => (string) ($row->category_name ?? 'Uncategorized'),
-                'qty_sold' => (int) ($row->qty_sold ?? 0),
-                'gross_sales' => (int) ($row->gross_sales ?? 0),
-            ])
-            ->values()
-            ->all();
+            ->selectRaw('COALESCE(SUM(si.line_total), 0) as revenue')
+            ->groupBy('p.category_id', 'si.product_name', 'si.variant_name')
+            ->get();
+
+        $categoryAccumulator = [];
+        $productAccumulator = [];
+        $variantRows = [];
+
+        foreach ($itemGroups as $row) {
+            $categoryName = (string) ($row->category_name ?? 'Uncategorized');
+            $productName = (string) ($row->product_name ?? '-');
+            $variantName = (string) ($row->variant_name ?? '-');
+            $qtySold = (int) ($row->qty_sold ?? 0);
+            $revenue = (int) ($row->revenue ?? 0);
+
+            $variantRows[] = [
+                'product_name' => $productName,
+                'variant_name' => $variantName,
+                'qty_sold' => $qtySold,
+                'revenue' => $revenue,
+            ];
+
+            $categoryAccumulator[$categoryName] ??= [
+                'category_name' => $categoryName,
+                'qty_sold' => 0,
+                'gross_sales' => 0,
+            ];
+            $categoryAccumulator[$categoryName]['qty_sold'] += $qtySold;
+            $categoryAccumulator[$categoryName]['gross_sales'] += $revenue;
+
+            $productAccumulator[$productName] ??= [
+                'product_name' => $productName,
+                'qty_sold' => 0,
+                'revenue' => 0,
+            ];
+            $productAccumulator[$productName]['qty_sold'] += $qtySold;
+            $productAccumulator[$productName]['revenue'] += $revenue;
+        }
+
+        $categorySummary = array_values($categoryAccumulator);
+        usort($categorySummary, function (array $left, array $right) {
+            return ($right['gross_sales'] <=> $left['gross_sales'])
+                ?: (($right['qty_sold'] ?? 0) <=> ($left['qty_sold'] ?? 0))
+                ?: strcmp((string) ($left['category_name'] ?? ''), (string) ($right['category_name'] ?? ''));
+        });
+
+        usort($variantRows, function (array $left, array $right) {
+            return ($right['qty_sold'] <=> $left['qty_sold'])
+                ?: ($right['revenue'] <=> $left['revenue'])
+                ?: strcmp((string) ($left['product_name'] ?? ''), (string) ($right['product_name'] ?? ''))
+                ?: strcmp((string) ($left['variant_name'] ?? ''), (string) ($right['variant_name'] ?? ''));
+        });
+        $topVariants = array_slice($variantRows, 0, $topLimit);
+
+        $topProducts = array_values($productAccumulator);
+        usort($topProducts, function (array $left, array $right) {
+            return ($right['qty_sold'] <=> $left['qty_sold'])
+                ?: ($right['revenue'] <=> $left['revenue'])
+                ?: strcmp((string) ($left['product_name'] ?? ''), (string) ($right['product_name'] ?? ''));
+        });
+        $topProducts = array_slice($topProducts, 0, $topLimit);
 
         return [
             'filters' => [
@@ -313,10 +385,10 @@ class OwnerOverviewService
                 'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
             ],
             'metrics' => [
-                'gross_sales' => (int) ($metrics->gross_sales ?? 0),
-                'marking_gross_sales' => (int) ($metrics->marking_gross_sales ?? 0),
-                'cash_sales' => (int) ($metrics->cash_sales ?? 0),
-                'tax_total' => (int) ($metrics->tax_total ?? 0),
+                'gross_sales' => (int) ($metrics['gross_sales'] ?? 0),
+                'marking_gross_sales' => (int) ($metrics['marking_gross_sales'] ?? 0),
+                'cash_sales' => (int) ($metrics['cash_sales'] ?? 0),
+                'tax_total' => (int) ($metrics['tax_total'] ?? 0),
             ],
             'breakdowns' => [
                 'by_channel' => $byChannel,
@@ -340,6 +412,93 @@ class OwnerOverviewService
         ];
     }
 
+    private function emptyOverviewPayload(string $dateFrom, string $dateTo, array $outletFilter, string $timezone, array $allowedOutlets, int $recentLimit): array
+    {
+        $outletSalesSummary = collect($allowedOutlets)
+            ->map(fn (array $outlet) => [
+                'outlet_id' => (string) ($outlet['id'] ?? ''),
+                'outlet_code' => (string) ($outlet['code'] ?? ''),
+                'outlet_name' => (string) ($outlet['name'] ?? '-'),
+                'trx_count' => 0,
+                'gross_sales' => 0,
+                'marking_gross_sales' => 0,
+                'cash_sales' => 0,
+                'tax_total' => 0,
+            ])
+            ->sortBy(fn (array $row) => mb_strtolower($row['outlet_name']))
+            ->values()
+            ->all();
+
+        return [
+            'filters' => [
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+                'outlet_id' => (string) ($outletFilter['value'] ?? FinanceOutletFilter::FILTER_ALL),
+                'outlet_filter' => (string) ($outletFilter['value'] ?? FinanceOutletFilter::FILTER_ALL),
+            ],
+            'meta' => [
+                'timezone' => $timezone,
+                'outlet_scope_name' => (string) ($outletFilter['label'] ?? 'All Outlet'),
+                'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+            ],
+            'metrics' => [
+                'gross_sales' => 0,
+                'marking_gross_sales' => 0,
+                'cash_sales' => 0,
+                'tax_total' => 0,
+            ],
+            'breakdowns' => [
+                'by_channel' => [],
+                'by_payment_method' => [],
+            ],
+            'summaries' => [
+                'outlet_sales' => $outletSalesSummary,
+                'category_summary' => [],
+            ],
+            'top_items' => [
+                'variants' => [],
+                'products' => [],
+            ],
+            'recent_sales' => [
+                'items' => [],
+                'meta' => [
+                    'limit' => $recentLimit,
+                    'total' => 0,
+                ],
+            ],
+        ];
+    }
+
+
+    private function resolveEligibleSalesScope(array $outletIds, array $params, string $timezone): array
+    {
+        $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        sort($normalizedOutletIds);
+
+        if ($normalizedOutletIds === []) {
+            return [
+                'scope_key' => 'owner-overview:empty',
+                'has_rows' => false,
+            ];
+        }
+
+        return $this->reportSaleScopeCache->remember(
+            'owner-overview.sales-scope',
+            [
+                'outlets' => $normalizedOutletIds,
+                'date_from' => (string) ($params['date_from'] ?? ''),
+                'date_to' => (string) ($params['date_to'] ?? ''),
+                'timezone' => $timezone,
+            ],
+            fn () => $this->cashierAlignedSaleScope->eligibleSaleIds(
+                $normalizedOutletIds,
+                $params['date_from'] ?? null,
+                $params['date_to'] ?? null,
+                $timezone,
+            ),
+            20,
+        );
+    }
 
     /**
      * @return array<int, array{id:string,code:string,name:string,type:string,timezone:string}>
@@ -458,6 +617,126 @@ class OwnerOverviewService
         );
     }
 
+
+    private function resolvePaymentBreakdown(array $saleScope, array $outletIds): array
+    {
+        $scopeKey = (string) ($saleScope['scope_key'] ?? '');
+        if ($scopeKey === '' || ! ($saleScope['has_rows'] ?? false)) {
+            return [];
+        }
+
+        $normalizedPaymentRows = DB::table('sale_payments as sp')
+            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 'sp.sale_id'))
+            ->join('sales as s', 's.id', '=', 'sp.sale_id')
+            ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
+            ->whereNull('s.deleted_at')
+            ->where('s.status', '=', 'PAID')
+            ->when(! empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds))
+            ->selectRaw("COALESCE(NULLIF(TRIM(pm.name), ''), NULLIF(TRIM(s.payment_method_name), ''), '-') as payment_method_name")
+            ->selectRaw("COALESCE(NULLIF(TRIM(s.payment_method_type), ''), '') as payment_method_type")
+            ->selectRaw("CASE WHEN LOWER(TRIM(COALESCE(pm.name, ''))) IN ('cash', 'tunai') AND COALESCE(sp.amount, 0) > 0 THEN GREATEST(COALESCE(sp.amount, 0) - COALESCE(s.change_total, 0), 0) ELSE COALESCE(sp.amount, 0) END as gross_sales");
+
+        $paymentRows = DB::query()
+            ->fromSub($normalizedPaymentRows, 'payment_rows')
+            ->selectRaw('payment_method_name')
+            ->selectRaw('payment_method_type')
+            ->selectRaw('COUNT(*) as trx_count')
+            ->selectRaw('COALESCE(SUM(gross_sales), 0) as gross_sales')
+            ->groupBy('payment_method_name', 'payment_method_type')
+            ->get();
+
+        $normalizedFallbackRows = DB::table('sales as s')
+            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
+            ->whereNull('s.deleted_at')
+            ->where('s.status', '=', 'PAID')
+            ->when(! empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds))
+            ->whereNotExists(function ($exists) {
+                $exists->selectRaw('1')
+                    ->from('sale_payments as sp_check')
+                    ->whereColumn('sp_check.sale_id', 's.id');
+            })
+            ->selectRaw("COALESCE(NULLIF(TRIM(s.payment_method_name), ''), '-') as payment_method_name")
+            ->selectRaw("COALESCE(NULLIF(TRIM(s.payment_method_type), ''), '') as payment_method_type")
+            ->selectRaw('COALESCE(s.grand_total, 0) as gross_sales');
+
+        $fallbackRows = DB::query()
+            ->fromSub($normalizedFallbackRows, 'fallback_rows')
+            ->selectRaw('payment_method_name')
+            ->selectRaw('payment_method_type')
+            ->selectRaw('COUNT(*) as trx_count')
+            ->selectRaw('COALESCE(SUM(gross_sales), 0) as gross_sales')
+            ->groupBy('payment_method_name', 'payment_method_type')
+            ->get();
+
+        $rows = [];
+        foreach ($paymentRows->concat($fallbackRows) as $row) {
+            $key = mb_strtolower((string) ($row->payment_method_name ?? '-')) . '|' . mb_strtolower((string) ($row->payment_method_type ?? ''));
+            if (! isset($rows[$key])) {
+                $rows[$key] = [
+                    'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
+                    'payment_method_type' => (string) ($row->payment_method_type ?? ''),
+                    'trx_count' => 0,
+                    'gross_sales' => 0,
+                ];
+            }
+            $rows[$key]['trx_count'] += (int) ($row->trx_count ?? 0);
+            $rows[$key]['gross_sales'] += (int) ($row->gross_sales ?? 0);
+        }
+
+        return array_values($rows);
+    }
+
+    private function paymentSummarySubquery(string $scopeKey): Builder
+    {
+        return DB::table('sale_payments as sp')
+            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 'sp.sale_id'))
+            ->join('sales as s', 's.id', '=', 'sp.sale_id')
+            ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
+            ->selectRaw('sp.sale_id')
+            ->selectRaw("GROUP_CONCAT(DISTINCT NULLIF(TRIM(pm.name), '') ORDER BY pm.name SEPARATOR ', ') as payment_method_names")
+            ->selectRaw("GROUP_CONCAT(CONCAT(COALESCE(NULLIF(TRIM(pm.name), ''), NULLIF(TRIM(s.payment_method_name), ''), 'Payment'), CASE WHEN COALESCE(sp.amount, 0) > 0 THEN CONCAT(' (', sp.amount, ')') ELSE '' END) ORDER BY sp.created_at, sp.id SEPARATOR ', ') as payment_method_display")
+            ->selectRaw("COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(pm.name, ''))) IN ('cash', 'tunai') AND COALESCE(sp.amount, 0) > 0 THEN GREATEST(COALESCE(sp.amount, 0) - COALESCE(s.change_total, 0), 0) ELSE CASE WHEN LOWER(TRIM(COALESCE(pm.name, ''))) IN ('cash', 'tunai') THEN COALESCE(sp.amount, 0) ELSE 0 END END), 0) as cash_amount")
+            ->selectRaw('COUNT(*) as has_payment_rows')
+            ->groupBy('sp.sale_id');
+    }
+
+    private function channelMapSubquery(string $scopeKey): Builder
+    {
+        return DB::table('sales as s1')
+            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's1.id'))
+            ->leftJoinSub($this->saleItemChannelsSubquery($scopeKey), 'item_channels', fn ($join) => $join->on('item_channels.sale_id', '=', 's1.id'))
+            ->selectRaw('s1.id as sale_id')
+            ->selectRaw("CASE
+                WHEN UPPER(COALESCE(s1.channel, '')) = 'DELIVERY' AND NULLIF(TRIM(COALESCE(s1.online_order_source, '')), '') IS NOT NULL THEN LOWER(TRIM(s1.online_order_source))
+                WHEN UPPER(COALESCE(s1.channel, '')) = 'MIXED' AND NULLIF(TRIM(COALESCE(item_channels.channel_display, '')), '') IS NOT NULL THEN item_channels.channel_display
+                ELSE UPPER(COALESCE(s1.channel, ''))
+            END as display_channel");
+    }
+
+    private function saleItemChannelsSubquery(string $scopeKey): Builder
+    {
+        return DB::table('sale_items as si')
+            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 'si.sale_id'))
+            ->selectRaw('si.sale_id')
+            ->selectRaw("GROUP_CONCAT(DISTINCT si.channel ORDER BY FIELD(si.channel, 'DINE_IN', 'TAKEAWAY', 'DELIVERY'), si.channel SEPARATOR ' + ') as channel_display")
+            ->whereNull('si.voided_at')
+            ->groupBy('si.sale_id');
+    }
+
+    private function scopeSalesSubquery(string $scopeKey): Builder
+    {
+        return $this->reportSaleScopeCache->subquery($scopeKey);
+    }
+
+    private function isCashPaymentLabel(?string $name, ?string $type = null): bool
+    {
+        $normalizedName = mb_strtolower(trim((string) ($name ?? '')));
+        $normalizedType = mb_strtolower(trim((string) ($type ?? '')));
+
+        return in_array($normalizedName, ['cash', 'tunai'], true)
+            || in_array($normalizedType, ['cash', 'tunai'], true);
+    }
+
     private function mapSaleListRow(object $row): array
     {
         $timezone = (string) ($row->outlet_timezone ?? config('app.timezone', 'Asia/Jakarta'));
@@ -470,8 +749,8 @@ class OwnerOverviewService
             'outlet_code' => (string) ($row->outlet_code ?? ''),
             'outlet_name' => (string) ($row->outlet_name ?? ''),
             'outlet_timezone' => $timezone,
-            'channel' => (string) ($row->channel ?? '-'),
-            'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
+            'channel' => (string) ($row->display_channel ?? $row->channel ?? '-'),
+            'payment_method_name' => (string) ($row->payment_method_display ?? $row->payment_method_name ?? '-'),
             'payment_method_type' => (string) ($row->payment_method_type ?? ''),
             'subtotal' => (int) ($row->subtotal ?? 0),
             'discount_total' => (int) ($row->discount_total ?? 0),
@@ -485,7 +764,6 @@ class OwnerOverviewService
             'created_at_time' => $createdAtText ? substr($createdAtText, 11, 5) : '-',
         ];
 
-        $payload = DeliveryNoTaxReadModel::normalizeSaleArray($payload);
         $payload['total'] = (int) ($payload['grand_total'] ?? 0);
         $payload['paid'] = (int) ($payload['paid_total'] ?? 0);
         $payload['change'] = (int) ($payload['change_total'] ?? 0);
@@ -496,7 +774,19 @@ class OwnerOverviewService
     private function transformSaleDetail(Sale $sale): array
     {
         try {
-            return (new SaleDetailResource($sale))->toArray(request());
+            $payload = (new SaleDetailResource($sale))->toArray(request());
+
+            $payload['subtotal'] = (int) ($sale->subtotal ?? ($payload['subtotal'] ?? 0));
+            $payload['discount_total'] = (int) ($sale->discount_total ?? ($payload['discount_total'] ?? 0));
+            $payload['tax_total'] = (int) ($sale->tax_total ?? ($payload['tax_total'] ?? 0));
+            $payload['service_charge_total'] = (int) ($sale->service_charge_total ?? ($payload['service_charge_total'] ?? 0));
+            $payload['rounding_total'] = (int) ($sale->rounding_total ?? ($payload['rounding_total'] ?? 0));
+            $payload['grand_total'] = (int) ($sale->grand_total ?? ($payload['grand_total'] ?? 0));
+            $payload['paid_total'] = (int) ($sale->paid_total ?? ($payload['paid_total'] ?? 0));
+            $payload['change_total'] = (int) ($sale->change_total ?? ($payload['change_total'] ?? 0));
+            $payload['total_before_rounding'] = max(0, $payload['grand_total'] - $payload['rounding_total']);
+
+            return $payload;
         } catch (Throwable $e) {
             report($e);
 
@@ -628,8 +918,6 @@ class OwnerOverviewService
         if ($discountTotal <= 0) {
             $discountTotal = max(0, (int) ($sale['discount_amount'] ?? 0));
         }
-
-        $sale = DeliveryNoTaxReadModel::normalizeSaleArray($sale);
 
         $taxTotal = max(0, (int) ($sale['tax_total'] ?? 0));
         $taxPercent = max(0, (int) ($sale['tax_percent'] ?? 0));
