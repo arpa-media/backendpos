@@ -103,14 +103,14 @@ class ReportPortalController extends Controller
         return $this->okCached($request, 'report-portal.tax', $scope, fn () => $this->analyticsService->tax($scope, $request->validated()));
     }
 
-    public function saleDetail(Request $request, string $portalCode, string $saleId)
+    public function saleDetail(ReportPortalQueryRequest $request, string $portalCode, string $saleId)
     {
         $scope = $this->resolveScope($request, $portalCode);
         if ($scope['ok'] !== true) {
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        $payload = $this->analyticsService->saleDetail($scope, $saleId);
+        $payload = $this->analyticsService->saleDetail($scope, $saleId, $request->validated());
         if (($payload['ok'] ?? false) !== true) {
             return ApiResponse::error($payload['message'], $payload['error_code'], $payload['status']);
         }

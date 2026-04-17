@@ -220,7 +220,10 @@ Route::prefix('v1')->group(function () {
             Route::get('/ledger', [ReportController::class, 'ledger']);
             Route::get('/marking', [ReportController::class, 'marking']);
             Route::get('/marking/config', [ReportController::class, 'markingConfig']);
+            Route::get('/marking/configs', [ReportController::class, 'markingConfigs']);
+            Route::get('/marking/config/{outletId}', [ReportController::class, 'markingConfigByOutlet']);
             Route::post('/marking/config', [ReportController::class, 'updateMarkingConfig']);
+            Route::post('/marking/config/{outletId}', [ReportController::class, 'updateMarkingConfigByOutlet']);
             Route::post('/marking/apply-existing', [ReportController::class, 'applyExistingMarking']);
             Route::post('/marking/remove-all', [ReportController::class, 'removeAllMarking']);
             Route::post('/marking/{saleId}/toggle', [ReportController::class, 'toggleMarking']);
@@ -264,6 +267,7 @@ Route::put('/outlet', [OutletController::class, 'update'])
                 Route::put('/roles/{id}', [UserManagementController::class, 'updateRole']);
                 Route::post('/levels', [UserManagementController::class, 'storeLevel']);
                 Route::put('/levels/{id}', [UserManagementController::class, 'updateLevel']);
+                Route::post('/users', [UserManagementController::class, 'storeUser']);
                 Route::put('/users/{userId}/access', [UserManagementController::class, 'updateUserAccess']);
                 Route::put('/users/{userId}/profile', [UserManagementController::class, 'updateUserProfile']);
                 Route::put('/users/{userId}/provision-control', [UserManagementController::class, 'updateUserProvisionControl']);

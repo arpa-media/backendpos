@@ -176,103 +176,105 @@ class ReportService
         $page = (int) ($params['page'] ?? 1);
 
         $pmSub = $this->salePaymentMethodSubquery();
+        $scopeOutletIds = $this->resolveReportScopeOutletIds($params, $outletId);
+        $scopeTimezone = $this->resolveReportScopeTimezone($params, $outletId);
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scopeOutletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
 
         $q = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
-            ->where('s.status', '=', 'PAID');
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
-        $this->applyDateRange($q, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
+        $this->applyBusinessDateScope($q, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
 
-        if (!empty($outletId)) {
-            $q->where('s.outlet_id', '=', $outletId);
+        if (!empty($scopeOutletIds)) {
+            $q->whereIn('s.outlet_id', $scopeOutletIds);
         }
-
         if ($markedOnly) {
             $q->where('s.marking', '=', 1);
         }
-
         if (!empty($params['payment_method_name'])) {
             $q->where('spm.payment_method_name', '=', $params['payment_method_name']);
         }
-
         if (!empty($params['channel'])) {
             $q->where('s.channel', '=', $params['channel']);
+        }
+        if (!empty($params['sale_number'])) {
+            $q->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
         }
 
         $q->select([
             's.id as sale_id',
+            'o.id as outlet_id',
             'o.code as outlet_code',
+            'o.name as outlet_name',
+            'o.timezone as outlet_timezone',
             's.sale_number',
-            'si.product_name as item',
-            'si.variant_name as variant',
-            'si.qty',
-            DB::raw("'-' as unit"),
-            'si.unit_price',
             's.channel',
-            DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
-            DB::raw('COALESCE(si.line_total, 0) as total'),
-            DB::raw('COALESCE(s.marking, 1) as marking'),
+            DB::raw("COALESCE(spm.payment_method_name, COALESCE(s.payment_method_name, '-')) as payment_method_name"),
+            's.subtotal',
+            's.discount_total',
+            's.service_charge_total',
+            's.grand_total',
+            's.paid_total',
+            's.change_total',
+            's.marking',
             's.created_at',
-        ]);
-
-        $q->orderByDesc('s.created_at')->orderByDesc('s.id');
+        ])
+        ->selectRaw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total')
+        ->orderByDesc('s.created_at')
+        ->orderByDesc('s.id');
 
         $paginator = $this->paginate($q, $perPage, $page);
 
         $items = collect($paginator->items())->map(function ($r) {
-            $payload = [
+            $dateText = TransactionDate::formatSaleLocal($r->created_at, $r->outlet_timezone, isset($r->sale_number) ? (string) $r->sale_number : null);
+            return [
                 'sale_id' => (string) $r->sale_id,
+                'outlet_id' => (string) ($r->outlet_id ?? ''),
                 'outlet_code' => (string) ($r->outlet_code ?? ''),
-                'sale_number' => (string) $r->sale_number,
-                'item' => (string) ($r->item ?? ''),
-                'variant' => (string) ($r->variant ?? ''),
-                'qty' => (int) ($r->qty ?? 0),
-                'unit' => (string) ($r->unit ?? '-'),
-                'unit_price' => (int) ($r->unit_price ?? 0),
+                'outlet_name' => (string) ($r->outlet_name ?? ''),
+                'sale_number' => (string) ($r->sale_number ?? ''),
                 'channel' => (string) ($r->channel ?? ''),
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
                 'marking' => (int) ($r->marking ?? 1),
-                'created_at' => $this->formatCreatedAt($r->created_at, null, isset($r->sale_number) ? (string) $r->sale_number : null),
+                'date' => TransactionDate::formatSaleLocal($r->created_at, $r->outlet_timezone, isset($r->sale_number) ? (string) $r->sale_number : null, 'Y-m-d'),
+                'time' => TransactionDate::formatSaleLocal($r->created_at, $r->outlet_timezone, isset($r->sale_number) ? (string) $r->sale_number : null, 'H:i:s'),
+                'created_at' => $dateText,
             ];
         })->values()->all();
 
-        $saleSummaryQ = DB::table('sales as s')
+        $salesSummary = DB::table('sales as s')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
-            ->where('s.status', '=', 'PAID');
-
-        $this->applyDateRange($saleSummaryQ, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
-
-        if (!empty($outletId)) $saleSummaryQ->where('s.outlet_id', '=', $outletId);
-        if ($markedOnly) $saleSummaryQ->where('s.marking', '=', 1);
-        if (!empty($params['payment_method_name'])) $saleSummaryQ->where('spm.payment_method_name', '=', $params['payment_method_name']);
-        if (!empty($params['channel'])) $saleSummaryQ->where('s.channel', '=', $params['channel']);
-
-        $salesSummary = $saleSummaryQ->selectRaw('
-            COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '),0) as grand_total,
-            COUNT(DISTINCT s.id) as transaction_count
-        ')->first();
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+        $this->applyBusinessDateScope($salesSummary, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        if (!empty($scopeOutletIds)) $salesSummary->whereIn('s.outlet_id', $scopeOutletIds);
+        if ($markedOnly) $salesSummary->where('s.marking', '=', 1);
+        if (!empty($params['payment_method_name'])) $salesSummary->where('spm.payment_method_name', '=', $params['payment_method_name']);
+        if (!empty($params['channel'])) $salesSummary->where('s.channel', '=', $params['channel']);
+        if (!empty($params['sale_number'])) $salesSummary->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
+        $salesSummary = $salesSummary->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '),0) as grand_total, COUNT(DISTINCT s.id) as transaction_count')->first();
 
         $itemSummaryQ = DB::table('sales as s')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
-            ->where('s.status', '=', 'PAID');
-
-        $this->applyDateRange($itemSummaryQ, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null);
-
-        if (!empty($outletId)) $itemSummaryQ->where('s.outlet_id', '=', $outletId);
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+        $this->applyBusinessDateScope($itemSummaryQ, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        if (!empty($scopeOutletIds)) $itemSummaryQ->whereIn('s.outlet_id', $scopeOutletIds);
         if ($markedOnly) $itemSummaryQ->where('s.marking', '=', 1);
         if (!empty($params['payment_method_name'])) $itemSummaryQ->where('spm.payment_method_name', '=', $params['payment_method_name']);
         if (!empty($params['channel'])) $itemSummaryQ->where('s.channel', '=', $params['channel']);
-
+        if (!empty($params['sale_number'])) $itemSummaryQ->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
         $itemSummary = $itemSummaryQ->selectRaw('COALESCE(SUM(si.qty),0) as items_sold')->first();
 
         return [
@@ -291,6 +293,8 @@ class ReportService
                 'per_page' => $paginator->perPage(),
                 'last_page' => $paginator->lastPage(),
                 'total' => $paginator->total(),
+                'timezone' => $scopeTimezone,
+                'outlet_scope_name' => (string) ($params['outlet_scope_name'] ?? 'All Outlet'),
             ],
         ];
     }
@@ -570,17 +574,11 @@ class ReportService
             ->where('s.status', '=', 'PAID')
             ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
 
-        if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
-
-        if (!empty($params['sale_number'])) {
-            $q->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
-        }
-        if (!empty($params['channel'])) {
-            $q->where('s.channel', '=', $params['channel']);
-        }
-        if (!empty($params['payment_method_name'])) {
-            $q->where('spm.payment_method_name', '=', $params['payment_method_name']);
-        }
+        $this->applyBusinessDateScope($q, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        if (!empty($scopeOutletIds)) $q->whereIn('s.outlet_id', $scopeOutletIds);
+        if (!empty($params['sale_number'])) $q->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
+        if (!empty($params['channel'])) $q->where('s.channel', '=', $params['channel']);
+        if (!empty($params['payment_method_name'])) $q->where('spm.payment_method_name', '=', $params['payment_method_name']);
 
         $q->select([
             's.id as sale_id',
@@ -595,7 +593,7 @@ class ReportService
 
         $p = $this->paginate($q, $perPage, $page);
 
-        $items = collect($p->items())->map(function ($r) {
+        $items = collect($p->items())->map(function ($r) use ($scopeTimezone) {
             return [
                 'sale_id' => (string) $r->sale_id,
                 'sale_number' => (string) $r->sale_number,
@@ -603,14 +601,39 @@ class ReportService
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
                 'tax' => (int) ($r->tax ?? 0),
-                'created_at' => $this->formatCreatedAt($r->created_at, null, isset($r->sale_number) ? (string) $r->sale_number : null),
+                'created_at' => $this->formatCreatedAt($r->created_at, $scopeTimezone, isset($r->sale_number) ? (string) $r->sale_number : null),
             ];
         })->values()->all();
 
+        $summaryQ = DB::table('sales as s')
+            ->leftJoinSub($pmSub, 'spm', function ($join) {
+                $join->on('spm.sale_id', '=', 's.id');
+            })
+            ->where('s.status', '=', 'PAID')
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+        $this->applyBusinessDateScope($summaryQ, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        if (!empty($scopeOutletIds)) $summaryQ->whereIn('s.outlet_id', $scopeOutletIds);
+        if (!empty($params['sale_number'])) $summaryQ->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
+        if (!empty($params['channel'])) $summaryQ->where('s.channel', '=', $params['channel']);
+        if (!empty($params['payment_method_name'])) $summaryQ->where('spm.payment_method_name', '=', $params['payment_method_name']);
+        $summary = $summaryQ->selectRaw('COUNT(DISTINCT s.id) as transaction_count, COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '),0) as grand_total, COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '),0) as tax_total')->first();
+
         return [
             'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
+            'summary' => [
+                'transaction_count' => (int) ($summary->transaction_count ?? 0),
+                'grand_total' => (int) ($summary->grand_total ?? 0),
+                'tax_total' => (int) ($summary->tax_total ?? 0),
+            ],
             'data' => $items,
-            'meta' => ['current_page' => $p->currentPage(), 'per_page' => $p->perPage(), 'last_page' => $p->lastPage(), 'total' => $p->total()],
+            'meta' => [
+                'current_page' => $p->currentPage(),
+                'per_page' => $p->perPage(),
+                'last_page' => $p->lastPage(),
+                'total' => $p->total(),
+                'timezone' => $scopeTimezone,
+                'outlet_scope_name' => (string) ($params['outlet_scope_name'] ?? 'All Outlet'),
+            ],
         ];
     }
 

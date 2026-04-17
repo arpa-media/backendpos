@@ -401,6 +401,74 @@ class UserManagementService
     }
 
 
+    public function createUser(User $actor, array $payload): array
+    {
+        return DB::transaction(function () use ($actor, $payload) {
+            $subject = User::query()->create([
+                'name' => trim((string) ($payload['name'] ?? '')),
+                'email' => strtolower(trim((string) ($payload['email'] ?? ''))),
+                'username' => trim((string) ($payload['username'] ?? '')),
+                'nisj' => $this->nullableString($payload['nisj'] ?? null),
+                'outlet_id' => $this->nullableString($payload['outlet_id'] ?? null),
+                'password' => (string) ($payload['password'] ?? ''),
+                'is_active' => (bool) ($payload['is_active'] ?? true),
+            ]);
+
+            $employee = null;
+            $assignmentTitle = $this->nullableString($payload['assignment_role_title'] ?? null);
+            $targetOutletId = $this->nullableString($payload['outlet_id'] ?? null);
+            $targetNisj = $this->nullableString($payload['nisj'] ?? null);
+            $needsEmployee = $assignmentTitle !== null || $targetOutletId !== null || $targetNisj !== null;
+
+            if ($needsEmployee) {
+                $employee = Employee::query()->create([
+                    'user_id' => $subject->id,
+                    'assignment_id' => null,
+                    'nisj' => $targetNisj,
+                    'full_name' => $subject->name,
+                    'nickname' => $subject->name,
+                    'employment_status' => 'manual',
+                ]);
+            }
+
+            if ($employee && ($assignmentTitle !== null || $targetOutletId !== null)) {
+                $assignment = Assignment::query()->create([
+                    'employee_id' => $employee->id,
+                    'outlet_id' => $targetOutletId,
+                    'role_title' => $assignmentTitle,
+                    'is_primary' => true,
+                    'status' => 'manual',
+                ]);
+                $employee->assignment_id = $assignment->id;
+                $employee->save();
+            }
+
+            $this->ensureAccessAssignment($subject);
+            $sync = $this->updateUserAssignment(
+                $actor,
+                $subject,
+                (string) ($payload['access_role_id'] ?? ''),
+                $this->nullableString($payload['access_level_id'] ?? null),
+            );
+
+            $subject->refresh()->loadMissing([
+                'employee.assignment.outlet',
+                'outlet',
+                'roles',
+                'accessAssignment.role.userType',
+                'accessAssignment.level',
+            ]);
+
+            return [
+                'user' => $subject,
+                'subject_access' => $sync['access'] ?? null,
+                'subject_permissions' => $sync['permissions'] ?? [],
+                'current_actor_session' => $this->currentSessionSnapshot($actor),
+            ];
+        });
+    }
+
+
     public function updateUserProfile(User $actor, User $subject, array $payload): array
     {
         return DB::transaction(function () use ($actor, $subject, $payload) {

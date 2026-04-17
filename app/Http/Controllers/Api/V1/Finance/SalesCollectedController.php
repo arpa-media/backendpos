@@ -12,6 +12,7 @@ use App\Support\FinanceOutletFilter;
 use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
+use Throwable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 
@@ -37,7 +38,7 @@ class SalesCollectedController extends Controller
         $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
 
         $sale = Sale::query()
-            ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer'])
+            ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer', 'cancelRequests'])
             ->where('id', $saleId)
             ->whereNull('deleted_at')
             ->where('status', 'PAID')
@@ -50,7 +51,7 @@ class SalesCollectedController extends Controller
         }
 
         return ApiResponse::ok([
-            'sale' => (new SaleDetailResource($sale))->toArray($request),
+            'sale' => $this->transformSaleDetail($sale, $request),
             'meta' => [
                 'outlet_scope_id' => $outletFilter['value'],
                 'outlet_scope_name' => $outletFilter['label'],
@@ -59,6 +60,116 @@ class SalesCollectedController extends Controller
                 'timezone' => $timezone,
             ],
         ], 'OK');
+    }
+
+    private function transformSaleDetail(Sale $sale, $request): array
+    {
+        try {
+            return (new SaleDetailResource($sale))->toArray($request);
+        } catch (Throwable $e) {
+            report($e);
+
+            $payload = [
+                'id' => (string) $sale->id,
+                'outlet_id' => (string) $sale->outlet_id,
+                'sale_number' => (string) ($sale->sale_number ?? ''),
+                'queue_no' => $sale->queue_no ? (string) $sale->queue_no : null,
+                'channel' => (string) ($sale->channel ?? '-'),
+                'online_order_source' => $sale->online_order_source ? (string) $sale->online_order_source : null,
+                'status' => (string) ($sale->status ?? '-'),
+                'bill_name' => (string) ($sale->bill_name ?? ''),
+                'is_member_customer' => false,
+                'print_customer_name' => $sale->bill_name ?: optional($sale->customer)->name ?: null,
+                'customer_id' => $sale->customer_id ? (string) $sale->customer_id : null,
+                'table_chamber' => $sale->table_chamber ? (string) $sale->table_chamber : null,
+                'table_number' => $sale->table_number ? (string) $sale->table_number : null,
+                'customer' => $sale->relationLoaded('customer') && $sale->customer ? [
+                    'id' => (string) $sale->customer->id,
+                    'outlet_id' => (string) $sale->customer->outlet_id,
+                    'name' => (string) ($sale->customer->name ?? ''),
+                    'phone' => (string) ($sale->customer->phone ?? ''),
+                ] : null,
+                'cashier_id' => (string) ($sale->cashier_id ?? ''),
+                'cashier_name' => (string) ($sale->cashier_name ?? ''),
+                'outlet_name' => (string) optional($sale->outlet)->name,
+                'outlet_name_snapshot' => (string) (optional($sale->outlet)->name ?? ''),
+                'outlet_address' => (string) optional($sale->outlet)->address,
+                'outlet' => $sale->relationLoaded('outlet') && $sale->outlet ? [
+                    'id' => (string) $sale->outlet->id,
+                    'name' => (string) ($sale->outlet->name ?? ''),
+                    'address' => (string) ($sale->outlet->address ?? ''),
+                    'timezone' => (string) ($sale->outlet->timezone ?? config('app.timezone', 'Asia/Jakarta')),
+                ] : null,
+                'payment_method_name' => (string) ($sale->payment_method_name ?? '-'),
+                'payment_method_type' => (string) ($sale->payment_method_type ?? ''),
+                'subtotal' => (int) ($sale->subtotal ?? 0),
+                'discount_type' => (string) ($sale->discount_type ?? 'NONE'),
+                'discount_value' => (int) ($sale->discount_value ?? 0),
+                'discount_amount' => (int) ($sale->discount_amount ?? 0),
+                'discount_reason' => $sale->discount_reason,
+                'discount_total' => (int) ($sale->discount_total ?? 0),
+                'tax_id' => $sale->tax_id ? (string) $sale->tax_id : null,
+                'tax_name' => (string) ($sale->tax_name_snapshot ?? 'Tax'),
+                'tax_percent' => (int) ($sale->tax_percent_snapshot ?? 0),
+                'tax_total' => (int) ($sale->tax_total ?? 0),
+                'service_charge_total' => (int) ($sale->service_charge_total ?? 0),
+                'total_before_rounding' => max(0, (int) ($sale->grand_total ?? 0) - (int) ($sale->rounding_total ?? 0)),
+                'rounding_total' => (int) ($sale->rounding_total ?? 0),
+                'grand_total' => (int) ($sale->grand_total ?? 0),
+                'paid_total' => (int) ($sale->paid_total ?? 0),
+                'change_total' => (int) ($sale->change_total ?? 0),
+                'marking' => (int) ($sale->marking ?? 1),
+                'note' => $sale->note,
+                'items' => $sale->relationLoaded('items') ? $sale->items->map(function ($item) {
+                    return [
+                        'id' => (string) $item->id,
+                        'channel' => (string) ($item->channel ?? ''),
+                        'product_id' => (string) ($item->product_id ?? ''),
+                        'variant_id' => (string) ($item->variant_id ?? ''),
+                        'product_name' => (string) ($item->product_name ?? ''),
+                        'variant_name' => (string) ($item->variant_name ?? ''),
+                        'category_kind' => (string) ($item->category_kind_snapshot ?? 'OTHER'),
+                        'category_name' => (string) optional(optional($item->product)->category)->name,
+                        'category_slug' => (string) optional(optional($item->product)->category)->slug,
+                        'qty' => (int) ($item->qty ?? 0),
+                        'unit_price' => (int) ($item->unit_price ?? 0),
+                        'line_total' => (int) ($item->line_total ?? 0),
+                        'is_voided' => !is_null($item->voided_at),
+                        'voided_at' => optional($item->voided_at)->toISOString(),
+                        'voided_by_user_id' => $item->voided_by_user_id ? (string) $item->voided_by_user_id : null,
+                        'voided_by_name' => $item->voided_by_name ?: null,
+                        'void_reason' => $item->void_reason ?: null,
+                        'original_unit_price_before_void' => (int) ($item->original_unit_price_before_void ?? 0),
+                        'original_line_total_before_void' => (int) ($item->original_line_total_before_void ?? 0),
+                        'note' => $item->note ?? null,
+                        'addons' => $item->relationLoaded('addons') ? $item->addons->map(fn ($addon) => [
+                            'id' => (string) $addon->id,
+                            'addon_id' => $addon->addon_id ? (string) $addon->addon_id : null,
+                            'addon_name' => (string) ($addon->addon_name ?? ''),
+                            'qty_per_item' => (int) ($addon->qty_per_item ?? 0),
+                            'unit_price' => (int) ($addon->unit_price ?? 0),
+                            'line_total' => (int) ($addon->line_total ?? 0),
+                        ])->values()->all() : [],
+                    ];
+                })->values()->all() : [],
+                'payments' => $sale->relationLoaded('payments') ? $sale->payments->map(fn ($payment) => [
+                    'id' => (string) $payment->id,
+                    'payment_method_id' => (string) ($payment->payment_method_id ?? ''),
+                    'amount' => (int) ($payment->amount ?? 0),
+                    'reference' => $payment->reference,
+                    'created_at' => optional($payment->created_at)->toISOString(),
+                    'updated_at' => optional($payment->updated_at)->toISOString(),
+                ])->values()->all() : [],
+                'latest_request_type' => null,
+                'cancel_requests' => [],
+                'created_at' => TransactionDate::toSaleIso(method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('created_at') : $sale->created_at, optional($sale->outlet)->timezone, (string) ($sale->sale_number ?? '')),
+                'updated_at' => TransactionDate::toSaleIso(method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('updated_at') : $sale->updated_at, optional($sale->outlet)->timezone, (string) ($sale->sale_number ?? '')),
+                'created_at_text' => TransactionDate::formatSaleLocal(method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('created_at') : $sale->created_at, optional($sale->outlet)->timezone, (string) ($sale->sale_number ?? '')),
+                'updated_at_text' => TransactionDate::formatSaleLocal(method_exists($sale, 'getRawOriginal') ? $sale->getRawOriginal('updated_at') : $sale->updated_at, optional($sale->outlet)->timezone, (string) ($sale->sale_number ?? '')),
+            ];
+
+            return DeliveryNoTaxReadModel::normalizeSaleArray($payload);
+        }
     }
 
     public function index(ListSalesCollectedRequest $request)

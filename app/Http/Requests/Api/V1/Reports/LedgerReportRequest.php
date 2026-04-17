@@ -9,6 +9,7 @@ class LedgerReportRequest extends ReportRangeRequest
         return array_merge(parent::rules(), [
             'payment_method_name' => ['nullable', 'string', 'max:120'],
             'channel' => ['nullable', 'string', 'max:50'],
+            'sale_number' => ['nullable', 'string', 'max:50'],
         ]);
     }
 }

@@ -11,6 +11,7 @@ use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 class OwnerOverviewService
 {
@@ -41,7 +42,7 @@ class OwnerOverviewService
         $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scope['allowed_outlet_ids'], $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone);
 
         $sale = Sale::query()
-            ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer'])
+            ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer', 'cancelRequests'])
             ->where('id', $saleId)
             ->whereNull('deleted_at')
             ->where('status', '=', 'PAID')
@@ -67,7 +68,7 @@ class OwnerOverviewService
         return [
             'ok' => true,
             'scope' => $scope,
-            'sale' => $this->normalizeSaleDetailPayload((new SaleDetailResource($sale))->toArray(request())),
+            'sale' => $this->normalizeSaleDetailPayload($this->transformSaleDetail($sale)),
         ];
     }
 
@@ -252,7 +253,10 @@ class OwnerOverviewService
                 's.channel',
                 's.payment_method_name',
                 's.payment_method_type',
-                's.grand_total',
+                's.subtotal',
+                's.discount_total',
+                's.service_charge_total',
+                DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as grand_total'),
                 's.paid_total',
                 's.change_total',
                 's.marking',
@@ -459,7 +463,7 @@ class OwnerOverviewService
         $timezone = (string) ($row->outlet_timezone ?? config('app.timezone', 'Asia/Jakarta'));
         $createdAtText = TransactionDate::formatSaleLocal($row->created_at ?? null, $timezone, (string) ($row->sale_number ?? ''));
 
-        return [
+        $payload = [
             'sale_id' => (string) ($row->sale_id ?? ''),
             'outlet_id' => (string) ($row->outlet_id ?? ''),
             'sale_number' => (string) ($row->sale_number ?? ''),
@@ -469,14 +473,141 @@ class OwnerOverviewService
             'channel' => (string) ($row->channel ?? '-'),
             'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
             'payment_method_type' => (string) ($row->payment_method_type ?? ''),
-            'total' => (int) ($row->grand_total ?? 0),
-            'paid' => (int) ($row->paid_total ?? 0),
-            'change' => (int) ($row->change_total ?? 0),
+            'subtotal' => (int) ($row->subtotal ?? 0),
+            'discount_total' => (int) ($row->discount_total ?? 0),
+            'service_charge_total' => (int) ($row->service_charge_total ?? 0),
+            'grand_total' => (int) ($row->grand_total ?? 0),
+            'paid_total' => (int) ($row->paid_total ?? 0),
+            'change_total' => (int) ($row->change_total ?? 0),
             'marking' => (int) ($row->marking ?? 0),
             'created_at' => TransactionDate::toSaleIso($row->created_at ?? null, $timezone, (string) ($row->sale_number ?? '')),
             'created_at_text' => $createdAtText,
             'created_at_time' => $createdAtText ? substr($createdAtText, 11, 5) : '-',
         ];
+
+        $payload = DeliveryNoTaxReadModel::normalizeSaleArray($payload);
+        $payload['total'] = (int) ($payload['grand_total'] ?? 0);
+        $payload['paid'] = (int) ($payload['paid_total'] ?? 0);
+        $payload['change'] = (int) ($payload['change_total'] ?? 0);
+
+        return $payload;
+    }
+
+    private function transformSaleDetail(Sale $sale): array
+    {
+        try {
+            return (new SaleDetailResource($sale))->toArray(request());
+        } catch (Throwable $e) {
+            report($e);
+
+            $payload = [
+                'id' => (string) $sale->id,
+                'outlet_id' => (string) $sale->outlet_id,
+                'sale_number' => (string) ($sale->sale_number ?? ''),
+                'queue_no' => $sale->queue_no ? (string) $sale->queue_no : null,
+                'channel' => (string) ($sale->channel ?? '-'),
+                'online_order_source' => $sale->online_order_source ? (string) $sale->online_order_source : null,
+                'status' => (string) ($sale->status ?? '-'),
+                'bill_name' => (string) ($sale->bill_name ?? ''),
+                'is_member_customer' => false,
+                'print_customer_name' => $sale->bill_name ?: optional($sale->customer)->name ?: null,
+                'customer_id' => $sale->customer_id ? (string) $sale->customer_id : null,
+                'table_chamber' => $sale->table_chamber ? (string) $sale->table_chamber : null,
+                'table_number' => $sale->table_number ? (string) $sale->table_number : null,
+                'customer' => $sale->relationLoaded('customer') && $sale->customer ? [
+                    'id' => (string) $sale->customer->id,
+                    'outlet_id' => (string) ($sale->customer->outlet_id ?? ''),
+                    'name' => (string) ($sale->customer->name ?? ''),
+                    'phone' => (string) ($sale->customer->phone ?? ''),
+                ] : null,
+                'cashier_id' => (string) ($sale->cashier_id ?? ''),
+                'cashier_name' => (string) ($sale->cashier_name ?? ''),
+                'outlet_name' => (string) optional($sale->outlet)->name,
+                'outlet_name_snapshot' => (string) (optional($sale->outlet)->name ?? ''),
+                'outlet_address' => (string) optional($sale->outlet)->address,
+                'outlet' => $sale->relationLoaded('outlet') && $sale->outlet ? [
+                    'id' => (string) $sale->outlet->id,
+                    'name' => (string) ($sale->outlet->name ?? ''),
+                    'address' => (string) ($sale->outlet->address ?? ''),
+                    'timezone' => (string) ($sale->outlet->timezone ?? config('app.timezone', 'Asia/Jakarta')),
+                ] : null,
+                'payment_method_name' => (string) ($sale->payment_method_name ?? '-'),
+                'payment_method_type' => (string) ($sale->payment_method_type ?? ''),
+                'subtotal' => (int) ($sale->subtotal ?? 0),
+                'discount_type' => (string) ($sale->discount_type ?? 'NONE'),
+                'discount_value' => (int) ($sale->discount_value ?? 0),
+                'discount_amount' => (int) ($sale->discount_amount ?? 0),
+                'discount_reason' => $sale->discount_reason,
+                'discount_total' => (int) ($sale->discount_total ?? 0),
+                'tax_id' => $sale->tax_id ? (string) $sale->tax_id : null,
+                'tax_name' => (string) ($sale->tax_name_snapshot ?? 'Tax'),
+                'tax_percent' => (int) ($sale->tax_percent_snapshot ?? 0),
+                'tax_total' => (int) ($sale->tax_total ?? 0),
+                'service_charge_total' => (int) ($sale->service_charge_total ?? 0),
+                'total_before_rounding' => max(0, (int) ($sale->grand_total ?? 0) - (int) ($sale->rounding_total ?? 0)),
+                'rounding_total' => (int) ($sale->rounding_total ?? 0),
+                'grand_total' => (int) ($sale->grand_total ?? 0),
+                'paid_total' => (int) ($sale->paid_total ?? 0),
+                'change_total' => (int) ($sale->change_total ?? 0),
+                'marking' => (int) ($sale->marking ?? 1),
+                'note' => $sale->note,
+                'items' => $sale->relationLoaded('items') ? $sale->items->map(function ($item) {
+                    return [
+                        'id' => (string) $item->id,
+                        'channel' => (string) ($item->channel ?? ''),
+                        'product_id' => (string) ($item->product_id ?? ''),
+                        'variant_id' => (string) ($item->variant_id ?? ''),
+                        'product_name' => (string) ($item->product_name ?? ''),
+                        'variant_name' => (string) ($item->variant_name ?? ''),
+                        'category_kind' => (string) ($item->category_kind_snapshot ?? 'OTHER'),
+                        'category_name' => (string) optional(optional($item->product)->category)->name,
+                        'category_slug' => (string) optional(optional($item->product)->category)->slug,
+                        'qty' => (int) ($item->qty ?? 0),
+                        'unit_price' => (int) ($item->unit_price ?? 0),
+                        'line_total' => (int) ($item->line_total ?? 0),
+                        'is_voided' => !is_null($item->voided_at),
+                        'voided_at' => optional($item->voided_at)->toISOString(),
+                        'voided_by_user_id' => $item->voided_by_user_id ? (string) $item->voided_by_user_id : null,
+                        'voided_by_name' => $item->voided_by_name ?: null,
+                        'void_reason' => $item->void_reason ?: null,
+                        'original_unit_price_before_void' => (int) ($item->original_unit_price_before_void ?? 0),
+                        'original_line_total_before_void' => (int) ($item->original_line_total_before_void ?? 0),
+                        'note' => $item->note ?? null,
+                        'addons' => $item->relationLoaded('addons') ? $item->addons->map(fn ($addon) => [
+                            'id' => (string) $addon->id,
+                            'addon_id' => $addon->addon_id ? (string) $addon->addon_id : null,
+                            'addon_name' => (string) ($addon->addon_name ?? ''),
+                            'qty_per_item' => (int) ($addon->qty_per_item ?? 0),
+                            'unit_price' => (int) ($addon->unit_price ?? 0),
+                            'line_total' => (int) ($addon->line_total ?? 0),
+                        ])->values()->all() : [],
+                    ];
+                })->values()->all() : [],
+                'payments' => $sale->relationLoaded('payments') ? $sale->payments->map(fn ($payment) => [
+                    'id' => (string) $payment->id,
+                    'payment_method_id' => $payment->payment_method_id ? (string) $payment->payment_method_id : null,
+                    'payment_method_name' => (string) ($payment->payment_method_name ?? ''),
+                    'payment_method_type' => (string) ($payment->payment_method_type ?? ''),
+                    'amount' => (int) ($payment->amount ?? 0),
+                    'paid_at' => optional($payment->paid_at)->toISOString(),
+                    'reference_no' => $payment->reference_no ?: null,
+                    'meta' => $payment->meta,
+                ])->values()->all() : [],
+                'cancel_requests' => $sale->relationLoaded('cancelRequests') ? $sale->cancelRequests->map(fn ($request) => [
+                    'id' => (string) $request->id,
+                    'status' => (string) ($request->status ?? ''),
+                    'reason' => $request->reason,
+                    'requested_by' => $request->requested_by ? (string) $request->requested_by : null,
+                    'approved_by' => $request->approved_by ? (string) $request->approved_by : null,
+                    'created_at' => optional($request->created_at)->toISOString(),
+                    'updated_at' => optional($request->updated_at)->toISOString(),
+                ])->values()->all() : [],
+                'created_at' => optional($sale->created_at)->toISOString(),
+                'updated_at' => optional($sale->updated_at)->toISOString(),
+            ];
+
+            return $payload;
+        }
     }
 
     private function normalizeSaleDetailPayload(array $sale): array

@@ -290,6 +290,80 @@ class UserManagementController extends Controller
         ], 'Level updated');
     }
 
+    public function storeUser(Request $request)
+    {
+        $this->userManagement->ensureMasters();
+
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:255'],
+            'email' => ['required', 'string', 'email', 'max:255', Rule::unique('users', 'email')],
+            'username' => ['required', 'string', 'max:100', Rule::unique('users', 'username')],
+            'nisj' => ['nullable', 'string', 'max:100'],
+            'assignment_role_title' => ['nullable', 'string', 'max:255'],
+            'outlet_id' => ['nullable', 'string', Rule::exists('outlets', 'id')],
+            'access_role_id' => ['required', 'string', Rule::exists('access_roles', 'id')],
+            'access_level_id' => ['nullable', 'string', Rule::exists('access_levels', 'id')],
+            'password' => ['required', 'string', 'min:8', 'confirmed'],
+            'is_active' => ['nullable', 'boolean'],
+        ]);
+
+        $result = $this->userManagement->createUser($request->user(), $data);
+        $fresh = $result['user'];
+        $employee = $fresh->employee;
+        $assignment = $employee?->assignment;
+        $outlet = $assignment?->outlet ?: $fresh->outlet;
+        $accessAssignment = $fresh->accessAssignment;
+        $accessRole = $accessAssignment?->role;
+        $accessLevel = $accessAssignment?->level;
+
+        return ApiResponse::ok([
+            'user' => [
+                'id' => (string) $fresh->id,
+                'name' => $fresh->name,
+                'username' => $fresh->username,
+                'nisj' => $fresh->nisj,
+                'email' => $fresh->email,
+                'is_active' => (bool) $fresh->is_active,
+                'employee' => $employee ? [
+                    'id' => (string) $employee->id,
+                    'name' => $employee->full_name ?: $employee->nickname,
+                    'nisj' => $employee->nisj,
+                    'employee_no' => $employee->hr_employee_id,
+                    'status' => $employee->employment_status,
+                ] : null,
+                'assignment' => $assignment ? [
+                    'id' => (string) $assignment->id,
+                    'role_title' => $assignment->role_title,
+                    'status' => $assignment->status,
+                    'is_primary' => (bool) $assignment->is_primary,
+                ] : null,
+                'outlet' => $outlet ? [
+                    'id' => (string) $outlet->id,
+                    'name' => $outlet->name,
+                    'code' => $outlet->code,
+                    'type' => $outlet->type,
+                    'timezone' => $outlet->timezone,
+                ] : null,
+                'access' => [
+                    'role' => $accessRole ? [
+                        'id' => (string) $accessRole->id,
+                        'code' => (string) $accessRole->code,
+                        'name' => (string) $accessRole->name,
+                    ] : null,
+                    'level' => $accessLevel ? [
+                        'id' => (string) $accessLevel->id,
+                        'code' => (string) $accessLevel->code,
+                        'name' => (string) $accessLevel->name,
+                    ] : null,
+                ],
+            ],
+            'subject_access' => $result['subject_access'] ?? null,
+            'subject_permissions' => $result['subject_permissions'] ?? [],
+            'current_actor_session' => $result['current_actor_session'] ?? $this->userManagement->currentSessionSnapshot($request->user()),
+        ], 'User created');
+    }
+
+
     public function updateUserAccess(Request $request, string $userId)
     {
         $this->userManagement->ensureMasters();
