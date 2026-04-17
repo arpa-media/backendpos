@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
@@ -77,6 +78,69 @@ class CashierAlignedSaleScopeService
             sort($ids);
             return $ids;
         });
+    }
+
+    public function eligibleSalesSubquery(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null): Builder
+    {
+        $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        sort($normalizedOutletIds);
+
+        if ($normalizedOutletIds === []) {
+            return DB::table('sales as s')->select('s.id')->whereRaw('1 = 0');
+        }
+
+        $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
+        $groupedOutletIds = [];
+        foreach ($normalizedOutletIds as $outletId) {
+            $timezone = $timezoneMap[$outletId] ?? TransactionDate::appTimezone();
+            $groupedOutletIds[$timezone] ??= [];
+            $groupedOutletIds[$timezone][] = $outletId;
+        }
+
+        $unionQuery = null;
+        foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
+            $groupQuery = $this->buildEligibleSalesGroupQuery($tzOutletIds, $dateFrom, $dateTo, $timezone);
+            $unionQuery = $unionQuery ? $unionQuery->union($groupQuery) : $groupQuery;
+        }
+
+        return DB::query()
+            ->fromSub($unionQuery ?? DB::table('sales as s')->select('s.id')->whereRaw('1 = 0'), 'cashier_aligned_sales')
+            ->select('cashier_aligned_sales.id')
+            ->distinct();
+    }
+
+    private function buildEligibleSalesGroupQuery(array $outletIds, ?string $dateFrom, ?string $dateTo, string $timezone): Builder
+    {
+        $window = $this->resolveCashierBusinessWindow($dateFrom, $dateTo, $timezone);
+        $query = DB::table('sales as s')
+            ->select('s.id')
+            ->whereNull('s.deleted_at')
+            ->where('s.status', '=', 'PAID')
+            ->whereIn('s.outlet_id', array_values(array_unique(array_filter(array_map('strval', $outletIds)))));
+
+        $candidateDateTo = $this->isMakassarCashierBusinessTimezone($timezone)
+            ? $window['requested_to']->addDay()->toDateString()
+            : $window['requested_to']->toDateString();
+
+        $this->applyCashierCandidateScope(
+            $query,
+            's.sale_number',
+            's.created_at',
+            $window['requested_from']->toDateString(),
+            $candidateDateTo,
+            $timezone
+        );
+
+        $resolvedLocalExpr = TransactionDate::resolvedSaleLocalSqlExpression('s.created_at', 's.sale_number', $timezone);
+        $query->whereRaw(
+            "({$resolvedLocalExpr} >= ? AND {$resolvedLocalExpr} < ?)",
+            [
+                $window['from_local']->format('Y-m-d H:i:s'),
+                $window['to_exclusive_local']->format('Y-m-d H:i:s'),
+            ]
+        );
+
+        return $query->distinct();
     }
 
     private function resolveTimezoneMap(array $outletIds, ?string $fallbackTimezone = null): array
@@ -172,7 +236,7 @@ class CashierAlignedSaleScopeService
 
     private function applyCashierCandidateScope(object $query, ?string $saleNumberColumn, string $createdAtColumn, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): void
     {
-        [$fromLocal, $toLocal, $fromUtc, $toUtc] = TransactionDate::dateRange(
+        [, , $fromUtc, $toUtc] = TransactionDate::dateRange(
             $dateFrom,
             $dateTo,
             $timezone ?: TransactionDate::appTimezone()

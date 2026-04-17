@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListItemSummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\CashierAlignedSaleScopeService;
+use App\Services\ReportSaleScopeCacheService;
 use App\Support\FinanceCategorySegment;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
@@ -14,8 +15,10 @@ use Illuminate\Support\Facades\DB;
 
 class ItemSummaryController extends Controller
 {
-    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
-    {
+    public function __construct(
+        private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
+        private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
+    ) {
     }
 
     public function index(ListItemSummaryRequest $request)
@@ -34,11 +37,48 @@ class ItemSummaryController extends Controller
             $v['date_to'] ?? null,
             $timezone
         );
-        [$fromLocal, $toLocal, $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
+        [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
 
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+        if ($request->boolean('filters_only')) {
+            return ApiResponse::ok([
+                'items' => [],
+                'summary' => [
+                    'item_sold' => 0,
+                    'gross_sales' => 0,
+                    'discount' => 0,
+                    'net_sales' => 0,
+                    'cogs' => 0,
+                    'gross_profit' => 0,
+                    'gross_margin' => 0.0,
+                ],
+                'filters' => [
+                    'date_from' => $fromLocal->format('Y-m-d'),
+                    'date_to' => $toLocal->format('Y-m-d'),
+                    'outlet_filter' => $outletFilter['value'],
+                    'category_segment' => $categorySegment,
+                    'sort' => $sort,
+                    'dir' => $dir,
+                ],
+                'filter_options' => [
+                    'outlet_filters' => $outletFilter['options'],
+                    'category_segments' => FinanceCategorySegment::options(),
+                ],
+                'meta' => [
+                    'timezone' => $timezone,
+                    'outlet_scope_name' => $outletFilter['label'],
+                    'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
+                    'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
+                    'generated_at' => null,
+                    'category_segment_active' => $categorySegment,
+                    'category_segment_label' => FinanceCategorySegment::label($categorySegment),
+                    'bar_category_names' => FinanceCategorySegment::barCategoryNames(),
+                    'cogs_source' => 'not_available',
+                ],
+            ], 'OK');
+        }
 
-        $rows = $this->buildRows($outletIds, $eligibleSaleIds, $v, $timezone, $sort, $dir, $categorySegment)->get();
+        $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
+        $rows = $this->buildRows($outletIds, $saleScope, $sort, $dir, $categorySegment)->get();
 
         $items = $rows->map(function ($row) {
             $grossSales = (int) round((float) ($row->gross_sales ?? 0));
@@ -105,12 +145,12 @@ class ItemSummaryController extends Controller
         ], 'OK');
     }
 
-    private function buildRows(array $outletIds, array $eligibleSaleIds, array $filters, string $timezone, string $sort, string $dir, string $categorySegment): Builder
+    private function buildRows(array $outletIds, array $saleScope, string $sort, string $dir, string $categorySegment): Builder
     {
         $salesTotalsSub = DB::table('sale_items as tsi')
             ->selectRaw('tsi.sale_id, COALESCE(SUM(tsi.line_total), 0) as items_gross_sales')
             ->whereNull('tsi.voided_at')
-            ->when(!empty($eligibleSaleIds), fn ($builder) => $builder->whereIn('tsi.sale_id', $eligibleSaleIds), fn ($builder) => $builder->whereRaw('1 = 0'))
+            ->when(!($saleScope['has_rows'] ?? false), fn ($builder) => $builder->whereRaw('1 = 0'), fn ($builder) => $builder->whereIn('tsi.sale_id', $this->cachedSaleIdSubquery($saleScope)))
             ->groupBy('tsi.sale_id');
 
         $query = DB::table('sale_items as si')
@@ -122,7 +162,7 @@ class ItemSummaryController extends Controller
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
             ->when(!empty($outletIds), fn ($builder) => $builder->whereIn('s.outlet_id', $outletIds))
-            ->when(!empty($eligibleSaleIds), fn ($builder) => $builder->whereIn('s.id', $eligibleSaleIds), fn ($builder) => $builder->whereRaw('1 = 0'));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($builder) => $builder->whereRaw('1 = 0'), fn ($builder) => $builder->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         FinanceCategorySegment::apply($query, 'c.name', $categorySegment);
 
@@ -142,6 +182,30 @@ class ItemSummaryController extends Controller
         return $this->applySorting($query, $sort, $dir);
     }
 
+    private function resolveEligibleSalesScope(array $outletIds, array $filters, string $timezone): array
+    {
+        return $this->reportSaleScopeCache->remember(
+            'item_summary_cashier_aligned',
+            [
+                'outlet_ids' => array_values(array_unique(array_map('strval', $outletIds))),
+                'date_from' => $filters['date_from'] ?? null,
+                'date_to' => $filters['date_to'] ?? null,
+                'timezone' => $timezone,
+            ],
+            fn () => $this->cashierAlignedSaleScope->eligibleSaleIds(
+                $outletIds,
+                $filters['date_from'] ?? null,
+                $filters['date_to'] ?? null,
+                $timezone
+            )
+        );
+    }
+
+    private function cachedSaleIdSubquery(array $saleScope): Builder
+    {
+        return $this->reportSaleScopeCache->subquery((string) ($saleScope['scope_key'] ?? ''));
+    }
+
     private function applySorting(Builder $query, string $sort, string $dir): Builder
     {
         return match ($sort) {
@@ -156,5 +220,4 @@ class ItemSummaryController extends Controller
             default => $query->orderBy('category_name', $dir)->orderBy('item_name_variant', 'asc'),
         };
     }
-
 }

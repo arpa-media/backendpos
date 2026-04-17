@@ -6,15 +6,18 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListFinanceOverviewRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\CashierAlignedSaleScopeService;
+use App\Services\ReportSaleScopeCacheService;
 use App\Support\FinanceOutletFilter;
-use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 
 class FinanceOverviewController extends Controller
 {
-    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
-    {
+    public function __construct(
+        private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
+        private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
+    ) {
     }
 
     private const PAYMENT_BUCKETS = [
@@ -44,26 +47,55 @@ class FinanceOverviewController extends Controller
             $v['date_to'] ?? null,
             $timezone
         );
-        [$fromLocal, $toLocal, $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
+        [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
 
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+        if ($request->boolean('filters_only')) {
+            return ApiResponse::ok([
+                'summary' => [
+                    'gross_sales' => 0,
+                    'marking_gross_sales' => 0,
+                    'total_tax' => 0,
+                    'total_discount' => 0,
+                ],
+                'payment_method_totals' => [],
+                'items' => [],
+                'filters' => [
+                    'date_from' => $fromLocal->format('Y-m-d'),
+                    'date_to' => $toLocal->format('Y-m-d'),
+                    'outlet_filter' => $outletFilter['value'],
+                ],
+                'filter_options' => [
+                    'outlet_filters' => $outletFilter['options'],
+                    'payment_method_columns' => array_map(fn ($key, $label) => ['key' => $key, 'label' => $label], array_keys(self::PAYMENT_BUCKETS), array_values(self::PAYMENT_BUCKETS)),
+                ],
+                'meta' => [
+                    'timezone' => $timezone,
+                    'outlet_scope_name' => $outletFilter['label'],
+                    'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
+                    'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
+                    'generated_at' => null,
+                ],
+            ], 'OK');
+        }
+
+        $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
 
         $base = DB::table('sales as s')
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
             ->when(!empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds))
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         $summaryRow = (clone $base)
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as gross_sales')
-            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN ' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ELSE 0 END), 0) as marking_gross_sales')
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as total_tax')
-            ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
+            ->selectRaw('COALESCE(SUM(COALESCE(s.subtotal, 0)), 0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(CAST(s.marking AS SIGNED), 0) = 1 THEN COALESCE(s.subtotal, 0) ELSE 0 END), 0) as marking_gross_sales')
+            ->selectRaw('COALESCE(SUM(COALESCE(s.tax_total, 0)), 0) as total_tax')
+            ->selectRaw('COALESCE(SUM(COALESCE(s.discount_total, 0)), 0) as total_discount')
             ->first();
 
         $paymentSelects = [];
         foreach (self::PAYMENT_BUCKETS as $key => $label) {
-            $paymentSelects[] = 'COALESCE(SUM(CASE WHEN ' . $this->bucketSqlCondition($key) . ' THEN ' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ELSE 0 END), 0) as ' . $key;
+            $paymentSelects[] = 'COALESCE(SUM(CASE WHEN ' . $this->bucketSqlCondition($key) . ' THEN COALESCE(s.grand_total, 0) ELSE 0 END), 0) as ' . $key;
         }
 
         $agg = (clone $base)
@@ -137,6 +169,30 @@ class FinanceOverviewController extends Controller
         }
 
         return ApiResponse::ok($payload, 'OK');
+    }
+
+    private function resolveEligibleSalesScope(array $outletIds, array $filters, string $timezone): array
+    {
+        return $this->reportSaleScopeCache->remember(
+            'finance_overview_cashier_aligned',
+            [
+                'outlet_ids' => array_values(array_unique(array_map('strval', $outletIds))),
+                'date_from' => $filters['date_from'] ?? null,
+                'date_to' => $filters['date_to'] ?? null,
+                'timezone' => $timezone,
+            ],
+            fn () => $this->cashierAlignedSaleScope->eligibleSaleIds(
+                $outletIds,
+                $filters['date_from'] ?? null,
+                $filters['date_to'] ?? null,
+                $timezone
+            )
+        );
+    }
+
+    private function cachedSaleIdSubquery(array $saleScope): Builder
+    {
+        return $this->reportSaleScopeCache->subquery((string) ($saleScope['scope_key'] ?? ''));
     }
 
     private function bucketSqlCondition(string $bucket): string

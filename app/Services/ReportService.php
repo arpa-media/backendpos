@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Sale;
 use App\Services\CashierAlignedSaleScopeService;
+use App\Services\ReportSaleScopeCacheService;
 use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
@@ -13,8 +14,10 @@ use Illuminate\Support\Facades\DB;
 
 class ReportService
 {
-    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
-    {
+    public function __construct(
+        private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
+        private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
+    ) {
     }
 
     private function currentTimezone(): string
@@ -151,6 +154,30 @@ class ReportService
         return $this->resolveTimezone($outletId);
     }
 
+    private function resolveCachedSaleScope(array $scopeOutletIds, array $params, string $scopeTimezone, string $namespace = 'report_service_cashier_aligned'): array
+    {
+        return $this->reportSaleScopeCache->remember(
+            $namespace,
+            [
+                'outlet_ids' => array_values(array_unique(array_map('strval', $scopeOutletIds))),
+                'date_from' => $params['date_from'] ?? null,
+                'date_to' => $params['date_to'] ?? null,
+                'timezone' => $scopeTimezone,
+            ],
+            fn () => $this->cashierAlignedSaleScope->eligibleSaleIds(
+                $scopeOutletIds,
+                $params['date_from'] ?? null,
+                $params['date_to'] ?? null,
+                $scopeTimezone
+            )
+        );
+    }
+
+    private function cachedSaleIdSubquery(array $saleScope): QueryBuilder
+    {
+        return $this->reportSaleScopeCache->subquery((string) ($saleScope['scope_key'] ?? ''));
+    }
+
     private function paginate(QueryBuilder $q, int $perPage, int $page): LengthAwarePaginator
     {
         // paginate is available on query builder in Laravel
@@ -178,7 +205,7 @@ class ReportService
         $pmSub = $this->salePaymentMethodSubquery();
         $scopeOutletIds = $this->resolveReportScopeOutletIds($params, $outletId);
         $scopeTimezone = $this->resolveReportScopeTimezone($params, $outletId);
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scopeOutletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
@@ -186,9 +213,8 @@ class ReportService
                 $join->on('spm.sale_id', '=', 's.id');
             })
             ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
-        $this->applyBusinessDateScope($q, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
 
         if (!empty($scopeOutletIds)) {
             $q->whereIn('s.outlet_id', $scopeOutletIds);
@@ -224,7 +250,7 @@ class ReportService
             's.marking',
             's.created_at',
         ])
-        ->selectRaw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total')
+        ->selectRaw('COALESCE(s.grand_total, 0) as total')
         ->orderByDesc('s.created_at')
         ->orderByDesc('s.id');
 
@@ -253,14 +279,13 @@ class ReportService
                 $join->on('spm.sale_id', '=', 's.id');
             })
             ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
-        $this->applyBusinessDateScope($salesSummary, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
         if (!empty($scopeOutletIds)) $salesSummary->whereIn('s.outlet_id', $scopeOutletIds);
         if ($markedOnly) $salesSummary->where('s.marking', '=', 1);
         if (!empty($params['payment_method_name'])) $salesSummary->where('spm.payment_method_name', '=', $params['payment_method_name']);
         if (!empty($params['channel'])) $salesSummary->where('s.channel', '=', $params['channel']);
         if (!empty($params['sale_number'])) $salesSummary->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
-        $salesSummary = $salesSummary->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '),0) as grand_total, COUNT(DISTINCT s.id) as transaction_count')->first();
+        $salesSummary = $salesSummary->selectRaw('COALESCE(SUM(COALESCE(s.grand_total, 0)),0) as grand_total, COUNT(DISTINCT s.id) as transaction_count')->first();
 
         $itemSummaryQ = DB::table('sales as s')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
@@ -268,8 +293,7 @@ class ReportService
             })
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
             ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
-        $this->applyBusinessDateScope($itemSummaryQ, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
         if (!empty($scopeOutletIds)) $itemSummaryQ->whereIn('s.outlet_id', $scopeOutletIds);
         if ($markedOnly) $itemSummaryQ->where('s.marking', '=', 1);
         if (!empty($params['payment_method_name'])) $itemSummaryQ->where('spm.payment_method_name', '=', $params['payment_method_name']);
@@ -317,12 +341,12 @@ class ReportService
 
         $scopeOutletIds = $this->resolveReportScopeOutletIds($params, $outletId);
         $scopeTimezone = $this->resolveReportScopeTimezone($params, $outletId);
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scopeOutletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
 
@@ -331,7 +355,7 @@ class ReportService
             'o.code as outlet_code',
             's.sale_number',
             DB::raw('COALESCE(SUM(si.qty),0) as items_sold'),
-            DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total'),
+            DB::raw('COALESCE(s.grand_total, 0) as total'),
             's.paid_total as paid',
             's.created_at',
         ])
@@ -376,12 +400,12 @@ class ReportService
 
         $scopeOutletIds = $this->resolveReportScopeOutletIds($params, $outletId);
         $scopeTimezone = $this->resolveReportScopeTimezone($params, $outletId);
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scopeOutletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
             ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
 
@@ -409,7 +433,7 @@ class ReportService
         $sumQ = DB::table('sales as s')
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
             ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         if (!empty($outletId)) $sumQ->where('s.outlet_id', '=', $outletId);
 
@@ -435,12 +459,12 @@ class ReportService
 
         $scopeOutletIds = $this->resolveReportScopeOutletIds($params, $outletId);
         $scopeTimezone = $this->resolveReportScopeTimezone($params, $outletId);
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scopeOutletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
             ->leftJoin('sale_items as si', 'si.sale_id', '=', 's.id')
             ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
 
@@ -486,7 +510,7 @@ class ReportService
 
         $scopeOutletIds = $this->resolveReportScopeOutletIds($params, $outletId);
         $scopeTimezone = $this->resolveReportScopeTimezone($params, $outletId);
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scopeOutletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
@@ -494,7 +518,7 @@ class ReportService
             })
             ->where('s.status', '=', 'PAID')
             ->where('s.rounding_total', '!=', 0)
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         if (!empty($outletId)) $q->where('s.outlet_id', '=', $outletId);
         if (!empty($params['sale_number'])) $q->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
@@ -508,7 +532,7 @@ class ReportService
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
             DB::raw('GREATEST(COALESCE(s.grand_total, 0) - COALESCE(s.rounding_total, 0), 0) as total_before_rounding'),
             's.rounding_total as rounding',
-            DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total'),
+            DB::raw('COALESCE(s.grand_total, 0) as total'),
             's.created_at',
         ])->orderByDesc('s.created_at');
 
@@ -533,7 +557,7 @@ class ReportService
             })
             ->where('s.status', '=', 'PAID')
             ->where('s.rounding_total', '!=', 0)
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         if (!empty($outletId)) $sumQ->where('s.outlet_id', '=', $outletId);
         if (!empty($params['sale_number'])) $sumQ->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
@@ -565,16 +589,15 @@ class ReportService
 
         $scopeOutletIds = $this->resolveReportScopeOutletIds($params, $outletId);
         $scopeTimezone = $this->resolveReportScopeTimezone($params, $outletId);
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scopeOutletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
             ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
-        $this->applyBusinessDateScope($q, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
         if (!empty($scopeOutletIds)) $q->whereIn('s.outlet_id', $scopeOutletIds);
         if (!empty($params['sale_number'])) $q->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
         if (!empty($params['channel'])) $q->where('s.channel', '=', $params['channel']);
@@ -585,8 +608,8 @@ class ReportService
             's.sale_number',
             's.channel',
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
-            DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total'),
-            DB::raw(DeliveryNoTaxReadModel::sqlTaxTotal('s') . ' as tax'),
+            DB::raw('COALESCE(s.grand_total, 0) as total'),
+            DB::raw('COALESCE(s.tax_total, 0) as tax'),
             's.created_at',
         ])
         ->orderByDesc('s.created_at');
@@ -610,13 +633,12 @@ class ReportService
                 $join->on('spm.sale_id', '=', 's.id');
             })
             ->where('s.status', '=', 'PAID')
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
-        $this->applyBusinessDateScope($summaryQ, 's.sale_number', 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
         if (!empty($scopeOutletIds)) $summaryQ->whereIn('s.outlet_id', $scopeOutletIds);
         if (!empty($params['sale_number'])) $summaryQ->where('s.sale_number', 'like', '%' . $params['sale_number'] . '%');
         if (!empty($params['channel'])) $summaryQ->where('s.channel', '=', $params['channel']);
         if (!empty($params['payment_method_name'])) $summaryQ->where('spm.payment_method_name', '=', $params['payment_method_name']);
-        $summary = $summaryQ->selectRaw('COUNT(DISTINCT s.id) as transaction_count, COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '),0) as grand_total, COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '),0) as tax_total')->first();
+        $summary = $summaryQ->selectRaw('COUNT(DISTINCT s.id) as transaction_count, COALESCE(SUM(COALESCE(s.grand_total, 0)),0) as grand_total, COALESCE(SUM(COALESCE(s.tax_total, 0)),0) as tax_total')->first();
 
         return [
             'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
@@ -647,7 +669,7 @@ class ReportService
 
         $scopeOutletIds = $this->resolveReportScopeOutletIds($params, $outletId);
         $scopeTimezone = $this->resolveReportScopeTimezone($params, $outletId);
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($scopeOutletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $scopeTimezone);
+        $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
@@ -655,7 +677,7 @@ class ReportService
             })
             ->where('s.status', '=', 'PAID')
             ->where('s.discount_amount', '>', 0)
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $eligibleSaleIds));
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
         if (!empty($outletId)) {
             $q->where('s.outlet_id', '=', $outletId);
@@ -689,7 +711,7 @@ class ReportService
             's.sale_number',
             's.channel',
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
-            DB::raw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total'),
+            DB::raw('COALESCE(s.grand_total, 0) as total'),
             's.discount_amount as discount',
             's.discount_name_snapshot',
             's.discounts_snapshot',

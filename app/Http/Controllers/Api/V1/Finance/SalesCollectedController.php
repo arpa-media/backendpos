@@ -8,18 +8,20 @@ use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Models\Sale;
 use App\Services\CashierAlignedSaleScopeService;
+use App\Services\ReportSaleScopeCacheService;
 use App\Support\FinanceOutletFilter;
 use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
-use Carbon\CarbonInterface;
 use Throwable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 
 class SalesCollectedController extends Controller
 {
-    public function __construct(private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope)
-    {
+    public function __construct(
+        private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
+        private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
+    ) {
     }
 
     public function detail(ListSalesCollectedRequest $request, string $saleId)
@@ -35,7 +37,20 @@ class SalesCollectedController extends Controller
             $timezone
         );
 
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+        $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
+        if (!($saleScope['has_rows'] ?? false)) {
+            return ApiResponse::error('Transaksi tidak ditemukan pada filter Sales Collected ini.', 'SALES_COLLECTED_SALE_NOT_FOUND', 404);
+        }
+
+        $visible = DB::table('report_sale_scope_cache as rssc')
+            ->where('rssc.scope_key', (string) $saleScope['scope_key'])
+            ->where('rssc.sale_id', $saleId)
+            ->where('rssc.expires_at', '>', now())
+            ->exists();
+
+        if (!$visible) {
+            return ApiResponse::error('Transaksi tidak ditemukan pada filter Sales Collected ini.', 'SALES_COLLECTED_SALE_NOT_FOUND', 404);
+        }
 
         $sale = Sale::query()
             ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer', 'cancelRequests'])
@@ -43,9 +58,7 @@ class SalesCollectedController extends Controller
             ->whereNull('deleted_at')
             ->where('status', 'PAID')
             ->when(!empty($outletIds), fn ($query) => $query->whereIn('outlet_id', $outletIds))
-            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('id', $eligibleSaleIds));
-
-        $sale = $sale->first();
+            ->first();
         if (!$sale) {
             return ApiResponse::error('Transaksi tidak ditemukan pada filter Sales Collected ini.', 'SALES_COLLECTED_SALE_NOT_FOUND', 404);
         }
@@ -192,27 +205,34 @@ class SalesCollectedController extends Controller
             $v['date_to'] ?? null,
             $timezone
         );
-        [$fromLocal, $toLocal, $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
+        [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
 
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+        $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
 
-        $summaryQuery = $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone, true, true, false);
-        $summary = (clone $summaryQuery)
-            ->selectRaw('COALESCE(SUM(s.subtotal), 0) as total_gross_sales')
-            ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
-            ->selectRaw('COALESCE(SUM(GREATEST(s.subtotal - s.discount_total, 0)), 0) as total_net_sales')
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . '), 0) as total_tax')
-            ->selectRaw('COALESCE(SUM(' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . '), 0) as total_collected')
-            ->first();
+        $summary = ($saleScope['has_rows'] ?? false)
+            ? (clone $this->buildBaseQuery($outletIds, $saleScope, $v, $timezone, true, true, false))
+                ->selectRaw('COALESCE(SUM(s.subtotal), 0) as total_gross_sales')
+                ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
+                ->selectRaw('COALESCE(SUM(GREATEST(s.subtotal - s.discount_total, 0)), 0) as total_net_sales')
+                ->selectRaw('COALESCE(SUM(COALESCE(s.tax_total, 0)), 0) as total_tax')
+                ->selectRaw('COALESCE(SUM(COALESCE(s.grand_total, 0)), 0) as total_collected')
+                ->first()
+            : (object) [
+                'total_gross_sales' => 0,
+                'total_discount' => 0,
+                'total_net_sales' => 0,
+                'total_tax' => 0,
+                'total_collected' => 0,
+            ];
 
         $channelOptions = [];
         $paymentOptions = [];
-        if ($includeFilterOptions) {
-            $channelOptions = $this->resolveChannelOptions($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone);
-            $paymentOptions = $this->resolvePaymentMethodOptions($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone);
+        if ($includeFilterOptions && ($saleScope['has_rows'] ?? false)) {
+            $channelOptions = $this->resolveChannelOptions($outletIds, $saleScope, $v, $timezone);
+            $paymentOptions = $this->resolvePaymentMethodOptions($outletIds, $saleScope, $v, $timezone);
         }
 
-        $rowsQuery = $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone, true, true, true)
+        $rowsQuery = $this->buildBaseQuery($outletIds, $saleScope, $v, $timezone, true, true, true)
             ->select([
                 's.id',
                 's.sale_number',
@@ -229,11 +249,11 @@ class SalesCollectedController extends Controller
                 's.paid_total',
                 's.cashier_name',
             ])
-            ->selectRaw('' . DeliveryNoTaxReadModel::sqlNetSales('s') . ' as net_sales')
-            ->selectRaw('' . DeliveryNoTaxReadModel::sqlTaxTotal('s') . ' as tax_total_corrected')
-            ->selectRaw('' . DeliveryNoTaxReadModel::sqlRoundingTotal('s') . ' as rounding_total_corrected')
-            ->selectRaw('' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as grand_total_corrected')
-            ->selectRaw('' . DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' as total_collected')
+            ->selectRaw('GREATEST(COALESCE(s.subtotal, 0) - COALESCE(s.discount_total, 0), 0) as net_sales')
+            ->selectRaw('COALESCE(s.tax_total, 0) as tax_total_cashier')
+            ->selectRaw('COALESCE(s.rounding_total, 0) as rounding_total_cashier')
+            ->selectRaw('COALESCE(s.grand_total, 0) as grand_total_cashier')
+            ->selectRaw('COALESCE(s.grand_total, 0) as total_collected')
             ->selectRaw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel")
             ->selectRaw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display");
 
@@ -277,11 +297,11 @@ class SalesCollectedController extends Controller
                 'gross_sales' => (int) ($row->subtotal ?? 0),
                 'discount' => (int) ($row->discount_total ?? 0),
                 'net_sales' => (int) ($row->net_sales ?? 0),
-                'tax' => (int) ($row->tax_total_corrected ?? $row->tax_total ?? 0),
-                'total_collected' => (int) ($row->total_collected ?? $row->grand_total_corrected ?? $row->grand_total ?? 0),
-                'rounding_total' => (int) ($row->rounding_total_corrected ?? $row->rounding_total ?? 0),
-                'grand_total' => (int) ($row->grand_total_corrected ?? $row->grand_total ?? 0),
-                'paid_total' => (int) ($row->paid_total ?? $row->grand_total_corrected ?? $row->grand_total ?? 0),
+                'tax' => (int) ($row->tax_total_cashier ?? $row->tax_total ?? 0),
+                'total_collected' => (int) ($row->total_collected ?? $row->grand_total_cashier ?? $row->grand_total ?? 0),
+                'rounding_total' => (int) ($row->rounding_total_cashier ?? $row->rounding_total ?? 0),
+                'grand_total' => (int) ($row->grand_total_cashier ?? $row->grand_total ?? 0),
+                'paid_total' => (int) ($row->paid_total ?? $row->grand_total_cashier ?? $row->grand_total ?? 0),
                 'collected_by' => (string) ($row->cashier_name ?? '-'),
                 'items' => $includeItems ? ($itemsMap[(string) $row->id] ?? '-') : '',
                 'channel' => (string) ($row->display_channel ?? '-'),
@@ -323,7 +343,7 @@ class SalesCollectedController extends Controller
                 'list_mode' => $includeItems ? 'full' : 'lite',
                 'filter_options' => $includeFilterOptions ? 'loaded' : 'deferred',
                 'items_endpoint' => '/finance/sales-collected/items',
-                'recommended_indexes_migration' => '2026_03_26_100500_add_sales_collected_indexes',
+                'scope_cache_strategy' => 'exact_cashier_sale_ids_materialized',
             ],
         ];
 
@@ -373,16 +393,15 @@ class SalesCollectedController extends Controller
         $timezone = $outletFilter['timezone'];
         $outletIds = $outletFilter['outlet_ids'];
 
-        $window = $this->resolveLocalDateRange(
-            $v['date_from'] ?? null,
-            $v['date_to'] ?? null,
-            $timezone
-        );
-        [, , $fromQuery, $toQuery] = [$window['requested_from'], $window['requested_to'], $window['from_utc'], $window['to_utc']];
+        $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
 
-        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+        if (!($saleScope['has_rows'] ?? false)) {
+            return ApiResponse::ok([
+                'items_map' => [],
+            ], 'OK');
+        }
 
-        $visibleSaleIds = $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $v, $timezone, true, true, false)
+        $visibleSaleIds = $this->buildBaseQuery($outletIds, $saleScope, $v, $timezone, true, true, false)
             ->whereIn('s.id', $saleIds)
             ->select('s.id')
             ->pluck('s.id')
@@ -410,39 +429,54 @@ class SalesCollectedController extends Controller
         return filter_var($value, FILTER_VALIDATE_BOOLEAN);
     }
 
-    private function applyBusinessDateScope(Builder $query, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, ?string $timezone = null, string $saleNumberColumn = 's.sale_number', string $createdAtColumn = 's.created_at'): void
+    private function resolveEligibleSalesScope(array $outletIds, array $filters, string $timezone): array
     {
-        TransactionDate::applyExactBusinessDateScope(
-            $query,
-            $createdAtColumn,
-            $filters['date_from'] ?? null,
-            $filters['date_to'] ?? null,
-            $timezone,
-            $saleNumberColumn
+        return $this->reportSaleScopeCache->remember(
+            'sales_collected_cashier_aligned',
+            [
+                'outlet_ids' => array_values(array_unique(array_map('strval', $outletIds))),
+                'date_from' => $filters['date_from'] ?? null,
+                'date_to' => $filters['date_to'] ?? null,
+                'timezone' => $timezone,
+            ],
+            fn () => $this->cashierAlignedSaleScope->eligibleSaleIds(
+                $outletIds,
+                $filters['date_from'] ?? null,
+                $filters['date_to'] ?? null,
+                $timezone
+            )
         );
     }
 
-    private function buildBaseQuery(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, bool $applyChannelFilter = true, bool $applyPaymentFilter = true, bool $includeDecorations = true): Builder
+    private function scopeSalesSubquery(string $scopeKey): Builder
+    {
+        return $this->reportSaleScopeCache->subquery($scopeKey);
+    }
+
+    private function buildBaseQuery(array $outletIds, array $saleScope, array $filters, string $timezone, bool $applyChannelFilter = true, bool $applyPaymentFilter = true, bool $includeDecorations = true): Builder
     {
         $needsChannelJoin = $includeDecorations || ($applyChannelFilter && !empty($filters['channel']));
         $needsPaymentJoin = $includeDecorations;
 
         $query = DB::table('sales as s')
+            ->join('report_sale_scope_cache as rssc', function ($join) use ($saleScope) {
+                $join->on('rssc.sale_id', '=', 's.id')
+                    ->where('rssc.scope_key', '=', (string) ($saleScope['scope_key'] ?? ''))
+                    ->where('rssc.expires_at', '>', now());
+            })
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->when(!empty($outletIds), fn ($q) => $q->whereIn('s.outlet_id', $outletIds))
-            ->when(empty($eligibleSaleIds), fn ($q) => $q->whereRaw('1 = 0'), fn ($q) => $q->whereIn('s.id', $eligibleSaleIds));
+            ->when(!empty($outletIds), fn ($q) => $q->whereIn('s.outlet_id', $outletIds));
 
         if ($needsPaymentJoin) {
-            $query->leftJoinSub($this->paymentSummarySubquery(), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'));
+            $query->leftJoinSub($this->paymentSummarySubquery((string) ($saleScope['scope_key'] ?? '')), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'));
         }
 
         if ($needsChannelJoin) {
-            $query->leftJoinSub($this->channelMapSubquery(), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'));
+            $query->leftJoinSub($this->channelMapSubquery((string) ($saleScope['scope_key'] ?? '')), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'));
         }
 
-        $this->applyBusinessDateScope($query, $fromQuery, $toQuery, $filters, $timezone);
         $this->applySaleNumberFilter($query, (string) ($filters['q'] ?? ''));
 
         if ($applyChannelFilter && !empty($filters['channel'])) {
@@ -451,7 +485,7 @@ class SalesCollectedController extends Controller
         }
 
         if ($applyPaymentFilter && !empty($filters['payment_method_name'])) {
-            $paymentMethod = trim((string) $filters['payment_method_name']);
+            $paymentMethod = trim((string) ($filters['payment_method_name'] ?? ''));
             $query->where(function ($inner) use ($paymentMethod) {
                 $inner->where('s.payment_method_name', $paymentMethod)
                     ->orWhereExists(function ($exists) use ($paymentMethod) {
@@ -467,9 +501,9 @@ class SalesCollectedController extends Controller
         return $query;
     }
 
-    private function buildFilteredSalesIdSubquery(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromQuery, CarbonInterface $toQuery, array $filters, string $timezone, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
+    private function buildFilteredSalesIdSubquery(array $outletIds, array $saleScope, array $filters, string $timezone, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
     {
-        return $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromQuery, $toQuery, $filters, $timezone, $applyChannelFilter, $applyPaymentFilter, false)
+        return $this->buildBaseQuery($outletIds, $saleScope, $filters, $timezone, $applyChannelFilter, $applyPaymentFilter, false)
             ->select('s.id')
             ->distinct();
     }
@@ -491,9 +525,9 @@ class SalesCollectedController extends Controller
         });
     }
 
-    private function resolveChannelOptions(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromLocal, CarbonInterface $toLocal, array $filters, string $timezone): array
+    private function resolveChannelOptions(array $outletIds, array $saleScope, array $filters, string $timezone): array
     {
-        return (clone $this->buildBaseQuery($outletIds, $eligibleSaleIds, $fromLocal, $toLocal, $filters, $timezone, false, true, true))
+        return (clone $this->buildBaseQuery($outletIds, $saleScope, $filters, $timezone, false, true, true))
             ->selectRaw("TRIM(COALESCE(NULLIF(channel_map.display_channel, ''), '')) as channel_value")
             ->distinct()
             ->orderBy('channel_value')
@@ -540,9 +574,10 @@ class SalesCollectedController extends Controller
         });
     }
 
-    private function paymentSummarySubquery(): Builder
+    private function paymentSummarySubquery(string $scopeKey): Builder
     {
         return DB::table('sale_payments as sp')
+            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 'sp.sale_id'))
             ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
             ->selectRaw('sp.sale_id')
             ->selectRaw("GROUP_CONCAT(DISTINCT NULLIF(TRIM(pm.name), '') ORDER BY pm.name SEPARATOR ', ') as payment_method_names")
@@ -550,10 +585,11 @@ class SalesCollectedController extends Controller
             ->groupBy('sp.sale_id');
     }
 
-    private function channelMapSubquery(): Builder
+    private function channelMapSubquery(string $scopeKey): Builder
     {
         return DB::table('sales as s1')
-            ->leftJoinSub($this->saleItemChannelsSubquery(), 'item_channels', fn ($join) => $join->on('item_channels.sale_id', '=', 's1.id'))
+            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's1.id'))
+            ->leftJoinSub($this->saleItemChannelsSubquery($scopeKey), 'item_channels', fn ($join) => $join->on('item_channels.sale_id', '=', 's1.id'))
             ->selectRaw('s1.id as sale_id')
             ->selectRaw("CASE
                 WHEN UPPER(COALESCE(s1.channel, '')) = 'DELIVERY' AND NULLIF(TRIM(COALESCE(s1.online_order_source, '')), '') IS NOT NULL THEN LOWER(TRIM(s1.online_order_source))
@@ -562,18 +598,19 @@ class SalesCollectedController extends Controller
             END as display_channel");
     }
 
-    private function saleItemChannelsSubquery(): Builder
+    private function saleItemChannelsSubquery(string $scopeKey): Builder
     {
         return DB::table('sale_items as si')
+            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 'si.sale_id'))
             ->selectRaw('si.sale_id')
             ->selectRaw("GROUP_CONCAT(DISTINCT si.channel ORDER BY FIELD(si.channel, 'DINE_IN', 'TAKEAWAY', 'DELIVERY'), si.channel SEPARATOR ' + ') as channel_display")
             ->whereNull('si.voided_at')
             ->groupBy('si.sale_id');
     }
 
-    private function resolvePaymentMethodOptions(array $outletIds, array $eligibleSaleIds, CarbonInterface $fromLocal, CarbonInterface $toLocal, array $filters, string $timezone): array
+    private function resolvePaymentMethodOptions(array $outletIds, array $saleScope, array $filters, string $timezone): array
     {
-        $filteredSales = $this->buildFilteredSalesIdSubquery($outletIds, $eligibleSaleIds, $fromLocal, $toLocal, $filters, $timezone, true, false);
+        $filteredSales = $this->buildFilteredSalesIdSubquery($outletIds, $saleScope, $filters, $timezone, true, false);
 
         $snapshotOptions = DB::query()
             ->fromSub($filteredSales, 'fs')
@@ -632,10 +669,10 @@ class SalesCollectedController extends Controller
                 $query->orderByRaw('GREATEST(s.subtotal - s.discount_total, 0) ' . $dir)->orderBy('s.created_at', 'desc');
                 break;
             case 'tax':
-                $query->orderByRaw(DeliveryNoTaxReadModel::sqlTaxTotal('s') . ' ' . $dir)->orderBy('s.created_at', 'desc');
+                $query->orderByRaw('COALESCE(s.tax_total, 0) ' . $dir)->orderBy('s.created_at', 'desc');
                 break;
             case 'total_collected':
-                $query->orderByRaw(DeliveryNoTaxReadModel::sqlGrandTotal('s') . ' ' . $dir)->orderBy('s.created_at', 'desc');
+                $query->orderByRaw('COALESCE(s.grand_total, 0) ' . $dir)->orderBy('s.created_at', 'desc');
                 break;
             case 'collected_by':
                 $query->orderBy('s.cashier_name', $dir)->orderBy('s.created_at', 'desc');
