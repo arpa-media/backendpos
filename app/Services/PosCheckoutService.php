@@ -329,7 +329,7 @@ class PosCheckoutService
             ]);
         }
 
-        return DB::transaction(function () use (
+        $sale = DB::transaction(function () use (
             $outletId,
             $user,
             $payloadChannel,
@@ -1146,6 +1146,14 @@ class PosCheckoutService
 
             return $sale->load(['items', 'payments', 'customer', 'outlet']);
         });
+
+        try {
+            app(ReportDailySummaryRefreshService::class)->markSale($sale, 'checkout_paid');
+        } catch (\Throwable $e) {
+            report($e);
+        }
+
+        return $sale;
     }
 
     public function generateQueueNumber(string $outletId, $transactionMoment = null): string

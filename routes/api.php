@@ -72,12 +72,12 @@ Route::prefix('v1')->group(function () {
          */
 
         Route::get('/owner-overview', [OwnerOverviewController::class, 'index'])
-            ->middleware(['permission:dashboard.view', 'role:admin']);
+            ->middleware(['report_observe', 'permission:dashboard.view', 'role:admin']);
 
         Route::get('/owner-overview/sales/{saleId}', [OwnerOverviewController::class, 'saleDetail'])
-            ->middleware(['permission:owner_overview.sale_detail.view', 'role:admin']);
+            ->middleware(['report_observe', 'permission:owner_overview.sale_detail.view', 'role:admin']);
 
-        Route::prefix('report-portals/{portalCode}')->group(function () {
+        Route::prefix('report-portals/{portalCode}')->middleware('report_observe')->group(function () {
             Route::get('/dashboard', [ReportPortalController::class, 'dashboard'])
                 ->middleware('permission:dashboard.view');
 
@@ -163,25 +163,25 @@ Route::prefix('v1')->group(function () {
             ->middleware('permission:sale.view');
 
         Route::get('/finance/sales-collected', [SalesCollectedController::class, 'index'])
-            ->middleware('permission:sale.view');
+            ->middleware(['report_observe', 'permission:sale.view']);
 
         Route::get('/finance/sales-collected/items', [SalesCollectedController::class, 'items'])
-            ->middleware('permission:sale.view');
+            ->middleware(['report_observe', 'permission:sale.view']);
 
         Route::get('/finance/sales-collected/{saleId}', [SalesCollectedController::class, 'detail'])
-            ->middleware('permission:sale.view');
+            ->middleware(['report_observe', 'permission:sale.view']);
 
         Route::get('/finance/overview', [FinanceOverviewController::class, 'index'])
-            ->middleware('permission:report.view');
+            ->middleware(['report_observe', 'permission:report.view']);
 
         Route::get('/finance/item-summary', [ItemSummaryController::class, 'index'])
-            ->middleware('permission:report.view');
+            ->middleware(['report_observe', 'permission:report.view']);
 
         Route::get('/finance/category-summary', [CategorySummaryController::class, 'index'])
-            ->middleware('permission:report.view');
+            ->middleware(['report_observe', 'permission:report.view']);
 
         Route::get('/finance/sales-summary', [SalesSummaryController::class, 'index'])
-            ->middleware('permission:sale.view');
+            ->middleware(['report_observe', 'permission:sale.view']);
 
         Route::get('/sales/{id}', [SalesController::class, 'show']);
 
@@ -216,7 +216,7 @@ Route::prefix('v1')->group(function () {
         /**
          * REPORTS
          */
-        Route::prefix('reports')->middleware('permission:report.view')->group(function () {
+        Route::prefix('reports')->middleware(['report_observe', 'permission:report.view'])->group(function () {
             Route::get('/ledger', [ReportController::class, 'ledger']);
             Route::get('/marking', [ReportController::class, 'marking']);
             Route::get('/marking/config', [ReportController::class, 'markingConfig']);

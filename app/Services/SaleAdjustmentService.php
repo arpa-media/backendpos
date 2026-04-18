@@ -29,6 +29,8 @@ class SaleAdjustmentService
         $request->status = SaleCancelRequest::STATUS_APPROVED;
         $request->save();
 
+        $this->touchSaleSummary($sale ?: ($request->sale_id ?? ''), 'cancel_bill_approved');
+
         return $request->refresh();
     }
 
@@ -97,6 +99,8 @@ class SaleAdjustmentService
         $request->status = SaleCancelRequest::STATUS_APPROVED;
         $request->save();
 
+        $this->touchSaleSummary($sale, 'void_items_approved');
+
         return $request->refresh();
     }
 
@@ -154,6 +158,25 @@ class SaleAdjustmentService
             });
         }
 
+        $this->touchSaleSummary($sale, 'sale_totals_recalculated');
+
         return $sale->fresh(['items', 'payments', 'outlet', 'customer']);
+    }
+
+    private function touchSaleSummary(Sale|string|null $saleOrId, string $reason): void
+    {
+        try {
+            if ($saleOrId instanceof Sale) {
+                app(ReportDailySummaryRefreshService::class)->markSale($saleOrId, $reason);
+                return;
+            }
+
+            $saleId = trim((string) $saleOrId);
+            if ($saleId !== '') {
+                app(ReportDailySummaryRefreshService::class)->markSale($saleId, $reason);
+            }
+        } catch (\Throwable $e) {
+            report($e);
+        }
     }
 }

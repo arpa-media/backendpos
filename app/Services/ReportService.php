@@ -156,20 +156,13 @@ class ReportService
 
     private function resolveCachedSaleScope(array $scopeOutletIds, array $params, string $scopeTimezone, string $namespace = 'report_service_cashier_aligned'): array
     {
-        return $this->reportSaleScopeCache->remember(
+        return $this->cashierAlignedSaleScope->rememberScope(
+            $this->reportSaleScopeCache,
             $namespace,
-            [
-                'outlet_ids' => array_values(array_unique(array_map('strval', $scopeOutletIds))),
-                'date_from' => $params['date_from'] ?? null,
-                'date_to' => $params['date_to'] ?? null,
-                'timezone' => $scopeTimezone,
-            ],
-            fn () => $this->cashierAlignedSaleScope->eligibleSaleIds(
-                $scopeOutletIds,
-                $params['date_from'] ?? null,
-                $params['date_to'] ?? null,
-                $scopeTimezone
-            )
+            $scopeOutletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $scopeTimezone,
         );
     }
 

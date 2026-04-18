@@ -8,6 +8,7 @@ use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\ReportPortalAnalyticsService;
 use App\Services\ReportPortalScopeService;
 use App\Support\AnalyticsResponseCache;
+use App\Support\ReportPortalMarkedScopeVersion;
 use Illuminate\Http\Request;
 
 class ReportPortalController extends Controller
@@ -22,6 +23,7 @@ class ReportPortalController extends Controller
             '_scope_filter' => (string) ($scope['filter_value'] ?? ''),
             '_scope_selected_outlet' => (string) ($scope['selected_outlet_id'] ?? ''),
             '_scope_marked_only' => (bool) ($scope['marked_only'] ?? false),
+            '_scope_marked_version' => !empty($scope['marked_only']) ? ReportPortalMarkedScopeVersion::current() : '',
         ]);
         @ini_set('max_execution_time', '180');
         @set_time_limit(180);

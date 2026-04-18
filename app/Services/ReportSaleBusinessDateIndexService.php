@@ -9,7 +9,11 @@ use Illuminate\Support\Facades\DB;
 
 class ReportSaleBusinessDateIndexService
 {
-    public function ensureCoverage(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null): void
+    private const DEFAULT_OUTLET_CHUNK_SIZE = 6;
+    private const DEFAULT_DATE_CHUNK_DAYS = 3;
+    private const CANDIDATE_SALE_CHUNK_SIZE = 1000;
+
+    public function ensureCoverage(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null, array $options = []): void
     {
         $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
         sort($normalizedOutletIds);
@@ -17,6 +21,9 @@ class ReportSaleBusinessDateIndexService
         if ($normalizedOutletIds === []) {
             return;
         }
+
+        $outletChunkSize = $this->normalizeOutletChunkSize($options['outlet_chunk'] ?? null);
+        $dateChunkDays = $this->normalizeDateChunkDays($options['date_chunk_days'] ?? $options['date_chunk'] ?? null);
 
         $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
         $groupedOutletIds = [];
@@ -28,8 +35,41 @@ class ReportSaleBusinessDateIndexService
 
         foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
             [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $timezone);
-            foreach ($this->refreshWindows($tzOutletIds, $fromDate, $toDate, $timezone) as [$windowFrom, $windowTo]) {
-                $this->rebuildCoverageWindow($tzOutletIds, $windowFrom, $windowTo, $timezone);
+            foreach (array_chunk($tzOutletIds, $outletChunkSize) as $outletChunk) {
+                foreach ($this->splitWindowsByDays($this->refreshWindows($outletChunk, $fromDate, $toDate, $timezone), $timezone, $dateChunkDays) as [$windowFrom, $windowTo]) {
+                    $this->rebuildCoverageWindow($outletChunk, $windowFrom, $windowTo, $timezone);
+                }
+            }
+        }
+    }
+
+
+    public function refreshExactCoverage(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null, array $options = []): void
+    {
+        $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        sort($normalizedOutletIds);
+
+        if ($normalizedOutletIds === []) {
+            return;
+        }
+
+        $outletChunkSize = $this->normalizeOutletChunkSize($options['outlet_chunk'] ?? null);
+        $dateChunkDays = $this->normalizeDateChunkDays($options['date_chunk_days'] ?? $options['date_chunk'] ?? null);
+        $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
+        $groupedOutletIds = [];
+        foreach ($normalizedOutletIds as $outletId) {
+            $timezone = $timezoneMap[$outletId] ?? TransactionDate::normalizeTimezone($fallbackTimezone, TransactionDate::appTimezone());
+            $groupedOutletIds[$timezone] ??= [];
+            $groupedOutletIds[$timezone][] = $outletId;
+        }
+
+        foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
+            [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $timezone);
+            $windows = $this->splitWindowsByDays([[$fromDate, $toDate]], $timezone, $dateChunkDays);
+            foreach (array_chunk($tzOutletIds, $outletChunkSize) as $outletChunk) {
+                foreach ($windows as [$windowFrom, $windowTo]) {
+                    $this->rebuildCoverageWindow($outletChunk, $windowFrom, $windowTo, $timezone);
+                }
             }
         }
     }
@@ -82,28 +122,59 @@ class ReportSaleBusinessDateIndexService
         return $resolved;
     }
 
+    public function saleIdsCoveredSubquery(array $outletIds, ?string $dateFrom, ?string $dateTo, bool $markedOnly = false, ?string $fallbackTimezone = null): ?Builder
+    {
+        $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        sort($normalizedOutletIds);
+
+        if ($normalizedOutletIds === []) {
+            return $this->emptySaleIdSubquery();
+        }
+
+        $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
+        $groupedOutletIds = [];
+        foreach ($normalizedOutletIds as $outletId) {
+            $timezone = $timezoneMap[$outletId] ?? TransactionDate::normalizeTimezone($fallbackTimezone, TransactionDate::appTimezone());
+            $groupedOutletIds[$timezone] ??= [];
+            $groupedOutletIds[$timezone][] = $outletId;
+        }
+
+        $queries = [];
+        foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
+            [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $timezone);
+            if (! $this->hasFreshCoverage($tzOutletIds, $fromDate, $toDate, $timezone)) {
+                return null;
+            }
+
+            $query = DB::table('report_sale_business_dates as rsbd')
+                ->selectRaw('rsbd.sale_id as id')
+                ->whereIn('rsbd.outlet_id', $tzOutletIds)
+                ->where('rsbd.business_timezone', '=', $timezone)
+                ->whereBetween('rsbd.business_date', [$fromDate, $toDate]);
+
+            if ($markedOnly) {
+                $query->whereRaw('COALESCE(CAST(rsbd.marking AS SIGNED), 0) = 1');
+            }
+
+            $queries[] = $query;
+        }
+
+        return $this->unionSaleIdQueries($queries);
+    }
+
     public function saleIdsSubquery(array $outletIds, ?string $dateFrom, ?string $dateTo, bool $markedOnly = false, ?string $fallbackTimezone = null): Builder
     {
         $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
         sort($normalizedOutletIds);
 
         if ($normalizedOutletIds === []) {
-            return DB::table('report_sale_business_dates as rsbd')->selectRaw('rsbd.sale_id as id')->whereRaw('1 = 0');
+            return $this->emptySaleIdSubquery();
         }
 
         $this->ensureCoverage($normalizedOutletIds, $dateFrom, $dateTo, $fallbackTimezone);
-        [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $fallbackTimezone);
 
-        $query = DB::table('report_sale_business_dates as rsbd')
-            ->selectRaw('rsbd.sale_id as id')
-            ->whereIn('rsbd.outlet_id', $normalizedOutletIds)
-            ->whereBetween('rsbd.business_date', [$fromDate, $toDate]);
-
-        if ($markedOnly) {
-            $query->whereRaw('COALESCE(CAST(rsbd.marking AS SIGNED), 0) = 1');
-        }
-
-        return $query->distinct();
+        return $this->saleIdsCoveredSubquery($normalizedOutletIds, $dateFrom, $dateTo, $markedOnly, $fallbackTimezone)
+            ?? $this->emptySaleIdSubquery();
     }
 
     private function rebuildCoverageWindow(array $outletIds, string $fromDate, string $toDate, string $timezone): void
@@ -142,7 +213,7 @@ class ReportSaleBusinessDateIndexService
 
         $candidateQuery
             ->orderBy('s.id')
-            ->chunkById(2000, function ($chunk) use ($fromDate, $toDate, $timezone, $timestamp) {
+            ->chunkById(self::CANDIDATE_SALE_CHUNK_SIZE, function ($chunk) use ($fromDate, $toDate, $timezone, $timestamp) {
                 $rows = [];
                 foreach ($chunk as $sale) {
                     $businessDate = $this->resolveExactBusinessDate(
@@ -195,6 +266,30 @@ class ReportSaleBusinessDateIndexService
         foreach (array_chunk($coverageRows, 1000) as $chunk) {
             DB::table('report_sale_business_date_coverage')->insertOrIgnore($chunk);
         }
+    }
+
+
+    private function unionSaleIdQueries(array $queries): Builder
+    {
+        if ($queries === []) {
+            return $this->emptySaleIdSubquery();
+        }
+
+        $query = array_shift($queries);
+        foreach ($queries as $unionQuery) {
+            $query->unionAll($unionQuery);
+        }
+
+        return DB::query()
+            ->fromSub($query, 'covered_sale_ids')
+            ->selectRaw('DISTINCT covered_sale_ids.id as id');
+    }
+
+    private function emptySaleIdSubquery(): Builder
+    {
+        return DB::table('report_sale_business_dates as rsbd')
+            ->selectRaw('rsbd.sale_id as id')
+            ->whereRaw('1 = 0');
     }
 
     private function refreshWindows(array $outletIds, string $fromDate, string $toDate, string $timezone): array
@@ -321,6 +416,42 @@ class ReportSaleBusinessDateIndexService
         }
 
         return $map;
+    }
+
+    private function normalizeOutletChunkSize(mixed $value): int
+    {
+        $size = (int) $value;
+
+        return max(1, min(50, $size > 0 ? $size : self::DEFAULT_OUTLET_CHUNK_SIZE));
+    }
+
+    private function normalizeDateChunkDays(mixed $value): int
+    {
+        $days = (int) $value;
+
+        return max(1, min(31, $days > 0 ? $days : self::DEFAULT_DATE_CHUNK_DAYS));
+    }
+
+    private function splitWindowsByDays(array $windows, string $timezone, int $maxDays): array
+    {
+        $resolved = [];
+
+        foreach ($windows as [$windowFrom, $windowTo]) {
+            $cursor = CarbonImmutable::parse($windowFrom, $timezone);
+            $end = CarbonImmutable::parse($windowTo, $timezone);
+
+            while ($cursor->lessThanOrEqualTo($end)) {
+                $chunkEnd = $cursor->addDays($maxDays - 1);
+                if ($chunkEnd->greaterThan($end)) {
+                    $chunkEnd = $end;
+                }
+
+                $resolved[] = [$cursor->toDateString(), $chunkEnd->toDateString()];
+                $cursor = $chunkEnd->addDay();
+            }
+        }
+
+        return $resolved;
     }
 
     private function normalizeDateRange(?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null): array

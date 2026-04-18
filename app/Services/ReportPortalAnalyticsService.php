@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Support\DeliveryNoTaxReadModel;
+use App\Support\ReportPortalMarkedScopeVersion;
 use App\Support\TransactionDate;
 use App\Models\Sale;
 use Carbon\CarbonImmutable;
@@ -94,16 +95,22 @@ class ReportPortalAnalyticsService
             ];
         }
 
+        $fingerprint = [
+            'portal_code' => (string) ($scope['portal_code'] ?? ''),
+            'marked_only' => (bool) ($scope['marked_only'] ?? false),
+            'outlets' => $outletIds,
+            'date_from' => (string) ($params['date_from'] ?? ''),
+            'date_to' => (string) ($params['date_to'] ?? ''),
+            'timezone' => $timezone,
+        ];
+
+        if (!empty($scope['marked_only'])) {
+            $fingerprint['marked_scope_version'] = ReportPortalMarkedScopeVersion::current();
+        }
+
         return $this->reportSaleScopeCache->remember(
             'report-portal.sales-scope',
-            [
-                'portal_code' => (string) ($scope['portal_code'] ?? ''),
-                'marked_only' => (bool) ($scope['marked_only'] ?? false),
-                'outlets' => $outletIds,
-                'date_from' => (string) ($params['date_from'] ?? ''),
-                'date_to' => (string) ($params['date_to'] ?? ''),
-                'timezone' => $timezone,
-            ],
+            $fingerprint,
             function () use ($outletIds, $params, $timezone, $scope) {
                 $eligibleIds = $this->cashierAlignedSaleScope->eligibleSaleIds(
                     $outletIds,

@@ -10,6 +10,7 @@ use App\Models\Sale;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Services\ReportSaleScopeCacheService;
 use App\Support\FinanceOutletFilter;
+use App\Support\AnalyticsResponseCache;
 use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Throwable;
@@ -18,61 +19,114 @@ use Illuminate\Support\Facades\DB;
 
 class SalesCollectedController extends Controller
 {
+
     public function __construct(
         private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
         private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
     ) {
     }
 
+    private function okCached($request, string $namespace, array $params, callable $callback)
+    {
+        @ini_set('max_execution_time', '240');
+        @set_time_limit(240);
+
+        $payload = AnalyticsResponseCache::remember(
+            $namespace,
+            $params,
+            $callback,
+            180,
+            (string) ($request->user()?->getAuthIdentifier() ?? '')
+        );
+
+        return ApiResponse::ok($payload, 'OK');
+    }
+
     public function detail(ListSalesCollectedRequest $request, string $saleId)
     {
         $v = $request->validated();
-        $outletFilter = $this->resolveOutletFilter($v);
-        $timezone = $outletFilter['timezone'];
-        $outletIds = $outletFilter['outlet_ids'];
+        @ini_set('max_execution_time', '240');
+        @set_time_limit(240);
 
-        $window = $this->resolveLocalDateRange(
-            $v['date_from'] ?? null,
-            $v['date_to'] ?? null,
-            $timezone
+        $payload = AnalyticsResponseCache::remember(
+            'finance-sales-collected.detail',
+            array_merge($v, ['sale_id' => $saleId]),
+            function () use ($request, $saleId, $v) {
+                $outletFilter = $this->resolveOutletFilter($v);
+                $timezone = $outletFilter['timezone'];
+                $outletIds = $outletFilter['outlet_ids'];
+
+                $window = $this->resolveLocalDateRange(
+                    $v['date_from'] ?? null,
+                    $v['date_to'] ?? null,
+                    $timezone
+                );
+
+                $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
+                if (!($saleScope['has_rows'] ?? false)) {
+                    return [
+                        '_error' => true,
+                        'message' => 'Transaksi tidak ditemukan pada filter Sales Collected ini.',
+                        'error_code' => 'SALES_COLLECTED_SALE_NOT_FOUND',
+                        'status' => 404,
+                    ];
+                }
+
+                $visible = DB::table('report_sale_scope_cache as rssc')
+                    ->where('rssc.scope_key', (string) $saleScope['scope_key'])
+                    ->where('rssc.sale_id', $saleId)
+                    ->where('rssc.expires_at', '>', now())
+                    ->exists();
+
+                if (!$visible) {
+                    return [
+                        '_error' => true,
+                        'message' => 'Transaksi tidak ditemukan pada filter Sales Collected ini.',
+                        'error_code' => 'SALES_COLLECTED_SALE_NOT_FOUND',
+                        'status' => 404,
+                    ];
+                }
+
+                $sale = Sale::query()
+                    ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer', 'cancelRequests'])
+                    ->where('id', $saleId)
+                    ->whereNull('deleted_at')
+                    ->where('status', 'PAID')
+                    ->when(!empty($outletIds), fn ($query) => $query->whereIn('outlet_id', $outletIds))
+                    ->first();
+                if (!$sale) {
+                    return [
+                        '_error' => true,
+                        'message' => 'Transaksi tidak ditemukan pada filter Sales Collected ini.',
+                        'error_code' => 'SALES_COLLECTED_SALE_NOT_FOUND',
+                        'status' => 404,
+                    ];
+                }
+
+                return [
+                    'sale' => $this->transformSaleDetail($sale, $request),
+                    'meta' => [
+                        'outlet_scope_id' => $outletFilter['value'],
+                        'outlet_scope_name' => $outletFilter['label'],
+                        'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
+                        'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
+                        'timezone' => $timezone,
+                    ],
+                ];
+            },
+            120,
+            (string) ($request->user()?->getAuthIdentifier() ?? '')
         );
 
-        $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
-        if (!($saleScope['has_rows'] ?? false)) {
-            return ApiResponse::error('Transaksi tidak ditemukan pada filter Sales Collected ini.', 'SALES_COLLECTED_SALE_NOT_FOUND', 404);
+        if (($payload['_error'] ?? false) === true) {
+            return ApiResponse::error(
+                (string) ($payload['message'] ?? 'Transaksi tidak ditemukan.'),
+                (string) ($payload['error_code'] ?? 'SALES_COLLECTED_SALE_NOT_FOUND'),
+                (int) ($payload['status'] ?? 404)
+            );
         }
 
-        $visible = DB::table('report_sale_scope_cache as rssc')
-            ->where('rssc.scope_key', (string) $saleScope['scope_key'])
-            ->where('rssc.sale_id', $saleId)
-            ->where('rssc.expires_at', '>', now())
-            ->exists();
-
-        if (!$visible) {
-            return ApiResponse::error('Transaksi tidak ditemukan pada filter Sales Collected ini.', 'SALES_COLLECTED_SALE_NOT_FOUND', 404);
-        }
-
-        $sale = Sale::query()
-            ->with(['outlet', 'items.product.category', 'items.addons', 'payments', 'customer', 'cancelRequests'])
-            ->where('id', $saleId)
-            ->whereNull('deleted_at')
-            ->where('status', 'PAID')
-            ->when(!empty($outletIds), fn ($query) => $query->whereIn('outlet_id', $outletIds))
-            ->first();
-        if (!$sale) {
-            return ApiResponse::error('Transaksi tidak ditemukan pada filter Sales Collected ini.', 'SALES_COLLECTED_SALE_NOT_FOUND', 404);
-        }
-
-        return ApiResponse::ok([
-            'sale' => $this->transformSaleDetail($sale, $request),
-            'meta' => [
-                'outlet_scope_id' => $outletFilter['value'],
-                'outlet_scope_name' => $outletFilter['label'],
-                'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
-                'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
-                'timezone' => $timezone,
-            ],
-        ], 'OK');
+        return ApiResponse::ok($payload, 'OK');
     }
 
     private function transformSaleDetail(Sale $sale, $request): array
@@ -188,6 +242,8 @@ class SalesCollectedController extends Controller
     public function index(ListSalesCollectedRequest $request)
     {
         $v = $request->validated();
+
+        return $this->okCached($request, 'finance-sales-collected.index', $v, function () use ($request, $v) {
         $perPage = (int) ($v['per_page'] ?? 15);
         $page = max(1, (int) ($v['page'] ?? 1));
         $sort = (string) ($v['sort'] ?? 'date');
@@ -378,7 +434,8 @@ class SalesCollectedController extends Controller
             ];
         }
 
-        return ApiResponse::ok($payload, 'OK');
+        return $payload;
+        });
     }
 
     public function items(ListSalesCollectedRequest $request)

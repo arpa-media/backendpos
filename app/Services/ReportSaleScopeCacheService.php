@@ -155,15 +155,21 @@ class ReportSaleScopeCacheService
 
         $markedOnly = (bool) ($fingerprint['marked_only'] ?? false);
 
+        $normalizedFingerprint = [
+            'outlet_ids' => $outletIds,
+            'date_from' => (string) ($fingerprint['date_from'] ?? ''),
+            'date_to' => (string) ($fingerprint['date_to'] ?? ''),
+            'timezone' => (string) ($fingerprint['timezone'] ?? ''),
+            'marked_only' => $markedOnly,
+        ];
+
+        if ($namespace === 'report-portal.sales-scope' && $markedOnly) {
+            $normalizedFingerprint['marked_scope_version'] = (string) ($fingerprint['marked_scope_version'] ?? '');
+        }
+
         return [
-            $markedOnly ? 'shared_report_sale_scope_marked_only_v3' : 'shared_report_sale_scope_all_v3',
-            [
-                'outlet_ids' => $outletIds,
-                'date_from' => (string) ($fingerprint['date_from'] ?? ''),
-                'date_to' => (string) ($fingerprint['date_to'] ?? ''),
-                'timezone' => (string) ($fingerprint['timezone'] ?? ''),
-                'marked_only' => $markedOnly,
-            ],
+            $markedOnly ? 'shared_report_sale_scope_marked_only_v4' : 'shared_report_sale_scope_all_v3',
+            $normalizedFingerprint,
         ];
     }
 

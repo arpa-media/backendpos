@@ -4,7 +4,12 @@ namespace App\Services;
 
 use App\Models\Outlet;
 use App\Models\OutletMarkingSetting;
+use App\Support\AnalyticsResponseCache;
+use App\Support\OwnerOverviewCacheVersion;
+use App\Support\ReportPortalMarkedScopeVersion;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 
 class MarkingService
@@ -167,101 +172,120 @@ class MarkingService
         });
     }
 
+    public function applyExistingMarking(string $outletId): array
+    {
+        return DB::transaction(function () use ($outletId) {
+            $setting = OutletMarkingSetting::query()->lockForUpdate()->firstOrCreate(
+                ['outlet_id' => $outletId],
+                [
+                    'status' => self::STATUS_NORMAL,
+                    'interval_value' => null,
+                    'show_count' => 3,
+                    'hide_count' => 1,
+                    'sequence_counter' => 0,
+                ]
+            );
 
-public function applyExistingMarking(string $outletId): array
-{
-    return DB::transaction(function () use ($outletId) {
-        $setting = OutletMarkingSetting::query()->lockForUpdate()->firstOrCreate(
-            ['outlet_id' => $outletId],
-            [
-                'status' => self::STATUS_NORMAL,
-                'interval_value' => null,
-                'show_count' => 3,
-                'hide_count' => 1,
-                'sequence_counter' => 0,
-            ]
-        );
+            $status = $this->normalizeStatus($setting->status);
+            $show = $this->resolveShowCount($setting);
+            $hide = $this->resolveHideCount($setting);
 
-        $status = $this->normalizeStatus($setting->status);
-        $show = $this->resolveShowCount($setting);
-        $hide = $this->resolveHideCount($setting);
+            $sales = DB::table('sales')
+                ->where('outlet_id', $outletId)
+                ->where('status', 'PAID')
+                ->select(['id'])
+                ->orderBy('created_at')
+                ->orderBy('sale_number')
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
 
-        $sales = DB::table('sales')
-            ->where('outlet_id', $outletId)
-            ->where('status', 'PAID')
-            ->select(['id'])
-            ->orderBy('created_at')
-            ->orderBy('sale_number')
-            ->orderBy('id')
-            ->lockForUpdate()
-            ->get();
+            $sequence = 0;
+            $groups = [0 => [], 1 => []];
 
-        $sequence = 0;
-        $groups = [0 => [], 1 => []];
+            foreach ($sales as $row) {
+                $marking = 1;
 
-        foreach ($sales as $row) {
-            $marking = 1;
+                if ($status === self::STATUS_NON_ACTIVE) {
+                    $marking = 0;
+                } elseif ($status === self::STATUS_ACTIVE) {
+                    $marking = $this->resolveMarkingByPattern($show, $hide, $sequence);
+                    $sequence++;
+                }
 
-            if ($status === self::STATUS_NON_ACTIVE) {
-                $marking = 0;
-            } elseif ($status === self::STATUS_ACTIVE) {
-                $marking = $this->resolveMarkingByPattern($show, $hide, $sequence);
-                $sequence++;
+                $groups[$marking][] = (string) $row->id;
             }
 
-            $groups[$marking][] = (string) $row->id;
-        }
+            foreach ($groups as $marking => $ids) {
+                if (empty($ids)) {
+                    continue;
+                }
 
-        foreach ($groups as $marking => $ids) {
-            if (empty($ids)) {
-                continue;
+                DB::table('sales')
+                    ->whereIn('id', $ids)
+                    ->update([
+                        'marking' => (int) $marking,
+                        'updated_at' => now(),
+                    ]);
+
+                $this->syncBusinessDateMarking($ids, (int) $marking);
             }
 
-            DB::table('sales')
-                ->whereIn('id', $ids)
-                ->update([
-                    'marking' => (int) $marking,
-                    'updated_at' => now(),
-                ]);
-        }
+            $setting->sequence_counter = $status === self::STATUS_ACTIVE ? $sequence : 0;
+            $setting->save();
 
-        $setting->sequence_counter = $status === self::STATUS_ACTIVE ? $sequence : 0;
-        $setting->save();
+            $this->bumpReportResponseCache('apply-existing-marking:' . $outletId);
+            $this->bumpOwnerOverviewCacheVersion('apply-existing-marking:' . $outletId);
+            $this->bumpSalesReportMarkedScopeVersion('apply-existing-marking:' . $outletId);
 
-        return [
-            ...$this->buildConfigPayload($setting),
-            'affected_transactions' => count($groups[0]) + count($groups[1]),
-            'marked_transactions' => count($groups[1]),
-            'applies_to' => 'EXISTING_TRANSACTIONS',
-            'action' => 'APPLY_EXISTING_MARKING',
-        ];
-    });
-}
+            return [
+                ...$this->buildConfigPayload($setting),
+                'affected_transactions' => count($groups[0]) + count($groups[1]),
+                'marked_transactions' => count($groups[1]),
+                'applies_to' => 'EXISTING_TRANSACTIONS',
+                'action' => 'APPLY_EXISTING_MARKING',
+            ];
+        });
+    }
 
-public function removeAllMarking(string $outletId): array
-{
-    return DB::transaction(function () use ($outletId) {
-        $affected = DB::table('sales')
-            ->where('outlet_id', $outletId)
-            ->where('status', 'PAID')
-            ->update([
-                'marking' => 1,
-                'updated_at' => now(),
-            ]);
+    public function removeAllMarking(string $outletId): array
+    {
+        return DB::transaction(function () use ($outletId) {
+            $sales = DB::table('sales')
+                ->where('outlet_id', $outletId)
+                ->where('status', 'PAID')
+                ->select(['id'])
+                ->lockForUpdate()
+                ->get();
 
-        $setting = $this->getSetting($outletId);
+            $ids = $sales->pluck('id')->map(fn ($id) => (string) $id)->filter()->values()->all();
 
-        return [
-            ...$this->buildConfigPayload($setting),
-            'affected_transactions' => (int) $affected,
-            'marked_transactions' => (int) $affected,
-            'applies_to' => 'EXISTING_TRANSACTIONS',
-            'action' => 'REMOVE_MARKING',
-        ];
-    });
-}
+            if ($ids !== []) {
+                DB::table('sales')
+                    ->whereIn('id', $ids)
+                    ->update([
+                        'marking' => 1,
+                        'updated_at' => now(),
+                    ]);
 
-public function toggleSale(string $outletId, string $saleId): array
+                $this->syncBusinessDateMarking($ids, 1);
+            }
+
+            $this->bumpReportResponseCache('remove-all-marking:' . $outletId);
+            $this->bumpOwnerOverviewCacheVersion('remove-all-marking:' . $outletId);
+            $this->bumpSalesReportMarkedScopeVersion('remove-all-marking:' . $outletId);
+
+            return [
+                ...$this->buildConfigPayload($this->getSetting($outletId)),
+                'affected_transactions' => count($ids),
+                'marked_transactions' => count($ids),
+                'applies_to' => 'EXISTING_TRANSACTIONS',
+                'action' => 'REMOVE_MARKING',
+            ];
+        });
+    }
+
+    public function toggleSale(string $outletId, string $saleId): array
     {
         $row = DB::table('sales')
             ->where('outlet_id', $outletId)
@@ -282,11 +306,93 @@ public function toggleSale(string $outletId, string $saleId): array
             'updated_at' => now(),
         ]);
 
+        $this->syncBusinessDateMarking([$saleId], $next);
+        $this->bumpReportResponseCache('toggle-marking:' . $saleId . ':' . $next);
+        $this->bumpOwnerOverviewCacheVersion('toggle-marking:' . $saleId . ':' . $next);
+        $this->bumpSalesReportMarkedScopeVersion('toggle-marking:' . $saleId . ':' . $next);
+        $this->triggerImmediateReportRefresh($saleId);
+
         return [
             'sale_id' => (string) $saleId,
             'marking' => $next,
         ];
     }
+
+    private function triggerImmediateReportRefresh(?string $saleId): void
+    {
+        $saleId = trim((string) ($saleId ?? ''));
+        if ($saleId === '') {
+            return;
+        }
+
+        try {
+            app(ReportImmediateRefreshBridge::class)->refreshForSaleId($saleId);
+        } catch (\Throwable $e) {
+            Log::warning('Marking toggle saved but immediate report refresh failed.', [
+                'sale_id' => $saleId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function syncBusinessDateMarking(array $saleIds, int $marking): void
+    {
+        $saleIds = array_values(array_filter(array_map(fn ($id) => trim((string) $id), $saleIds)));
+        if ($saleIds === [] || ! Schema::hasTable('report_sale_business_dates')) {
+            return;
+        }
+
+        $update = ['marking' => $marking];
+        try {
+            $columns = array_flip(Schema::getColumnListing('report_sale_business_dates'));
+            if (isset($columns['updated_at'])) {
+                $update['updated_at'] = now();
+            }
+        } catch (\Throwable $e) {
+            // keep minimal update payload
+        }
+
+        DB::table('report_sale_business_dates')
+            ->whereIn('sale_id', $saleIds)
+            ->update($update);
+    }
+
+    private function bumpReportResponseCache(string $reason): void
+    {
+        try {
+            AnalyticsResponseCache::bumpVersion($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Failed to bump analytics response cache version after marking change.', [
+                'reason' => $reason,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function bumpOwnerOverviewCacheVersion(string $reason): void
+    {
+        try {
+            OwnerOverviewCacheVersion::bump($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Failed to bump owner overview cache version after marking change.', [
+                'reason' => $reason,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function bumpSalesReportMarkedScopeVersion(string $reason): void
+    {
+        try {
+            ReportPortalMarkedScopeVersion::bump($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Failed to bump sales report portal marked scope version after marking change.', [
+                'reason' => $reason,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
 
     private function buildConfigPayload(?OutletMarkingSetting $setting): array
     {
@@ -319,35 +425,47 @@ public function toggleSale(string $outletId, string $saleId): array
             ? filter_var($payload['active'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE)
             : null;
 
-        if ($active === true) {
-            $status = self::STATUS_ACTIVE;
-        } elseif ($active === false && $status !== self::STATUS_NON_ACTIVE) {
-            $status = self::STATUS_NORMAL;
-        }
+        $show = array_key_exists('show', $payload) ? (int) ($payload['show'] ?? 0) : null;
+        $hide = array_key_exists('hide', $payload) ? (int) ($payload['hide'] ?? 0) : null;
+        $interval = array_key_exists('interval', $payload) ? (int) ($payload['interval'] ?? 0) : null;
 
-        $status = $status ?: self::STATUS_NORMAL;
-        $legacyInterval = isset($payload['interval']) ? max(1, (int) $payload['interval']) : null;
-        $show = isset($payload['show']) ? max(1, (int) $payload['show']) : $legacyInterval;
-        $hide = isset($payload['hide']) ? max(1, (int) $payload['hide']) : $legacyInterval;
-
-        if ($status === self::STATUS_ACTIVE) {
-            if (!$show || !$hide) {
-                throw ValidationException::withMessages([
-                    'show' => ['Show and hide are required when marking active.'],
-                    'hide' => ['Show and hide are required when marking active.'],
-                ]);
+        if ($status === null) {
+            if ($active !== null) {
+                $status = $active ? self::STATUS_ACTIVE : self::STATUS_NON_ACTIVE;
+            } else {
+                $status = self::STATUS_NORMAL;
             }
         }
 
+        if ($show === null) {
+            $show = $interval ?? 3;
+        }
+        if ($hide === null) {
+            $hide = 1;
+        }
+
+        $show = max(1, $show);
+        $hide = max(1, $hide);
+
         if ($status !== self::STATUS_ACTIVE) {
-            $show = $show ?: 3;
-            $hide = $hide ?: 1;
+            return [
+                'status' => $status,
+                'show' => $show,
+                'hide' => $hide,
+            ];
+        }
+
+        if ($show <= 0 || $hide <= 0) {
+            throw ValidationException::withMessages([
+                'show' => ['Show and hide are required when marking active.'],
+                'hide' => ['Show and hide are required when marking active.'],
+            ]);
         }
 
         return [
             'status' => $status,
-            'show' => max(1, (int) ($show ?: 3)),
-            'hide' => max(1, (int) ($hide ?: 1)),
+            'show' => $show,
+            'hide' => $hide,
         ];
     }
 
@@ -358,7 +476,7 @@ public function toggleSale(string $outletId, string $saleId): array
 
     private function resolveHideCount(?OutletMarkingSetting $setting): int
     {
-        return max(1, (int) ($setting?->hide_count ?? $setting?->interval_value ?? 1));
+        return max(1, (int) ($setting?->hide_count ?? 1));
     }
 
     private function resolveMarkingByPattern(int $show, int $hide, int $sequence): int

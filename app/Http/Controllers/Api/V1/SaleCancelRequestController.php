@@ -8,11 +8,16 @@ use App\Http\Resources\Api\V1\Sales\SaleCancelRequestResource;
 use App\Models\Sale;
 use App\Models\SaleCancelRequest;
 use App\Models\SaleItem;
+use App\Services\ReportImmediateRefreshBridge;
+use App\Support\AnalyticsResponseCache;
+use App\Support\OwnerOverviewCacheVersion;
 use App\Support\BackofficeOutletScope;
 use App\Support\OutletScope;
+use App\Support\ReportPortalMarkedScopeVersion;
 use App\Support\SaleStatuses;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\Rule;
 
 class SaleCancelRequestController extends Controller
@@ -335,7 +340,74 @@ class SaleCancelRequestController extends Controller
             return $req;
         });
 
+        $this->invalidateSalesReportPortalCache($req);
+        $this->triggerImmediateRefreshForApprovedCancel($req);
+
         return ApiResponse::ok(new SaleCancelRequestResource($req), 'Decision saved');
+    }
+
+    private function invalidateSalesReportPortalCache(SaleCancelRequest $requestModel): void
+    {
+        $requestType = (string) ($requestModel->request_type ?? SaleCancelRequest::REQUEST_TYPE_CANCEL);
+        $status = (string) ($requestModel->status ?? '');
+        $sale = $requestModel->sale;
+
+        if ($requestType !== SaleCancelRequest::REQUEST_TYPE_CANCEL || $status !== SaleCancelRequest::STATUS_APPROVED || ! $sale) {
+            return;
+        }
+
+        $reason = 'cancel-approved:' . (string) ($sale->id ?? '');
+
+        try {
+            AnalyticsResponseCache::bumpVersion($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Cancel approval saved but analytics response cache bump failed.', [
+                'sale_id' => (string) ($sale->id ?? ''),
+                'request_id' => (string) ($requestModel->id ?? ''),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        try {
+            OwnerOverviewCacheVersion::bump($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Cancel approval saved but owner overview cache bump failed.', [
+                'sale_id' => (string) ($sale->id ?? ''),
+                'request_id' => (string) ($requestModel->id ?? ''),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        try {
+            ReportPortalMarkedScopeVersion::bump($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Cancel approval saved but sales report marked scope version bump failed.', [
+                'sale_id' => (string) ($sale->id ?? ''),
+                'request_id' => (string) ($requestModel->id ?? ''),
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function triggerImmediateRefreshForApprovedCancel(SaleCancelRequest $requestModel): void
+    {
+        $requestType = (string) ($requestModel->request_type ?? SaleCancelRequest::REQUEST_TYPE_CANCEL);
+        $status = (string) ($requestModel->status ?? '');
+        $sale = $requestModel->sale;
+
+        if ($requestType !== SaleCancelRequest::REQUEST_TYPE_CANCEL || $status !== SaleCancelRequest::STATUS_APPROVED || ! $sale) {
+            return;
+        }
+
+        try {
+            app(ReportImmediateRefreshBridge::class)->refreshForSale($sale);
+        } catch (\Throwable $e) {
+            Log::warning('Cancel approval saved but immediate report refresh failed.', [
+                'sale_id' => (string) ($sale->id ?? ''),
+                'request_id' => (string) ($requestModel->id ?? ''),
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     public function confirmDelete(Request $request, string $id)
@@ -384,6 +456,9 @@ class SaleCancelRequestController extends Controller
 
             return $req;
         });
+
+        $this->invalidateSalesReportPortalCache($req);
+        $this->triggerImmediateRefreshForApprovedCancel($req);
 
         return ApiResponse::ok(new SaleCancelRequestResource($req->load(['sale.items.product.category', 'outlet'])), 'Cancel bill approved');
     }

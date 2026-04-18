@@ -19,3 +19,7 @@ Schedule::command('report-sale-business-dates:sync-recent --days=45')
 Schedule::command('report-sale-scopes:warm-common --days=30 --per-outlet=1')
     ->hourly()
     ->withoutOverlapping();
+
+Schedule::command('report-daily-summaries:refresh-dirty --limit=80 --outlet-chunk=4 --date-chunk=2')
+    ->everyFiveMinutes()
+    ->withoutOverlapping();

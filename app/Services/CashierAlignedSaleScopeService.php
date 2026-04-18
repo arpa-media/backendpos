@@ -102,6 +102,32 @@ class CashierAlignedSaleScopeService
         });
     }
 
+    public function rememberScope(ReportSaleScopeCacheService $reportSaleScopeCache, string $namespace, array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null, bool $markedOnly = false, int $ttlMinutes = 360): array
+    {
+        $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        sort($normalizedOutletIds);
+
+        return $reportSaleScopeCache->rememberSubquery(
+            $namespace,
+            [
+                'outlet_ids' => $normalizedOutletIds,
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+                'timezone' => TransactionDate::normalizeTimezone($fallbackTimezone, TransactionDate::appTimezone()),
+                'marked_only' => $markedOnly,
+            ],
+            $this->businessDateIndex->saleIdsSubquery(
+                $normalizedOutletIds,
+                $dateFrom,
+                $dateTo,
+                $markedOnly,
+                $fallbackTimezone,
+            ),
+            $ttlMinutes,
+        );
+    }
+
+
     public function eligibleSalesSubquery(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null): Builder
     {
         $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));

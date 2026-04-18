@@ -8,11 +8,16 @@ use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Http\Resources\Api\V1\Sales\SaleListResource;
 use App\Models\Sale;
+use App\Services\ReportImmediateRefreshBridge;
+use App\Support\AnalyticsResponseCache;
+use App\Support\OwnerOverviewCacheVersion;
 use App\Support\BackofficeOutletScope;
 use App\Support\OutletScope;
+use App\Support\ReportPortalMarkedScopeVersion;
 use App\Support\TransactionDate;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class SalesController extends Controller
 {
@@ -159,7 +164,50 @@ class SalesController extends Controller
         $sale->status = 'CANCELLED';
         $sale->save();
 
+        $this->invalidateSalesReportPortalCacheForSale($sale);
+
+        try {
+            app(ReportImmediateRefreshBridge::class)->refreshForSale($sale);
+        } catch (\Throwable $e) {
+            Log::warning('Sale cancelled but immediate report refresh failed.', [
+                'sale_id' => (string) $sale->id,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
         return ApiResponse::ok(new SaleDetailResource($sale->load(['items.product.category', 'payments', 'customer', 'outlet', 'cancelRequests' => fn ($q) => $q->with(['outlet', 'sale'])->orderByDesc('created_at')])), 'Sale cancelled');
+    }
+
+    private function invalidateSalesReportPortalCacheForSale(Sale $sale): void
+    {
+        $reason = 'sale-status-changed:' . (string) ($sale->id ?? '');
+
+        try {
+            AnalyticsResponseCache::bumpVersion($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Sale status changed but analytics response cache bump failed.', [
+                'sale_id' => (string) ($sale->id ?? ''),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        try {
+            OwnerOverviewCacheVersion::bump($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Sale status changed but owner overview cache bump failed.', [
+                'sale_id' => (string) ($sale->id ?? ''),
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        try {
+            ReportPortalMarkedScopeVersion::bump($reason);
+        } catch (\Throwable $e) {
+            Log::warning('Sale status changed but sales report marked scope version bump failed.', [
+                'sale_id' => (string) ($sale->id ?? ''),
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     public function destroy(Request $request, string $id)

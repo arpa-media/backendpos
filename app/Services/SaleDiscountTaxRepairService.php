@@ -8,6 +8,7 @@ use App\Support\PaymentMethodTypes;
 use App\Support\SaleAmountBreakdown;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
+use App\Services\ReportDailySummaryRefreshService;
 
 class SaleDiscountTaxRepairService
 {
@@ -121,6 +122,12 @@ class SaleDiscountTaxRepairService
                 });
             }
         });
+
+        try {
+            app(ReportDailySummaryRefreshService::class)->markSale($sale, 'discount_tax_repair');
+        } catch (\Throwable $e) {
+            report($e);
+        }
 
         return array_merge($audit, [
             'updated' => true,

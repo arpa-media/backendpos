@@ -37,6 +37,7 @@ return Application::configure(basePath: dirname(__DIR__))
             'outlet_scope' => ResolveOutletScope::class,
             'outlet_timezone' => SetOutletTimezone::class,
             'pos_sync_auth' => AuthenticatePosSync::class,
+            'report_observe' => \App\Http\Middleware\ObserveReportRequest::class,
         ]);
 
         // Middleware API kamu tetap jalan, setelah CORS
