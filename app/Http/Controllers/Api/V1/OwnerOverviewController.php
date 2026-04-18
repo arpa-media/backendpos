@@ -7,7 +7,6 @@ use App\Http\Requests\Api\V1\Reports\OwnerOverviewQueryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\OwnerOverviewService;
 use App\Support\AnalyticsResponseCache;
-use App\Support\OwnerOverviewCacheVersion;
 
 class OwnerOverviewController extends Controller
 {
@@ -21,12 +20,9 @@ class OwnerOverviewController extends Controller
         @set_time_limit(240);
 
         $params = $request->validated();
-        $cacheParams = $params;
-        $cacheParams['__owner_overview_version'] = OwnerOverviewCacheVersion::current();
-
         $payload = AnalyticsResponseCache::remember(
             'owner-overview.index',
-            $cacheParams,
+            $params,
             fn () => $this->service->overview($params),
             300,
             (string) ($request->user()?->getAuthIdentifier() ?? '')

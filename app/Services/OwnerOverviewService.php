@@ -36,27 +36,21 @@ class OwnerOverviewService
         }
 
         $timezone = $this->resolveTimezone($scope['selected_outlet_id'] ?? null);
-        [, , $fromQuery, $toQuery] = TransactionDate::dateRange(
+        $this->dailySummaryService->ensureCoverage(
+            $scope['allowed_outlet_ids'],
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
             $timezone,
+            ['outlet_chunk' => 4, 'date_chunk_days' => 2]
         );
 
-        $saleScope = $this->resolveEligibleSalesScope($scope['allowed_outlet_ids'], $params, $timezone);
-        if (! ($saleScope['has_rows'] ?? false)) {
-            return [
-                'ok' => false,
-                'status' => 404,
-                'message' => 'Transaksi tidak ditemukan pada filter Owner Overview ini.',
-                'error_code' => 'OWNER_OVERVIEW_SALE_NOT_FOUND',
-            ];
-        }
-
-        $visible = DB::table('report_sale_scope_cache as rssc')
-            ->where('rssc.scope_key', (string) $saleScope['scope_key'])
-            ->where('rssc.sale_id', $saleId)
-            ->where('rssc.expires_at', '>', now())
-            ->exists();
+        $visible = $this->saleExistsWithinBusinessDateCoverage(
+            $scope['allowed_outlet_ids'],
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+            $saleId,
+        );
 
         if (! $visible) {
             return [
@@ -142,7 +136,13 @@ class OwnerOverviewService
             return $this->emptyOverviewPayload($fromLocal->toDateString(), $toLocal->toDateString(), $outletFilter, $timezone, $allowedOutlets, $recentLimit);
         }
 
-        $this->dailySummaryService->ensureCoverage($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone);
+        $this->dailySummaryService->ensureCoverage(
+            $outletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+            ['outlet_chunk' => 4, 'date_chunk_days' => 2]
+        );
 
         $summaryRow = $this->dailySummaryService
             ->salesSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null)
@@ -331,12 +331,27 @@ class OwnerOverviewService
             ->values()
             ->all();
 
-        $saleScope = $this->resolveEligibleSalesScope($outletIds, $params, $timezone);
-        $recentSales = $this->ownerOverviewRecentSalesQuery((string) ($saleScope['scope_key'] ?? ''), $outletIds, $recentLimit)
-            ->get()
-            ->map(fn ($row) => $this->mapSaleListRow($row))
-            ->values()
-            ->all();
+        $recentSaleIds = $this->resolveRecentSaleIdsFromCoverage(
+            $outletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+            $recentLimit,
+        );
+
+        $recentSales = [];
+        if ($recentSaleIds !== []) {
+            $recentSaleRows = $this->ownerOverviewRecentSalesByIdsQuery($recentSaleIds)
+                ->get()
+                ->keyBy(fn ($row) => (string) ($row->sale_id ?? ''));
+
+            foreach ($recentSaleIds as $saleId) {
+                $row = $recentSaleRows->get((string) $saleId);
+                if ($row) {
+                    $recentSales[] = $this->mapSaleListRow($row);
+                }
+            }
+        }
 
         return [
             'filters' => [
@@ -491,6 +506,125 @@ class OwnerOverviewService
                 DB::raw('COALESCE(payments.cash_amount, 0) as payment_cash_amount'),
                 DB::raw('COALESCE(payments.has_payment_rows, 0) as has_payment_rows'),
             ]);
+    }
+
+    private function saleExistsWithinBusinessDateCoverage(array $outletIds, ?string $dateFrom, ?string $dateTo, string $timezone, string $saleId): bool
+    {
+        $saleId = trim($saleId);
+        if ($saleId === '' || $outletIds === []) {
+            return false;
+        }
+
+        [$fromLocal, $toLocal] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
+
+        return DB::table('report_sale_business_dates as rsbd')
+            ->where('rsbd.sale_id', $saleId)
+            ->whereIn('rsbd.outlet_id', $outletIds)
+            ->whereBetween('rsbd.business_date', [$fromLocal->toDateString(), $toLocal->toDateString()])
+            ->exists();
+    }
+
+    private function resolveRecentSaleIdsFromCoverage(array $outletIds, ?string $dateFrom, ?string $dateTo, string $timezone, int $recentLimit): array
+    {
+        if ($outletIds === []) {
+            return [];
+        }
+
+        [$fromLocal, $toLocal] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
+
+        return DB::table('report_sale_business_dates as rsbd')
+            ->join('sales as s', 's.id', '=', 'rsbd.sale_id')
+            ->whereIn('rsbd.outlet_id', $outletIds)
+            ->whereBetween('rsbd.business_date', [$fromLocal->toDateString(), $toLocal->toDateString()])
+            ->whereNull('s.deleted_at')
+            ->where('s.status', '=', 'PAID')
+            ->groupBy('rsbd.sale_id')
+            ->selectRaw('rsbd.sale_id')
+            ->selectRaw('MAX(s.created_at) as latest_created_at')
+            ->orderByDesc('latest_created_at')
+            ->orderByDesc('rsbd.sale_id')
+            ->limit($recentLimit)
+            ->pluck('rsbd.sale_id')
+            ->map(fn ($saleId) => trim((string) $saleId))
+            ->filter()
+            ->values()
+            ->all();
+    }
+
+    private function ownerOverviewRecentSalesByIdsQuery(array $saleIds): Builder
+    {
+        $normalizedSaleIds = array_values(array_unique(array_filter(array_map('strval', $saleIds))));
+
+        return DB::table('sales as s')
+            ->join('outlets as o', 'o.id', '=', 's.outlet_id')
+            ->leftJoinSub($this->paymentSummaryForSaleIdsSubquery($normalizedSaleIds), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'))
+            ->leftJoinSub($this->channelMapForSaleIdsSubquery($normalizedSaleIds), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
+            ->whereIn('s.id', $normalizedSaleIds)
+            ->whereNull('s.deleted_at')
+            ->where('s.status', '=', 'PAID')
+            ->select([
+                's.id as sale_id',
+                's.outlet_id as outlet_id',
+                's.sale_number',
+                's.channel',
+                's.online_order_source',
+                's.payment_method_name',
+                's.payment_method_type',
+                's.subtotal',
+                's.discount_total',
+                's.service_charge_total',
+                DB::raw('COALESCE(s.grand_total, 0) as grand_total'),
+                DB::raw('COALESCE(s.tax_total, 0) as tax_total'),
+                DB::raw('COALESCE(s.rounding_total, 0) as rounding_total'),
+                's.paid_total',
+                's.change_total',
+                's.marking',
+                's.created_at',
+                'o.code as outlet_code',
+                'o.name as outlet_name',
+                'o.timezone as outlet_timezone',
+                DB::raw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel"),
+                DB::raw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display"),
+                DB::raw('COALESCE(payments.cash_amount, 0) as payment_cash_amount'),
+                DB::raw('COALESCE(payments.has_payment_rows, 0) as has_payment_rows'),
+            ]);
+    }
+
+    private function paymentSummaryForSaleIdsSubquery(array $saleIds): Builder
+    {
+        return DB::table('sale_payments as sp')
+            ->join('sales as s', 's.id', '=', 'sp.sale_id')
+            ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
+            ->whereIn('sp.sale_id', $saleIds)
+            ->selectRaw('sp.sale_id')
+            ->selectRaw("GROUP_CONCAT(DISTINCT NULLIF(TRIM(pm.name), '') ORDER BY pm.name SEPARATOR ', ') as payment_method_names")
+            ->selectRaw("GROUP_CONCAT(CONCAT(COALESCE(NULLIF(TRIM(pm.name), ''), NULLIF(TRIM(s.payment_method_name), ''), 'Payment'), CASE WHEN COALESCE(sp.amount, 0) > 0 THEN CONCAT(' (', sp.amount, ')') ELSE '' END) ORDER BY sp.created_at, sp.id SEPARATOR ', ') as payment_method_display")
+            ->selectRaw("COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(pm.name, ''))) IN ('cash', 'tunai') AND COALESCE(sp.amount, 0) > 0 THEN GREATEST(COALESCE(sp.amount, 0) - COALESCE(s.change_total, 0), 0) ELSE CASE WHEN LOWER(TRIM(COALESCE(pm.name, ''))) IN ('cash', 'tunai') THEN COALESCE(sp.amount, 0) ELSE 0 END END), 0) as cash_amount")
+            ->selectRaw('COUNT(*) as has_payment_rows')
+            ->groupBy('sp.sale_id');
+    }
+
+    private function channelMapForSaleIdsSubquery(array $saleIds): Builder
+    {
+        return DB::table('sales as s1')
+            ->leftJoinSub($this->saleItemChannelsForSaleIdsSubquery($saleIds), 'item_channels', fn ($join) => $join->on('item_channels.sale_id', '=', 's1.id'))
+            ->whereIn('s1.id', $saleIds)
+            ->selectRaw('s1.id as sale_id')
+            ->selectRaw("CASE
+                WHEN UPPER(COALESCE(s1.channel, '')) = 'DELIVERY' AND NULLIF(TRIM(COALESCE(s1.online_order_source, '')), '') IS NOT NULL THEN LOWER(TRIM(s1.online_order_source))
+                WHEN UPPER(COALESCE(s1.channel, '')) = 'MIXED' AND NULLIF(TRIM(COALESCE(item_channels.channel_display, '')), '') IS NOT NULL THEN item_channels.channel_display
+                ELSE UPPER(COALESCE(s1.channel, ''))
+            END as display_channel");
+    }
+
+    private function saleItemChannelsForSaleIdsSubquery(array $saleIds): Builder
+    {
+        return DB::table('sale_items as si')
+            ->whereIn('si.sale_id', $saleIds)
+            ->whereNull('si.voided_at')
+            ->selectRaw('si.sale_id')
+            ->selectRaw("GROUP_CONCAT(DISTINCT si.channel ORDER BY FIELD(si.channel, 'DINE_IN', 'TAKEAWAY', 'DELIVERY'), si.channel SEPARATOR ' + ') as channel_display")
+            ->groupBy('si.sale_id');
     }
 
     private function emptyOverviewPayload(string $dateFrom, string $dateTo, array $outletFilter, string $timezone, array $allowedOutlets, int $recentLimit): array
