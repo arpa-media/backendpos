@@ -11,6 +11,7 @@ use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use App\Support\AnalyticsResponseCache;
 
 class SalesSummaryController extends Controller
 {
@@ -20,9 +21,29 @@ class SalesSummaryController extends Controller
     ) {
     }
 
+
+
+    private function okCached($request, string $namespace, array $params, callable $callback)
+    {
+        @ini_set('max_execution_time', '240');
+        @set_time_limit(240);
+
+        $payload = AnalyticsResponseCache::remember(
+            $namespace,
+            $params,
+            $callback,
+            300,
+            (string) ($request->user()?->getAuthIdentifier() ?? '')
+        );
+
+        return ApiResponse::ok($payload, 'OK');
+    }
     public function index(ListSalesSummaryRequest $request)
     {
-        $v = $request->validated();
+        $validated = $request->validated();
+
+        return $this->okCached($request, 'finance-sales-summary.index', $validated, function () use ($request, $validated) {
+        $v = $validated;
         $sort = (string) ($v['sort'] ?? 'outlet_name');
         $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
         $isExport = filter_var($v['export'] ?? false, FILTER_VALIDATE_BOOLEAN);
@@ -39,7 +60,7 @@ class SalesSummaryController extends Controller
         [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
 
         if ($request->boolean('filters_only')) {
-            return ApiResponse::ok([
+            return [
                 'items' => [],
                 'summary' => [
                     'gross_sales' => 0,
@@ -67,7 +88,7 @@ class SalesSummaryController extends Controller
                     'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                     'generated_at' => null,
                 ],
-            ], 'OK');
+            ];
         }
 
         $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
@@ -135,7 +156,9 @@ class SalesSummaryController extends Controller
             ];
         }
 
-        return ApiResponse::ok($payload, 'OK');
+        return $payload;
+    
+        });
     }
 
     private function buildRows(array $outletIds, array $saleScope, string $sort, string $dir): Builder

@@ -27,7 +27,7 @@ class CashierAlignedSaleScopeService
             'timezones' => $timezoneMap,
         ]));
 
-        return Cache::remember($cacheKey, now()->addSeconds(20), function () use ($normalizedOutletIds, $timezoneMap, $dateFrom, $dateTo) {
+        return Cache::remember($cacheKey, now()->addMinutes(15), function () use ($normalizedOutletIds, $timezoneMap, $dateFrom, $dateTo) {
             $ids = [];
             $groupedOutletIds = [];
             foreach ($normalizedOutletIds as $outletId) {
@@ -44,39 +44,54 @@ class CashierAlignedSaleScopeService
                     ->where('s.status', '=', 'PAID')
                     ->whereIn('s.outlet_id', $tzOutletIds);
 
-                if ($this->isMakassarCashierBusinessTimezone($timezone)) {
-                    $candidateDateTo = $window['requested_to']->addDay()->toDateString();
-                    $this->applyCashierCandidateScope(
-                        $candidateQuery,
-                        's.sale_number',
-                        's.created_at',
-                        $window['requested_from']->toDateString(),
-                        $candidateDateTo,
-                        $timezone
-                    );
-                } else {
-                    $this->applyCashierCandidateScope(
-                        $candidateQuery,
-                        's.sale_number',
-                        's.created_at',
-                        $window['requested_from']->toDateString(),
-                        $window['requested_to']->toDateString(),
-                        $timezone
-                    );
-                }
+                $candidateDateTo = $this->isMakassarCashierBusinessTimezone($timezone)
+                    ? $window['requested_to']->addDay()->toDateString()
+                    : $window['requested_to']->toDateString();
 
-                $candidateIds = $candidateQuery->orderBy('s.created_at')->orderBy('s.sale_number')->get()
-                    ->filter(fn ($sale) => $this->saleFallsWithinCashierBusinessWindow($sale->created_at ?? null, $sale->sale_number ?? null, $window['from_local'], $window['to_exclusive_local'], $timezone))
-                    ->pluck('id')
-                    ->map(fn ($id) => (string) $id)
-                    ->all();
+                $this->applyCashierCandidateScope(
+                    $candidateQuery,
+                    's.sale_number',
+                    's.created_at',
+                    $window['requested_from']->toDateString(),
+                    $candidateDateTo,
+                    $timezone
+                );
 
-                $ids = array_merge($ids, $candidateIds);
+                $resolvedLocalExpr = TransactionDate::resolvedSaleLocalSqlExpression('s.created_at', 's.sale_number', $timezone);
+                $candidateQuery->whereRaw(
+                    "({$resolvedLocalExpr} >= ? AND {$resolvedLocalExpr} < ?)",
+                    [
+                        $window['from_local']->format('Y-m-d H:i:s'),
+                        $window['to_exclusive_local']->format('Y-m-d H:i:s'),
+                    ]
+                );
+
+                $candidateQuery
+                    ->orderBy('s.id')
+                    ->chunkById(2000, function ($chunk) use (&$ids, $window, $timezone) {
+                        foreach ($chunk as $sale) {
+                            if (! $this->saleFallsWithinCashierBusinessWindow(
+                                $sale->created_at ?? null,
+                                $sale->sale_number ?? null,
+                                $window['from_local'],
+                                $window['to_exclusive_local'],
+                                $timezone
+                            )) {
+                                continue;
+                            }
+
+                            $saleId = (string) ($sale->id ?? '');
+                            if ($saleId !== '') {
+                                $ids[$saleId] = true;
+                            }
+                        }
+                    }, 's.id', 'id');
             }
 
-            $ids = array_values(array_unique(array_filter(array_map('strval', $ids))));
-            sort($ids);
-            return $ids;
+            $resolved = array_keys($ids);
+            sort($resolved);
+
+            return $resolved;
         });
     }
 

@@ -12,6 +12,7 @@ use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use App\Support\AnalyticsResponseCache;
 
 class CategorySummaryController extends Controller
 {
@@ -21,9 +22,29 @@ class CategorySummaryController extends Controller
     ) {
     }
 
+
+
+    private function okCached($request, string $namespace, array $params, callable $callback)
+    {
+        @ini_set('max_execution_time', '240');
+        @set_time_limit(240);
+
+        $payload = AnalyticsResponseCache::remember(
+            $namespace,
+            $params,
+            $callback,
+            300,
+            (string) ($request->user()?->getAuthIdentifier() ?? '')
+        );
+
+        return $payload;
+    }
     public function index(ListCategorySummaryRequest $request)
     {
-        $v = $request->validated();
+        $validated = $request->validated();
+
+        return $this->okCached($request, 'finance-category-summary.index', $validated, function () use ($request, $validated) {
+        $v = $validated;
         $sort = (string) ($v['sort'] ?? 'category_name');
         $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
 
@@ -40,7 +61,7 @@ class CategorySummaryController extends Controller
         [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
 
         if ($request->boolean('filters_only')) {
-            return ApiResponse::ok([
+            return [
                 'items' => [],
                 'summary' => [
                     'item_sold' => 0,
@@ -75,7 +96,7 @@ class CategorySummaryController extends Controller
                     'category_segment_placeholder' => false,
                     'cogs_source' => 'not_available',
                 ],
-            ], 'OK');
+            ];
         }
 
         $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
@@ -141,6 +162,8 @@ class CategorySummaryController extends Controller
                 'cogs_source' => 'not_available',
             ],
         ], 'OK');
+    
+        });
     }
 
     private function buildRows(array $outletIds, array $saleScope, string $sort, string $dir, string $categorySegment): Builder

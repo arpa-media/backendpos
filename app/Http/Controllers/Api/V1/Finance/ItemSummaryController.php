@@ -12,6 +12,7 @@ use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use App\Support\AnalyticsResponseCache;
 
 class ItemSummaryController extends Controller
 {
@@ -21,9 +22,29 @@ class ItemSummaryController extends Controller
     ) {
     }
 
+
+
+    private function okCached($request, string $namespace, array $params, callable $callback)
+    {
+        @ini_set('max_execution_time', '240');
+        @set_time_limit(240);
+
+        $payload = AnalyticsResponseCache::remember(
+            $namespace,
+            $params,
+            $callback,
+            300,
+            (string) ($request->user()?->getAuthIdentifier() ?? '')
+        );
+
+        return $payload;
+    }
     public function index(ListItemSummaryRequest $request)
     {
-        $v = $request->validated();
+        $validated = $request->validated();
+
+        return $this->okCached($request, 'finance-item-summary.index', $validated, function () use ($request, $validated) {
+        $v = $validated;
         $sort = (string) ($v['sort'] ?? 'category_name');
         $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
         $categorySegment = FinanceCategorySegment::normalize((string) ($v['category_segment'] ?? ''));
@@ -40,7 +61,7 @@ class ItemSummaryController extends Controller
         [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
 
         if ($request->boolean('filters_only')) {
-            return ApiResponse::ok([
+            return [
                 'items' => [],
                 'summary' => [
                     'item_sold' => 0,
@@ -74,7 +95,7 @@ class ItemSummaryController extends Controller
                     'bar_category_names' => FinanceCategorySegment::barCategoryNames(),
                     'cogs_source' => 'not_available',
                 ],
-            ], 'OK');
+            ];
         }
 
         $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
@@ -143,6 +164,8 @@ class ItemSummaryController extends Controller
                 'cogs_source' => 'not_available',
             ],
         ], 'OK');
+    
+        });
     }
 
     private function buildRows(array $outletIds, array $saleScope, string $sort, string $dir, string $categorySegment): Builder

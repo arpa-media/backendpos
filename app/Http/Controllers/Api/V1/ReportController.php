@@ -17,6 +17,7 @@ use App\Services\ReportService;
 use App\Support\BackofficeOutletScope;
 use App\Support\FinanceOutletFilter;
 use App\Support\OutletScope;
+use App\Support\AnalyticsResponseCache;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -37,33 +38,52 @@ class ReportController extends Controller
         return $params;
     }
 
+
+
+    private function jsonCached(Request $request, string $namespace, array $params, callable $callback): JsonResponse
+    {
+        @ini_set('max_execution_time', '240');
+        @set_time_limit(240);
+
+        $payload = AnalyticsResponseCache::remember(
+            $namespace,
+            $params,
+            $callback,
+            300,
+            (string) ($request->user()?->getAuthIdentifier() ?? '')
+        );
+
+        return response()->json(['data' => $payload]);
+    }
     public function cashierReport(CashierReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return response()->json(['data' => $service->cashierReport($params, OutletScope::id($request))]);
+        return $this->jsonCached($request, 'report.cashier-report', $params, fn () => $service->cashierReport($params, OutletScope::id($request)));
     }
 
     public function cashierReportCashiers(CashierReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return response()->json(['data' => $service->cashierReportCashiers($params, OutletScope::id($request))]);
+        return $this->jsonCached($request, 'report.cashier-report-cashiers', $params, fn () => $service->cashierReportCashiers($params, OutletScope::id($request)));
     }
 
     public function cashierReportByCashier(CashierReportRequest $request, string $cashierId, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
         $params['cashier_id'] = $cashierId;
-        return response()->json(['data' => $service->cashierReport($params, OutletScope::id($request))]);
+        return $this->jsonCached($request, 'report.cashier-report-by-cashier', $params, fn () => $service->cashierReport($params, OutletScope::id($request)));
     }
 
     public function ledger(LedgerReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->ledger($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.ledger', $params, fn () => $service->ledger($params, OutletScope::id($request)));
     }
 
     public function marking(MarkingReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->marking($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.marking', $params, fn () => $service->marking($params, OutletScope::id($request)));
     }
 
     public function markingConfig(Request $request, MarkingService $service): JsonResponse
@@ -123,36 +143,43 @@ class ReportController extends Controller
 
     public function itemSold(ReportRangeRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->itemSold($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.item-sold', $params, fn () => $service->itemSold($params, OutletScope::id($request)));
     }
 
     public function recentSales(RecentSalesReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->recentSales($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.recent-sales', $params, fn () => $service->recentSales($params, OutletScope::id($request)));
     }
 
     public function itemByProduct(ReportRangeRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->itemByProduct($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.item-by-product', $params, fn () => $service->itemByProduct($params, OutletScope::id($request)));
     }
 
     public function itemByVariant(ReportRangeRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->itemByVariant($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.item-by-variant', $params, fn () => $service->itemByVariant($params, OutletScope::id($request)));
     }
 
     public function rounding(RoundingReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->rounding($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.rounding', $params, fn () => $service->rounding($params, OutletScope::id($request)));
     }
 
     public function tax(TaxReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->tax($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.tax', $params, fn () => $service->tax($params, OutletScope::id($request)));
     }
 
     public function discount(DiscountReportRequest $request, ReportService $service): JsonResponse
     {
-        return response()->json(['data' => $service->discount($this->injectBackofficeScope($request), OutletScope::id($request))]);
+        $params = $this->injectBackofficeScope($request);
+        return $this->jsonCached($request, 'report.discount', $params, fn () => $service->discount($params, OutletScope::id($request)));
     }
 }

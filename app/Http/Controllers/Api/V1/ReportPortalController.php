@@ -22,7 +22,10 @@ class ReportPortalController extends Controller
             '_scope_selected_outlet' => (string) ($scope['selected_outlet_id'] ?? ''),
             '_scope_marked_only' => (bool) ($scope['marked_only'] ?? false),
         ]);
-        $payload = AnalyticsResponseCache::remember($namespace, $cacheParams, $callback, 60, (string) $request->user()?->getAuthIdentifier());
+        @ini_set('max_execution_time', '180');
+        @set_time_limit(180);
+        $ttlSeconds = str_contains($namespace, 'dashboard') ? 300 : 180;
+        $payload = AnalyticsResponseCache::remember($namespace, $cacheParams, $callback, $ttlSeconds, (string) $request->user()?->getAuthIdentifier());
 
         return ApiResponse::ok($payload, 'OK');
     }

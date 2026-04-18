@@ -11,6 +11,7 @@ use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use App\Support\AnalyticsResponseCache;
 
 class FinanceOverviewController extends Controller
 {
@@ -20,6 +21,23 @@ class FinanceOverviewController extends Controller
     ) {
     }
 
+
+
+    private function okCached($request, string $namespace, array $params, callable $callback)
+    {
+        @ini_set('max_execution_time', '240');
+        @set_time_limit(240);
+
+        $payload = AnalyticsResponseCache::remember(
+            $namespace,
+            $params,
+            $callback,
+            300,
+            (string) ($request->user()?->getAuthIdentifier() ?? '')
+        );
+
+        return ApiResponse::ok($payload, 'OK');
+    }
     private const PAYMENT_BUCKETS = [
         'cash' => 'Tunai',
         'qris_bca' => 'Qris BCA',
@@ -35,7 +53,10 @@ class FinanceOverviewController extends Controller
 
     public function index(ListFinanceOverviewRequest $request)
     {
-        $v = $request->validated();
+        $validated = $request->validated();
+
+        return $this->okCached($request, 'finance-overview.index', $validated, function () use ($request, $validated) {
+        $v = $validated;
         $isExport = filter_var($v['export'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
         $outletFilter = FinanceOutletFilter::resolve((string) ($v['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
@@ -50,7 +71,7 @@ class FinanceOverviewController extends Controller
         [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
 
         if ($request->boolean('filters_only')) {
-            return ApiResponse::ok([
+            return [
                 'summary' => [
                     'gross_sales' => 0,
                     'marking_gross_sales' => 0,
@@ -75,7 +96,7 @@ class FinanceOverviewController extends Controller
                     'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                     'generated_at' => null,
                 ],
-            ], 'OK');
+            ];
         }
 
         $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
@@ -168,7 +189,9 @@ class FinanceOverviewController extends Controller
             ];
         }
 
-        return ApiResponse::ok($payload, 'OK');
+        return $payload;
+    
+        });
     }
 
     private function resolveEligibleSalesScope(array $outletIds, array $filters, string $timezone): array
