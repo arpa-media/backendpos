@@ -15,3 +15,7 @@ Schedule::command('report-sale-scope-cache:prune')
 Schedule::command('report-sale-business-dates:sync-recent --days=45')
     ->everyFifteenMinutes()
     ->withoutOverlapping();
+
+Schedule::command('report-sale-scopes:warm-common --days=30 --per-outlet=1')
+    ->hourly()
+    ->withoutOverlapping();

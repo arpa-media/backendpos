@@ -94,24 +94,45 @@ class ReportPortalAnalyticsService
             ];
         }
 
-        $fingerprint = [
-            'outlets' => $outletIds,
-            'date_from' => (string) ($params['date_from'] ?? ''),
-            'date_to' => (string) ($params['date_to'] ?? ''),
-            'timezone' => $timezone,
-            'marked_only' => ! empty($scope['marked_only']),
-        ];
-
         return $this->reportSaleScopeCache->remember(
             'report-portal.sales-scope',
-            $fingerprint,
-            fn () => $this->cashierAlignedSaleScope->eligibleSaleIds(
-                $outletIds,
-                $params['date_from'] ?? null,
-                $params['date_to'] ?? null,
-                $timezone,
-            ),
-            360,
+            [
+                'portal_code' => (string) ($scope['portal_code'] ?? ''),
+                'marked_only' => (bool) ($scope['marked_only'] ?? false),
+                'outlets' => $outletIds,
+                'date_from' => (string) ($params['date_from'] ?? ''),
+                'date_to' => (string) ($params['date_to'] ?? ''),
+                'timezone' => $timezone,
+            ],
+            function () use ($outletIds, $params, $timezone, $scope) {
+                $eligibleIds = $this->cashierAlignedSaleScope->eligibleSaleIds(
+                    $outletIds,
+                    $params['date_from'] ?? null,
+                    $params['date_to'] ?? null,
+                    $timezone,
+                );
+
+                if (empty($scope['marked_only']) || $eligibleIds === []) {
+                    return $eligibleIds;
+                }
+
+                $filtered = [];
+                foreach (array_chunk($eligibleIds, 1000) as $chunk) {
+                    $rows = DB::table('sales')
+                        ->whereIn('id', $chunk)
+                        ->whereRaw('COALESCE(CAST(marking AS SIGNED), 0) = 1')
+                        ->pluck('id')
+                        ->map(fn ($id) => (string) $id)
+                        ->all();
+                    $filtered = array_merge($filtered, $rows);
+                }
+
+                $filtered = array_values(array_unique(array_filter(array_map('strval', $filtered))));
+                sort($filtered);
+
+                return $filtered;
+            },
+            20,
         );
     }
 
@@ -172,15 +193,44 @@ class ReportPortalAnalyticsService
         $scopeKey = (string) ($saleScope['scope_key'] ?? '');
         $paymentBreakdownRows = $this->resolvePaymentBreakdown($saleScope, $outletIds);
 
-        $metricsRow = DB::table('sales as s')
+        $salesRows = DB::table('sales as s')
             ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
+            ->join('outlets as o', 'o.id', '=', 's.outlet_id')
+            ->leftJoinSub($this->paymentSummarySubquery($scopeKey), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'))
+            ->leftJoinSub($this->channelMapSubquery($scopeKey), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
             ->whereNull('s.deleted_at')
             ->where('s.status', '=', 'PAID');
-        $this->scopeService->applySalesScope($metricsRow, $scope, 's');
-        $metricsRow = $metricsRow
-            ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(COALESCE(s.grand_total, 0)), 0) as gross_sales')
-            ->first();
+
+        $this->scopeService->applySalesScope($salesRows, $scope, 's');
+
+        $salesRows = $salesRows->get([
+            's.id as sale_id',
+            's.outlet_id',
+            's.sale_number',
+            's.channel',
+            's.payment_method_name',
+            's.payment_method_type',
+            's.subtotal',
+            's.discount_total',
+            's.service_charge_total',
+            DB::raw('COALESCE(s.grand_total, 0) as grand_total'),
+            DB::raw('COALESCE(s.tax_total, 0) as tax_total'),
+            DB::raw('COALESCE(s.rounding_total, 0) as rounding_total'),
+            's.paid_total',
+            's.change_total',
+            's.marking',
+            's.created_at',
+            'o.code as outlet_code',
+            'o.name as outlet_name',
+            'o.timezone as outlet_timezone',
+            DB::raw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel"),
+            DB::raw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display"),
+            DB::raw('COALESCE(payments.has_payment_rows, 0) as has_payment_rows'),
+        ]);
+
+        $trxCount = $salesRows->count();
+        $grossSales = (int) $salesRows->sum(fn ($row) => (int) ($row->grand_total ?? 0));
+        $avgTicket = $trxCount > 0 ? (int) floor($grossSales / $trxCount) : 0;
 
         $itemsSoldQuery = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
@@ -191,11 +241,18 @@ class ReportPortalAnalyticsService
         $this->scopeService->applySalesScope($itemsSoldQuery, $scope, 's');
         $itemsSold = (int) $itemsSoldQuery->selectRaw('COALESCE(SUM(si.qty), 0) as qty_sum')->value('qty_sum');
 
-        $trxCount = (int) ($metricsRow->trx_count ?? 0);
-        $grossSales = (int) ($metricsRow->gross_sales ?? 0);
-        $avgTicket = $trxCount > 0 ? (int) floor($grossSales / $trxCount) : 0;
-
-        $byChannel = $this->resolveChannelBreakdown($saleScope, $scope);
+        $channelAccumulator = [];
+        foreach ($salesRows as $row) {
+            $channelKey = (string) ($row->display_channel ?? $row->channel ?? '-');
+            $channelAccumulator[$channelKey] ??= [
+                'channel' => $channelKey,
+                'trx_count' => 0,
+                'gross_sales' => 0,
+            ];
+            $channelAccumulator[$channelKey]['trx_count']++;
+            $channelAccumulator[$channelKey]['gross_sales'] += (int) ($row->grand_total ?? 0);
+        }
+        $byChannel = array_values($channelAccumulator);
         usort($byChannel, fn (array $a, array $b) => ($b['gross_sales'] <=> $a['gross_sales']) ?: (($b['trx_count'] ?? 0) <=> ($a['trx_count'] ?? 0)) ?: strcmp((string) ($a['channel'] ?? ''), (string) ($b['channel'] ?? '')));
 
         $byPaymentMethod = $paymentBreakdownRows;
@@ -250,42 +307,15 @@ class ReportPortalAnalyticsService
             ->values()
             ->all();
 
-        $recentSalesQuery = DB::table('sales as s')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->leftJoinSub($this->paymentSummarySubquery($scopeKey), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'))
-            ->leftJoinSub($this->channelMapSubquery($scopeKey), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-        $this->scopeService->applySalesScope($recentSalesQuery, $scope, 's');
-        $recentSales = $recentSalesQuery
-            ->orderByDesc('s.created_at')
-            ->orderByDesc('s.id')
-            ->limit($recentLimit)
-            ->get([
-                's.id as sale_id',
-                's.outlet_id',
-                's.sale_number',
-                's.channel',
-                's.payment_method_name',
-                's.payment_method_type',
-                's.subtotal',
-                's.discount_total',
-                's.service_charge_total',
-                DB::raw('COALESCE(s.grand_total, 0) as grand_total'),
-                DB::raw('COALESCE(s.tax_total, 0) as tax_total'),
-                DB::raw('COALESCE(s.rounding_total, 0) as rounding_total'),
-                's.paid_total',
-                's.change_total',
-                's.marking',
-                's.created_at',
-                'o.code as outlet_code',
-                'o.name as outlet_name',
-                'o.timezone as outlet_timezone',
-                DB::raw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel"),
-                DB::raw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display"),
-                DB::raw('COALESCE(payments.has_payment_rows, 0) as has_payment_rows'),
-            ])
+        $recentSales = $salesRows
+            ->sort(function ($left, $right) {
+                $createdCompare = strcmp((string) ($right->created_at ?? ''), (string) ($left->created_at ?? ''));
+                if ($createdCompare !== 0) {
+                    return $createdCompare;
+                }
+                return strcmp((string) ($right->sale_id ?? ''), (string) ($left->sale_id ?? ''));
+            })
+            ->take($recentLimit)
             ->map(fn ($row) => $this->mapSaleListRow($row))
             ->values()
             ->all();
@@ -314,7 +344,7 @@ class ReportPortalAnalyticsService
                 'items' => $recentSales,
                 'meta' => [
                     'limit' => $recentLimit,
-                    'total' => $trxCount,
+                    'total' => count($recentSales),
                 ],
             ],
         ];
@@ -713,42 +743,6 @@ class ReportPortalAnalyticsService
             'last_page' => $paginator->lastPage(),
             'total' => $paginator->total(),
         ];
-    }
-
-
-    private function resolveChannelBreakdown(array $saleScope, array $scope): array
-    {
-        $scopeKey = (string) ($saleScope['scope_key'] ?? '');
-        if ($scopeKey === '' || ! ($saleScope['has_rows'] ?? false)) {
-            return [];
-        }
-
-        $normalizedRows = DB::table('sales as s')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->leftJoinSub($this->channelMapSubquery($scopeKey), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-        $this->scopeService->applySalesScope($normalizedRows, $scope, 's');
-
-        return DB::query()
-            ->fromSub(
-                $normalizedRows
-                    ->selectRaw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as channel")
-                    ->selectRaw('COALESCE(s.grand_total, 0) as gross_sales'),
-                'channel_rows'
-            )
-            ->selectRaw('channel')
-            ->selectRaw('COUNT(*) as trx_count')
-            ->selectRaw('COALESCE(SUM(gross_sales), 0) as gross_sales')
-            ->groupBy('channel')
-            ->get()
-            ->map(fn ($row) => [
-                'channel' => (string) ($row->channel ?? '-'),
-                'trx_count' => (int) ($row->trx_count ?? 0),
-                'gross_sales' => (int) ($row->gross_sales ?? 0),
-            ])
-            ->values()
-            ->all();
     }
 
     private function resolvePaymentBreakdown(array $saleScope, array $outletIds): array

@@ -20,7 +20,7 @@ class OwnerOverviewController extends Controller
         @set_time_limit(240);
 
         $params = $request->validated();
-        $cacheKey = 'owner-overview:' . sha1(json_encode([
+        $cacheKey = 'owner-overview:v4:' . sha1(json_encode([
             'user_id' => (string) ($request->user()?->id ?? ''),
             'params' => $params,
         ]));

@@ -8,9 +8,9 @@ use Illuminate\Support\Facades\DB;
 
 class SyncReportSaleBusinessDateIndexCommand extends Command
 {
-    protected $signature = 'report-sale-business-dates:sync-recent {--days=45 : Jumlah hari business date yang dipanaskan}';
+    protected $signature = 'report-sale-business-dates:sync-recent {--days=45 : Jumlah hari business date exact yang dipanaskan}';
 
-    protected $description = 'Warm report sale business-date index for recent reporting windows.';
+    protected $description = 'Warm exact report sale business-date index for recent reporting windows.';
 
     public function handle(ReportSaleBusinessDateIndexService $service): int
     {
@@ -33,7 +33,7 @@ class SyncReportSaleBusinessDateIndexCommand extends Command
 
         $service->ensureCoverage($outletIds, $dateFrom, $dateTo, config('app.timezone', 'Asia/Jakarta'));
 
-        $this->info('Report sale business-date index warmed for ' . $dateFrom . ' until ' . $dateTo . '.');
+        $this->info('Exact report sale business-date index warmed for ' . $dateFrom . ' until ' . $dateTo . '.');
 
         return self::SUCCESS;
     }

@@ -10,6 +10,11 @@ use Illuminate\Support\Facades\DB;
 
 class CashierAlignedSaleScopeService
 {
+    public function __construct(
+        private readonly ReportSaleBusinessDateIndexService $businessDateIndex,
+    ) {
+    }
+
     public function eligibleSaleIds(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null): array
     {
         $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
@@ -20,14 +25,25 @@ class CashierAlignedSaleScopeService
         }
 
         $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
-        $cacheKey = 'cashier-aligned-sale-ids:' . sha1(json_encode([
+        $cacheKey = 'cashier-aligned-sale-ids:v3:' . sha1(json_encode([
             'outlets' => $normalizedOutletIds,
             'date_from' => $dateFrom,
             'date_to' => $dateTo,
             'timezones' => $timezoneMap,
         ]));
 
-        return Cache::remember($cacheKey, now()->addMinutes(15), function () use ($normalizedOutletIds, $timezoneMap, $dateFrom, $dateTo) {
+        return Cache::remember($cacheKey, now()->addMinutes(30), function () use ($normalizedOutletIds, $timezoneMap, $dateFrom, $dateTo) {
+            $indexedIds = $this->businessDateIndex->saleIdsIfCovered(
+                $normalizedOutletIds,
+                $dateFrom,
+                $dateTo,
+                false,
+                $timezoneMap[array_key_first($timezoneMap)] ?? TransactionDate::appTimezone(),
+            );
+            if ($indexedIds !== null) {
+                return $indexedIds;
+            }
+
             $ids = [];
             $groupedOutletIds = [];
             foreach ($normalizedOutletIds as $outletId) {
@@ -55,15 +71,6 @@ class CashierAlignedSaleScopeService
                     $window['requested_from']->toDateString(),
                     $candidateDateTo,
                     $timezone
-                );
-
-                $resolvedLocalExpr = TransactionDate::resolvedSaleLocalSqlExpression('s.created_at', 's.sale_number', $timezone);
-                $candidateQuery->whereRaw(
-                    "({$resolvedLocalExpr} >= ? AND {$resolvedLocalExpr} < ?)",
-                    [
-                        $window['from_local']->format('Y-m-d H:i:s'),
-                        $window['to_exclusive_local']->format('Y-m-d H:i:s'),
-                    ]
                 );
 
                 $candidateQuery
@@ -104,58 +111,14 @@ class CashierAlignedSaleScopeService
             return DB::table('sales as s')->select('s.id')->whereRaw('1 = 0');
         }
 
-        $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
-        $groupedOutletIds = [];
-        foreach ($normalizedOutletIds as $outletId) {
-            $timezone = $timezoneMap[$outletId] ?? TransactionDate::appTimezone();
-            $groupedOutletIds[$timezone] ??= [];
-            $groupedOutletIds[$timezone][] = $outletId;
+        $eligibleIds = $this->eligibleSaleIds($normalizedOutletIds, $dateFrom, $dateTo, $fallbackTimezone);
+        if ($eligibleIds === []) {
+            return DB::table('sales as s')->select('s.id')->whereRaw('1 = 0');
         }
 
-        $unionQuery = null;
-        foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
-            $groupQuery = $this->buildEligibleSalesGroupQuery($tzOutletIds, $dateFrom, $dateTo, $timezone);
-            $unionQuery = $unionQuery ? $unionQuery->union($groupQuery) : $groupQuery;
-        }
-
-        return DB::query()
-            ->fromSub($unionQuery ?? DB::table('sales as s')->select('s.id')->whereRaw('1 = 0'), 'cashier_aligned_sales')
-            ->select('cashier_aligned_sales.id')
-            ->distinct();
-    }
-
-    private function buildEligibleSalesGroupQuery(array $outletIds, ?string $dateFrom, ?string $dateTo, string $timezone): Builder
-    {
-        $window = $this->resolveCashierBusinessWindow($dateFrom, $dateTo, $timezone);
-        $query = DB::table('sales as s')
+        return DB::table('sales as s')
             ->select('s.id')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID')
-            ->whereIn('s.outlet_id', array_values(array_unique(array_filter(array_map('strval', $outletIds)))));
-
-        $candidateDateTo = $this->isMakassarCashierBusinessTimezone($timezone)
-            ? $window['requested_to']->addDay()->toDateString()
-            : $window['requested_to']->toDateString();
-
-        $this->applyCashierCandidateScope(
-            $query,
-            's.sale_number',
-            's.created_at',
-            $window['requested_from']->toDateString(),
-            $candidateDateTo,
-            $timezone
-        );
-
-        $resolvedLocalExpr = TransactionDate::resolvedSaleLocalSqlExpression('s.created_at', 's.sale_number', $timezone);
-        $query->whereRaw(
-            "({$resolvedLocalExpr} >= ? AND {$resolvedLocalExpr} < ?)",
-            [
-                $window['from_local']->format('Y-m-d H:i:s'),
-                $window['to_exclusive_local']->format('Y-m-d H:i:s'),
-            ]
-        );
-
-        return $query->distinct();
+            ->whereIn('s.id', $eligibleIds);
     }
 
     private function resolveTimezoneMap(array $outletIds, ?string $fallbackTimezone = null): array
@@ -236,7 +199,7 @@ class CashierAlignedSaleScopeService
     private function saleFallsWithinCashierBusinessWindow($createdAt, ?string $saleNumber, CarbonImmutable $fromLocal, CarbonImmutable $toExclusiveLocal, ?string $timezone = null): bool
     {
         $localText = TransactionDate::formatSaleLocal($createdAt, $timezone, $saleNumber);
-        if (!$localText) {
+        if (! $localText) {
             return false;
         }
 
@@ -258,7 +221,7 @@ class CashierAlignedSaleScopeService
         );
 
         $tokens = TransactionDate::dateTokens($dateFrom, $dateTo, $timezone ?: TransactionDate::appTimezone());
-        if (!$saleNumberColumn || empty($tokens)) {
+        if (! $saleNumberColumn || empty($tokens)) {
             $query->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
             return;
         }
