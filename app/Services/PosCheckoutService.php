@@ -1311,7 +1311,7 @@ class PosCheckoutService
             }
 
             $queueNo = trim((string) ($row->queue_no ?? ''));
-            if ($queueNo !== '' && preg_match('/(\d+)$/', $queueNo, $queueMatches)) {
+            if ($queueNo !== '' && preg_match('/^(\d+)(?:-[A-Z0-9]+)?$/', strtoupper($queueNo), $queueMatches)) {
                 $maxSequence = max($maxSequence, (int) $queueMatches[1]);
             }
         }

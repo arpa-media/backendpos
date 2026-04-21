@@ -20,6 +20,7 @@ class UpdateOutletRequest extends FormRequest
             'phone' => ['nullable', 'string', 'max:50'],
             'ig_1' => ['nullable', 'string', 'max:150'],
             'ig_2' => ['nullable', 'string', 'max:150'],
+            'passwordwifi' => ['nullable', 'string', 'max:255'],
             'timezone' => ['nullable', 'string', 'max:64'],
         ];
     }

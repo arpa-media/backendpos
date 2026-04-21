@@ -22,6 +22,7 @@ class Outlet extends Model
         'phone',
         'ig_1',
         'ig_2',
+        'passwordwifi',
         'timezone',
         'latitude',
         'longitude',
