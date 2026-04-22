@@ -6,11 +6,15 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Outlet\UpdateOutletRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Outlet\OutletResource;
+use App\Http\Resources\Api\V1\Outlet\PosLoginOutletOptionResource;
 use App\Models\Outlet;
 use App\Support\Auth\UserAuthContextResolver;
 use App\Support\OutletScope;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 class OutletController extends Controller
 {
@@ -42,9 +46,77 @@ class OutletController extends Controller
         ], 'OK');
     }
 
-    public function posLoginOptions()
+    public function posLoginOptions(Request $request)
     {
+        $cacheKey = 'pos:login-options:v3';
+        $staleKey = 'pos:login-options:stale:v3';
+
+        $cached = Cache::get($cacheKey);
+        if (is_array($cached)) {
+            return ApiResponse::ok([
+                'items' => $cached,
+            ], 'OK')->withHeaders([
+                'X-POS-Outlets-Cache' => 'hit',
+                'X-POS-Outlets-Count' => (string) count($cached),
+                'X-POS-Outlets-Source' => 'cache',
+            ]);
+        }
+
+        $startedAt = microtime(true);
+
+        try {
+            $items = $this->buildPosLoginOutletOptions();
+            $payload = PosLoginOutletOptionResource::collection($items)->resolve();
+
+            Cache::put($cacheKey, $payload, now()->addMinutes(5));
+            Cache::put($staleKey, $payload, now()->addDay());
+
+            return ApiResponse::ok([
+                'items' => $payload,
+            ], 'OK')->withHeaders([
+                'X-POS-Outlets-Cache' => 'miss',
+                'X-POS-Outlets-Count' => (string) count($payload),
+                'X-POS-Outlets-Source' => 'fresh',
+                'X-POS-Outlets-Gen-Ms' => (string) ((int) round((microtime(true) - $startedAt) * 1000)),
+            ]);
+        } catch (Throwable $exception) {
+            $stale = Cache::get($staleKey);
+            if (is_array($stale) && $stale !== []) {
+                Log::warning('POS outlets served from stale cache fallback', [
+                    'path' => $request->path(),
+                    'error' => $exception->getMessage(),
+                    'user_agent' => substr((string) $request->userAgent(), 0, 255),
+                ]);
+
+                return ApiResponse::ok([
+                    'items' => $stale,
+                ], 'OK')->withHeaders([
+                    'X-POS-Outlets-Cache' => 'stale',
+                    'X-POS-Outlets-Count' => (string) count($stale),
+                    'X-POS-Outlets-Source' => 'stale-fallback',
+                ]);
+            }
+
+            throw $exception;
+        }
+    }
+
+    private function buildPosLoginOutletOptions()
+    {
+        $columns = [
+            'id',
+            'code',
+            'name',
+            'type',
+            'timezone',
+        ];
+
+        if (Schema::hasColumn('outlets', 'is_active')) {
+            $columns[] = 'is_active';
+        }
+
         $baseQuery = Outlet::query()
+            ->select($columns)
             ->whereRaw('LOWER(COALESCE(type, ?)) = ?', ['outlet', 'outlet'])
             ->orderBy('name');
 
@@ -57,7 +129,7 @@ class OutletController extends Controller
         $items = $baseQuery->get();
 
         if ($items->isEmpty()) {
-            $fallback = Outlet::query()->orderBy('name');
+            $fallback = Outlet::query()->select($columns)->orderBy('name');
 
             if (Schema::hasColumn('outlets', 'code')) {
                 $fallback->whereNotNull('code');
@@ -70,9 +142,7 @@ class OutletController extends Controller
             })->values();
         }
 
-        return ApiResponse::ok([
-            'items' => OutletResource::collection($items),
-        ], 'OK');
+        return $items;
     }
 
     public function show(Request $request)
