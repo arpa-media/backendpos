@@ -24,6 +24,8 @@ class OutletResource extends JsonResource
             'ig_1' => $outlet->ig_1,
             'ig_2' => $outlet->ig_2,
             'passwordwifi' => $outlet->passwordwifi,
+            'pos_delete_bill_pin' => preg_replace('/\D+/', '', (string) ($outlet->pos_delete_bill_pin ?: '0341')) ?: '0341',
+            'delete_open_bill_pin' => preg_replace('/\D+/', '', (string) ($outlet->pos_delete_bill_pin ?: '0341')) ?: '0341',
             'timezone' => (string) ($outlet->timezone ?? 'Asia/Jakarta'),
             'is_active' => $outlet->is_active === null ? null : (bool) $outlet->is_active,
             'created_at' => optional($outlet->created_at)->toISOString(),

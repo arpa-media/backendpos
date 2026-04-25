@@ -113,6 +113,9 @@ Route::prefix('v1')->group(function () {
 
             Route::get('/squad-users', [PosController::class, 'squadUsers'])
                 ->middleware('permission:discount.view');
+
+            Route::post('/open-bills/verify-delete-pin', [UserManagementController::class, 'verifyOutletDeleteBillPin'])
+                ->middleware('permission_or_snapshot:sale.cancel.approve');
         });
 
 
@@ -271,6 +274,7 @@ Route::put('/outlet', [OutletController::class, 'update'])
                 Route::put('/users/{userId}/access', [UserManagementController::class, 'updateUserAccess']);
                 Route::put('/users/{userId}/profile', [UserManagementController::class, 'updateUserProfile']);
                 Route::put('/users/{userId}/provision-control', [UserManagementController::class, 'updateUserProvisionControl']);
+                Route::put('/outlets/{outletId}/delete-open-bill-pin', [UserManagementController::class, 'updateOutletDeleteBillPin']);
                 Route::put('/portal-permissions', [UserManagementController::class, 'updatePortalPermission']);
                 Route::put('/portal-permissions/bulk', [UserManagementController::class, 'bulkPortalPermissions']);
                 Route::put('/menu-permissions', [UserManagementController::class, 'updateMenuPermission']);

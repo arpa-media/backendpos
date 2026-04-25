@@ -1169,40 +1169,33 @@ class PosCheckoutService
         $requested = strtoupper(trim((string) ($requestedQueueNo ?? '')));
         $requested = preg_replace('/[^A-Z0-9-]+/', '', $requested) ?? '';
         $requested = substr($requested, 0, 20);
-
-        if ($requested === '') {
-            return $this->generateQueueNumber($outletId, $transactionMoment);
-        }
-
-        $exists = Sale::query()
-            ->where('outlet_id', $outletId)
-            ->where('queue_no', $requested)
-            ->lockForUpdate()
-            ->exists();
-
-        if (!$exists) {
-            return $requested;
-        }
-
         $context = $this->resolveSaleSequenceContext($outletId, $transactionMoment);
-        $nextCount = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
-        $counter = str_pad((string) $nextCount, 3, '0', STR_PAD_LEFT);
-        $base = preg_replace('/[^A-Z0-9]/', '', strtoupper((string) ($clientSyncId ?? '')));
-        $suffix = substr($base, 0, 4);
-        if ($suffix === '') {
-            $suffix = Str::upper(Str::random(4));
+
+        $requestedNumber = null;
+        if ($requested !== '' && preg_match('/^(\d{1,6})(?:-[A-Z0-9]+)?$/', $requested, $matches)) {
+            $requestedNumber = str_pad((string) ((int) $matches[1]), 3, '0', STR_PAD_LEFT);
         }
 
-        $candidate = sprintf('%s-%s', $counter, str_pad($suffix, 4, 'X'));
-        $candidate = substr($candidate, 0, 20);
+        if ($requestedNumber !== null) {
+            $expectedSequence = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
 
-        $candidateExists = Sale::query()
-            ->where('outlet_id', $outletId)
-            ->where('queue_no', $candidate)
-            ->lockForUpdate()
-            ->exists();
+            $existsSameVisibleQueue = Sale::query()
+                ->where('outlet_id', $outletId)
+                ->whereBetween('created_at', [$context['day_start_utc'], $context['day_end_utc']])
+                ->where(function ($query) use ($requestedNumber) {
+                    $query
+                        ->where('queue_no', $requestedNumber)
+                        ->orWhere('queue_no', 'like', $requestedNumber . '-%');
+                })
+                ->lockForUpdate()
+                ->exists();
 
-        return $candidateExists ? sprintf('%s-%s', $counter, Str::upper(Str::random(4))) : $candidate;
+            if (! $existsSameVisibleQueue && (int) $requestedNumber === $expectedSequence) {
+                return $requestedNumber;
+            }
+        }
+
+        return $this->generateQueueNumber($outletId, $transactionMoment);
     }
 
     public function generateSaleNumber(string $outletId, $transactionMoment = null): string
@@ -1237,6 +1230,16 @@ class PosCheckoutService
         );
 
         if (!preg_match($pattern, $preferred)) {
+            return $this->generateSaleNumber($outletId, $transactionMoment);
+        }
+
+        $expectedSequence = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
+        $preferredSequence = null;
+        if (preg_match('/-(\d{3})$/', $preferred, $sequenceMatches)) {
+            $preferredSequence = (int) $sequenceMatches[1];
+        }
+
+        if ($preferredSequence !== $expectedSequence) {
             return $this->generateSaleNumber($outletId, $transactionMoment);
         }
 

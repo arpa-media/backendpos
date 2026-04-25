@@ -23,6 +23,7 @@ class Outlet extends Model
         'ig_1',
         'ig_2',
         'passwordwifi',
+        'pos_delete_bill_pin',
         'timezone',
         'latitude',
         'longitude',

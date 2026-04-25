@@ -633,6 +633,8 @@ class UserManagementService
             'username' => $user->username ? (string) $user->username : null,
             'email' => (string) $user->email,
             'is_active' => (bool) ($user->is_active ?? true),
+            'pos_delete_bill_pin' => preg_replace('/\D+/', '', (string) ($resolvedOutlet?->pos_delete_bill_pin ?: '0341')) ?: '0341',
+            'delete_open_bill_pin' => preg_replace('/\D+/', '', (string) ($resolvedOutlet?->pos_delete_bill_pin ?: '0341')) ?: '0341',
             'outlet_id' => $resolvedOutlet?->id ? (string) $resolvedOutlet->id : null,
             'outlet_code' => $resolvedOutlet?->code ? (string) $resolvedOutlet->code : null,
             'outlet_type' => $resolvedOutlet?->type ? (string) $resolvedOutlet->type : null,
@@ -646,6 +648,8 @@ class UserManagementService
                 'name' => (string) $resolvedOutlet->name,
                 'type' => (string) ($resolvedOutlet->type ?? 'outlet'),
                 'timezone' => (string) ($resolvedOutlet->timezone ?? 'Asia/Jakarta'),
+                'pos_delete_bill_pin' => preg_replace('/\D+/', '', (string) ($resolvedOutlet?->pos_delete_bill_pin ?: '0341')) ?: '0341',
+                'delete_open_bill_pin' => preg_replace('/\D+/', '', (string) ($resolvedOutlet?->pos_delete_bill_pin ?: '0341')) ?: '0341',
             ] : null,
             'assignment' => $assignment ? [
                 'id' => (string) $assignment->id,

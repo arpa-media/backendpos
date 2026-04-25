@@ -17,6 +17,7 @@ use App\Models\User;
 use App\Services\UserManagementService;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
 use Spatie\Permission\Models\Permission;
 
@@ -123,6 +124,8 @@ class UserManagementController extends Controller
                     'code' => $outlet->code,
                     'type' => $outlet->type,
                     'timezone' => $outlet->timezone,
+                    'pos_delete_bill_pin' => $this->outletDeleteBillPin($outlet),
+                    'delete_open_bill_pin' => $this->outletDeleteBillPin($outlet),
                 ] : null,
                 'access' => [
                     'role' => $accessRole ? [
@@ -343,6 +346,8 @@ class UserManagementController extends Controller
                     'code' => $outlet->code,
                     'type' => $outlet->type,
                     'timezone' => $outlet->timezone,
+                    'pos_delete_bill_pin' => $this->outletDeleteBillPin($outlet),
+                    'delete_open_bill_pin' => $this->outletDeleteBillPin($outlet),
                 ] : null,
                 'access' => [
                     'role' => $accessRole ? [
@@ -450,6 +455,8 @@ class UserManagementController extends Controller
                     'code' => $outlet->code,
                     'type' => $outlet->type,
                     'timezone' => $outlet->timezone,
+                    'pos_delete_bill_pin' => $this->outletDeleteBillPin($outlet),
+                    'delete_open_bill_pin' => $this->outletDeleteBillPin($outlet),
                 ] : null,
                 'access' => [
                     'role' => $accessRole ? [
@@ -675,6 +682,107 @@ class UserManagementController extends Controller
         ], 'Menu permissions updated');
     }
 
+    public function updateOutletDeleteBillPin(Request $request, string $outletId)
+    {
+        $data = $request->validate([
+            'pos_delete_bill_pin' => ['required', 'regex:/^\d{4,12}$/'],
+        ]);
+
+        $outlet = Outlet::query()->find($outletId);
+        if (! $outlet) {
+            return ApiResponse::error('Outlet tidak ditemukan.', 'OUTLET_NOT_FOUND', 404);
+        }
+
+        if (! Schema::hasColumn('outlets', 'pos_delete_bill_pin')) {
+            return ApiResponse::error('Kolom PIN outlet belum tersedia. Jalankan migration overlay patch terlebih dahulu.', 'OUTLET_PIN_SCHEMA_MISSING', 409);
+        }
+
+        $pin = preg_replace('/\D+/', '', (string) $data['pos_delete_bill_pin']) ?: '0341';
+        $outlet->forceFill(['pos_delete_bill_pin' => $pin])->save();
+
+        return ApiResponse::ok([
+            'outlet' => [
+                'id' => (string) $outlet->id,
+                'code' => (string) ($outlet->code ?? ''),
+                'name' => (string) ($outlet->name ?? ''),
+                'type' => $outlet->type,
+                'timezone' => $outlet->timezone,
+                'pos_delete_bill_pin' => $pin,
+                'delete_open_bill_pin' => $pin,
+            ],
+        ], 'PIN Delete Open Bill outlet berhasil diperbarui.');
+    }
+
+    public function verifyOutletDeleteBillPin(Request $request)
+    {
+        $data = $request->validate([
+            'pin' => ['required', 'regex:/^\d{4,12}$/'],
+            'outlet_id' => ['nullable', 'string', Rule::exists('outlets', 'id')],
+        ]);
+
+        $user = $request->user();
+        if (! $this->canDeleteOpenBill($user)) {
+            return ApiResponse::error('Delete Open Bill hanya boleh dilakukan oleh akun SPV/Supervisor.', 'SPV_ACCOUNT_REQUIRED', 403);
+        }
+
+        $user?->loadMissing(['employee.assignment.outlet', 'outlet', 'roles']);
+        $outletId = trim((string) ($data['outlet_id'] ?? $request->header('X-Outlet-Id', '')));
+        $outlet = $outletId !== ''
+            ? Outlet::query()->find($outletId)
+            : ($user?->employee?->assignment?->outlet ?: $user?->outlet);
+
+        if (! $outlet) {
+            return ApiResponse::error('Outlet tidak ditemukan untuk verifikasi PIN.', 'OUTLET_CONTEXT_REQUIRED', 422);
+        }
+
+        $expected = $this->outletDeleteBillPin($outlet);
+        $provided = preg_replace('/\D+/', '', (string) $data['pin']);
+
+        if (! hash_equals($expected, $provided)) {
+            return ApiResponse::error('PIN Delete Open Bill salah.', 'OUTLET_DELETE_BILL_PIN_INVALID', 422);
+        }
+
+        return ApiResponse::ok([
+            'verified' => true,
+            'outlet_id' => (string) $outlet->id,
+        ], 'PIN Delete Open Bill valid.');
+    }
+
+    private function canDeleteOpenBill(?User $user): bool
+    {
+        if (! $user) {
+            return false;
+        }
+
+        try {
+            if ($user->can('sale.cancel.approve') || $user->hasPermissionTo('sale.cancel.approve')) {
+                return true;
+            }
+        } catch (\Throwable) {
+            // Fallback to role/assignment text below for older permission snapshots.
+        }
+
+        $roleNames = $user->roles?->pluck('name')->map(fn ($role) => strtolower((string) $role))->all() ?? [];
+        foreach ($roleNames as $roleName) {
+            if (str_contains($roleName, 'spv') || str_contains($roleName, 'supervisor') || str_contains($roleName, 'manager') || str_contains($roleName, 'admin') || str_contains($roleName, 'owner')) {
+                return true;
+            }
+        }
+
+        $assignmentTitle = strtolower((string) ($user->employee?->assignment?->role_title ?? ''));
+        return $assignmentTitle !== '' && (str_contains($assignmentTitle, 'spv') || str_contains($assignmentTitle, 'supervisor'));
+    }
+
+    private function outletDeleteBillPin(?Outlet $outlet): string
+    {
+        $raw = '0341';
+        if ($outlet && Schema::hasColumn('outlets', 'pos_delete_bill_pin')) {
+            $raw = (string) ($outlet->pos_delete_bill_pin ?: '0341');
+        }
+
+        return preg_replace('/\D+/', '', $raw) ?: '0341';
+    }
+
     private function buildMasters(): array
     {
         $userTypes = AccessUserType::query()->orderBy('name')->get()->map(fn (AccessUserType $item) => [
@@ -701,6 +809,8 @@ class UserManagementController extends Controller
                 'name' => (string) ($item->name ?? ''),
                 'type' => $item->type,
                 'timezone' => $item->timezone,
+                'pos_delete_bill_pin' => $this->outletDeleteBillPin($item),
+                'delete_open_bill_pin' => $this->outletDeleteBillPin($item),
             ])
             ->values()
             ->all();
