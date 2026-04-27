@@ -13,6 +13,7 @@ use App\Http\Controllers\Api\V1\PosController;
 use App\Http\Controllers\Api\V1\ProductController;
 use App\Http\Controllers\Api\V1\SalesController;
 use App\Http\Controllers\Api\V1\SaleCancelRequestController;
+use App\Http\Controllers\Api\V1\SavedBillDeleteHistoryController;
 use App\Http\Controllers\Api\V1\Finance\SalesCollectedController;
 use App\Http\Controllers\Api\V1\Finance\FinanceOverviewController;
 use App\Http\Controllers\Api\V1\Finance\ItemSummaryController;
@@ -116,6 +117,14 @@ Route::prefix('v1')->group(function () {
 
             Route::post('/open-bills/verify-delete-pin', [UserManagementController::class, 'verifyOutletDeleteBillPin'])
                 ->middleware('permission_or_snapshot:sale.cancel.approve');
+
+            Route::post('/open-bills/delete-history', [SavedBillDeleteHistoryController::class, 'store'])
+                ->middleware('permission_or_snapshot:sale.cancel.approve');
+
+            // Patch-04: read alias for Cancel Save Bill history.
+            // Kept under POS prefix as a safe fallback for clients that cannot hit /cancel-save-bills yet.
+            Route::get('/open-bills/delete-history', [SavedBillDeleteHistoryController::class, 'index'])
+                ->middleware('permission_or_snapshot:sale.cancel.approve');
         });
 
 
@@ -207,6 +216,12 @@ Route::prefix('v1')->group(function () {
 
         Route::get('/cancel-requests', [SaleCancelRequestController::class, 'index'])
             ->middleware('permission_or_snapshot:sale.cancel.approve');
+        Route::get('/cancel-save-bills', [SavedBillDeleteHistoryController::class, 'index'])
+            ->middleware('permission_or_snapshot:sale.cancel.approve');
+
+        // Patch-04: finance namespace alias, so the backoffice finance portal can use either URL.
+        Route::get('/finance/cancel-save-bills', [SavedBillDeleteHistoryController::class, 'index'])
+            ->middleware(['report_observe', 'permission_or_snapshot:sale.cancel.approve']);
         Route::get('/cancel-requests/{id}', [SaleCancelRequestController::class, 'show'])
             ->middleware('permission_or_snapshot:sale.cancel.approve');
 

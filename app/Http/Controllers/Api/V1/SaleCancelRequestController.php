@@ -10,9 +10,9 @@ use App\Models\SaleCancelRequest;
 use App\Models\SaleItem;
 use App\Services\ReportImmediateRefreshBridge;
 use App\Support\AnalyticsResponseCache;
-use App\Support\OwnerOverviewCacheVersion;
 use App\Support\BackofficeOutletScope;
 use App\Support\OutletScope;
+use App\Support\OwnerOverviewCacheVersion;
 use App\Support\ReportPortalMarkedScopeVersion;
 use App\Support\SaleStatuses;
 use Illuminate\Http\Request;
@@ -48,6 +48,56 @@ class SaleCancelRequestController extends Controller
         }
 
         return $query;
+    }
+
+    private function normalizePin($value): string
+    {
+        return preg_replace('/\D+/', '', (string) ($value ?? '')) ?: '';
+    }
+
+    private function saleOutletPin(Sale $sale): string
+    {
+        $sale->loadMissing('outlet');
+        $raw = (string) ($sale->outlet?->pos_delete_bill_pin ?: '0341');
+        return $this->normalizePin($raw) ?: '0341';
+    }
+
+    private function resolveAutoApprovalByOutletPin(Request $request, Sale $sale, array $validated): array
+    {
+        $autoApprove = filter_var($validated['auto_approve'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if (! $autoApprove) {
+            return [false, null];
+        }
+
+        $pin = $this->normalizePin($validated['pin'] ?? null);
+        if ($pin === '') {
+            return [false, ApiResponse::error('PIN outlet wajib diisi.', 'OUTLET_PIN_REQUIRED', 422)];
+        }
+
+        $expected = $this->saleOutletPin($sale);
+        if (! hash_equals($expected, $pin)) {
+            return [false, ApiResponse::error('PIN outlet salah.', 'OUTLET_DELETE_BILL_PIN_INVALID', 422)];
+        }
+
+        return [true, null];
+    }
+
+    private function approveRequestWithOutletPin(SaleCancelRequest $req, $user): SaleCancelRequest
+    {
+        $req->decided_by_user_id = $user?->id ? (string) $user->id : null;
+        $req->decided_by_name = trim((string) ($user?->name ?? '')) ?: 'Outlet PIN';
+        $req->decided_at = now();
+        $req->decision_note = 'Auto approved by outlet PIN.';
+        $req->status = SaleCancelRequest::STATUS_APPROVED;
+        $req->save();
+
+        $sale = $req->sale;
+        if ($sale && (string) $req->request_type === SaleCancelRequest::REQUEST_TYPE_CANCEL && (string) $sale->status === SaleStatuses::PAID) {
+            $sale->status = SaleStatuses::VOID;
+            $sale->save();
+        }
+
+        return $req;
     }
 
     private function mapVoidSnapshotItems($sale, array $itemIds = []): array
@@ -93,10 +143,12 @@ class SaleCancelRequestController extends Controller
     {
         $validated = $request->validate([
             'reason' => ['nullable', 'string', 'max:500'],
+            'auto_approve' => ['nullable', 'boolean'],
+            'pin' => ['nullable', 'string', 'max:32'],
         ]);
 
         $sale = $this->scopedSaleQuery($request)
-            ->with('items.product.category')
+            ->with(['items.product.category', 'outlet'])
             ->whereKey($saleId)
             ->first();
 
@@ -113,17 +165,24 @@ class SaleCancelRequestController extends Controller
             return ApiResponse::error('Unauthorized', 'UNAUTHORIZED', 401);
         }
 
-        $req = DB::transaction(function () use ($sale, $user, $validated) {
+        [$autoApprove, $pinError] = $this->resolveAutoApprovalByOutletPin($request, $sale, $validated);
+        if ($pinError) {
+            return $pinError;
+        }
+
+        $req = DB::transaction(function () use ($sale, $user, $validated, $autoApprove) {
             $existing = SaleCancelRequest::query()
+                ->with('sale')
                 ->where('sale_id', $sale->id)
                 ->where('request_type', SaleCancelRequest::REQUEST_TYPE_CANCEL)
                 ->where('status', SaleCancelRequest::STATUS_PENDING)
                 ->first();
+
             if ($existing) {
-                return $existing;
+                return $autoApprove ? $this->approveRequestWithOutletPin($existing, $user) : $existing;
             }
 
-            return SaleCancelRequest::query()->create([
+            $req = SaleCancelRequest::query()->create([
                 'sale_id' => (string) $sale->id,
                 'outlet_id' => (string) $sale->outlet_id,
                 'requested_by_user_id' => (string) $user->id,
@@ -132,9 +191,16 @@ class SaleCancelRequestController extends Controller
                 'request_type' => SaleCancelRequest::REQUEST_TYPE_CANCEL,
                 'status' => SaleCancelRequest::STATUS_PENDING,
             ]);
+            $req->setRelation('sale', $sale);
+
+            return $autoApprove ? $this->approveRequestWithOutletPin($req, $user) : $req;
         });
 
-        return ApiResponse::ok(new SaleCancelRequestResource($req), 'Cancel request created', 201);
+        $req->load(['sale.items.product.category', 'outlet']);
+        $this->invalidateSalesReportPortalCache($req);
+        $this->triggerImmediateRefreshForApprovedCancel($req);
+
+        return ApiResponse::ok(new SaleCancelRequestResource($req), $autoApprove ? 'Cancel request approved by outlet PIN' : 'Cancel request created', 201);
     }
 
     public function storeVoid(Request $request, string $saleId)
@@ -143,10 +209,12 @@ class SaleCancelRequestController extends Controller
             'reason' => ['nullable', 'string', 'max:500'],
             'item_ids' => ['required', 'array', 'min:1'],
             'item_ids.*' => ['required', 'string'],
+            'auto_approve' => ['nullable', 'boolean'],
+            'pin' => ['nullable', 'string', 'max:32'],
         ]);
 
         $sale = $this->scopedSaleQuery($request)
-            ->with('items.product.category')
+            ->with(['items.product.category', 'outlet'])
             ->whereKey($saleId)
             ->first();
 
@@ -163,22 +231,33 @@ class SaleCancelRequestController extends Controller
             return ApiResponse::error('Unauthorized', 'UNAUTHORIZED', 401);
         }
 
+        [$autoApprove, $pinError] = $this->resolveAutoApprovalByOutletPin($request, $sale, $validated);
+        if ($pinError) {
+            return $pinError;
+        }
+
         $voidItems = $this->mapVoidSnapshotItems($sale, $validated['item_ids'] ?? []);
         if (! count($voidItems)) {
             return ApiResponse::error('Void items not found', 'VOID_ITEMS_NOT_FOUND', 422);
         }
 
-        $req = DB::transaction(function () use ($sale, $user, $validated, $voidItems) {
+        $req = DB::transaction(function () use ($sale, $user, $validated, $voidItems, $autoApprove) {
             $existing = SaleCancelRequest::query()
+                ->with('sale')
                 ->where('sale_id', $sale->id)
                 ->where('request_type', SaleCancelRequest::REQUEST_TYPE_VOID)
                 ->where('status', SaleCancelRequest::STATUS_PENDING)
                 ->first();
+
             if ($existing) {
-                return $existing;
+                if (empty($existing->void_items_snapshot)) {
+                    $existing->void_items_snapshot = $voidItems;
+                    $existing->save();
+                }
+                return $autoApprove ? $this->approveRequestWithOutletPin($existing, $user) : $existing;
             }
 
-            return SaleCancelRequest::query()->create([
+            $req = SaleCancelRequest::query()->create([
                 'sale_id' => (string) $sale->id,
                 'outlet_id' => (string) $sale->outlet_id,
                 'requested_by_user_id' => (string) $user->id,
@@ -188,9 +267,16 @@ class SaleCancelRequestController extends Controller
                 'status' => SaleCancelRequest::STATUS_PENDING,
                 'void_items_snapshot' => $voidItems,
             ]);
+            $req->setRelation('sale', $sale);
+
+            return $autoApprove ? $this->approveRequestWithOutletPin($req, $user) : $req;
         });
 
-        return ApiResponse::ok(new SaleCancelRequestResource($req->load(['sale.items.product.category', 'outlet'])), 'Void request created', 201);
+        $req->load(['sale.items.product.category', 'outlet']);
+        $this->invalidateSalesReportPortalCache($req);
+        $this->triggerImmediateRefreshForApprovedCancel($req);
+
+        return ApiResponse::ok(new SaleCancelRequestResource($req), $autoApprove ? 'Void request approved by outlet PIN' : 'Void request created', 201);
     }
 
     public function index(Request $request)
@@ -206,8 +292,7 @@ class SaleCancelRequestController extends Controller
             'outlet_filter' => ['nullable', 'string', 'max:100'],
         ]);
 
-        $q = $this->baseScopedRequestQuery($request)
-            ->orderByDesc('created_at');
+        $q = $this->baseScopedRequestQuery($request)->orderByDesc('created_at');
 
         if (! empty($validated['status'])) {
             $q->where('status', $validated['status']);
@@ -340,6 +425,7 @@ class SaleCancelRequestController extends Controller
             return $req;
         });
 
+        $req->load(['sale.items.product.category', 'outlet']);
         $this->invalidateSalesReportPortalCache($req);
         $this->triggerImmediateRefreshForApprovedCancel($req);
 
@@ -348,20 +434,19 @@ class SaleCancelRequestController extends Controller
 
     private function invalidateSalesReportPortalCache(SaleCancelRequest $requestModel): void
     {
-        $requestType = (string) ($requestModel->request_type ?? SaleCancelRequest::REQUEST_TYPE_CANCEL);
         $status = (string) ($requestModel->status ?? '');
         $sale = $requestModel->sale;
 
-        if ($requestType !== SaleCancelRequest::REQUEST_TYPE_CANCEL || $status !== SaleCancelRequest::STATUS_APPROVED || ! $sale) {
+        if ($status !== SaleCancelRequest::STATUS_APPROVED || ! $sale) {
             return;
         }
 
-        $reason = 'cancel-approved:' . (string) ($sale->id ?? '');
+        $reason = 'cancel-void-approved:' . (string) ($requestModel->request_type ?? '') . ':' . (string) ($sale->id ?? '');
 
         try {
             AnalyticsResponseCache::bumpVersion($reason);
         } catch (\Throwable $e) {
-            Log::warning('Cancel approval saved but analytics response cache bump failed.', [
+            Log::warning('Cancel/void approval saved but analytics response cache bump failed.', [
                 'sale_id' => (string) ($sale->id ?? ''),
                 'request_id' => (string) ($requestModel->id ?? ''),
                 'error' => $e->getMessage(),
@@ -371,7 +456,7 @@ class SaleCancelRequestController extends Controller
         try {
             OwnerOverviewCacheVersion::bump($reason);
         } catch (\Throwable $e) {
-            Log::warning('Cancel approval saved but owner overview cache bump failed.', [
+            Log::warning('Cancel/void approval saved but owner overview cache bump failed.', [
                 'sale_id' => (string) ($sale->id ?? ''),
                 'request_id' => (string) ($requestModel->id ?? ''),
                 'error' => $e->getMessage(),
@@ -381,7 +466,7 @@ class SaleCancelRequestController extends Controller
         try {
             ReportPortalMarkedScopeVersion::bump($reason);
         } catch (\Throwable $e) {
-            Log::warning('Cancel approval saved but sales report marked scope version bump failed.', [
+            Log::warning('Cancel/void approval saved but sales report marked scope version bump failed.', [
                 'sale_id' => (string) ($sale->id ?? ''),
                 'request_id' => (string) ($requestModel->id ?? ''),
                 'error' => $e->getMessage(),
@@ -391,18 +476,17 @@ class SaleCancelRequestController extends Controller
 
     private function triggerImmediateRefreshForApprovedCancel(SaleCancelRequest $requestModel): void
     {
-        $requestType = (string) ($requestModel->request_type ?? SaleCancelRequest::REQUEST_TYPE_CANCEL);
         $status = (string) ($requestModel->status ?? '');
         $sale = $requestModel->sale;
 
-        if ($requestType !== SaleCancelRequest::REQUEST_TYPE_CANCEL || $status !== SaleCancelRequest::STATUS_APPROVED || ! $sale) {
+        if ($status !== SaleCancelRequest::STATUS_APPROVED || ! $sale) {
             return;
         }
 
         try {
             app(ReportImmediateRefreshBridge::class)->refreshForSale($sale);
         } catch (\Throwable $e) {
-            Log::warning('Cancel approval saved but immediate report refresh failed.', [
+            Log::warning('Cancel/void approval saved but immediate report refresh failed.', [
                 'sale_id' => (string) ($sale->id ?? ''),
                 'request_id' => (string) ($requestModel->id ?? ''),
                 'error' => $e->getMessage(),
@@ -457,9 +541,10 @@ class SaleCancelRequestController extends Controller
             return $req;
         });
 
+        $req->load(['sale.items.product.category', 'outlet']);
         $this->invalidateSalesReportPortalCache($req);
         $this->triggerImmediateRefreshForApprovedCancel($req);
 
-        return ApiResponse::ok(new SaleCancelRequestResource($req->load(['sale.items.product.category', 'outlet'])), 'Cancel bill approved');
+        return ApiResponse::ok(new SaleCancelRequestResource($req), 'Cancel bill approved');
     }
 }

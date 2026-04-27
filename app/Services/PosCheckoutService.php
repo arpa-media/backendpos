@@ -1171,27 +1171,51 @@ class PosCheckoutService
         $requested = substr($requested, 0, 20);
         $context = $this->resolveSaleSequenceContext($outletId, $transactionMoment);
 
-        $requestedNumber = null;
-        if ($requested !== '' && preg_match('/^(\d{1,6})(?:-[A-Z0-9]+)?$/', $requested, $matches)) {
+        if ($requested !== '' && preg_match('/^(\d{1,6})(?:-([A-Z0-9]{2,8}))?$/', $requested, $matches)) {
             $requestedNumber = str_pad((string) ((int) $matches[1]), 3, '0', STR_PAD_LEFT);
-        }
+            $requestedDeviceTag = isset($matches[2]) && $matches[2] !== '' ? substr((string) $matches[2], 0, 8) : null;
+            $normalizedRequested = $requestedDeviceTag ? ($requestedNumber . '-' . $requestedDeviceTag) : $requestedNumber;
 
-        if ($requestedNumber !== null) {
-            $expectedSequence = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
-
-            $existsSameVisibleQueue = Sale::query()
+            $exactExists = Sale::query()
                 ->where('outlet_id', $outletId)
                 ->whereBetween('created_at', [$context['day_start_utc'], $context['day_end_utc']])
-                ->where(function ($query) use ($requestedNumber) {
-                    $query
-                        ->where('queue_no', $requestedNumber)
-                        ->orWhere('queue_no', 'like', $requestedNumber . '-%');
+                ->where('queue_no', $normalizedRequested)
+                ->when($clientSyncId, function ($query) use ($clientSyncId) {
+                    $query->where(function ($scope) use ($clientSyncId) {
+                        $scope->whereNull('client_sync_id')
+                            ->orWhere('client_sync_id', '!=', $clientSyncId);
+                    });
                 })
                 ->lockForUpdate()
                 ->exists();
 
-            if (! $existsSameVisibleQueue && (int) $requestedNumber === $expectedSequence) {
-                return $requestedNumber;
+            if (! $exactExists) {
+                // Preserve queue identity that was already printed locally.
+                // Device-tagged values stay unique while keeping visible queue stable.
+                if ($requestedDeviceTag) {
+                    return $normalizedRequested;
+                }
+
+                $visibleExists = Sale::query()
+                    ->where('outlet_id', $outletId)
+                    ->whereBetween('created_at', [$context['day_start_utc'], $context['day_end_utc']])
+                    ->where(function ($query) use ($requestedNumber) {
+                        $query
+                            ->where('queue_no', $requestedNumber)
+                            ->orWhere('queue_no', 'like', $requestedNumber . '-%');
+                    })
+                    ->when($clientSyncId, function ($query) use ($clientSyncId) {
+                        $query->where(function ($scope) use ($clientSyncId) {
+                            $scope->whereNull('client_sync_id')
+                                ->orWhere('client_sync_id', '!=', $clientSyncId);
+                        });
+                    })
+                    ->lockForUpdate()
+                    ->exists();
+
+                if (! $visibleExists) {
+                    return $normalizedRequested;
+                }
             }
         }
 
@@ -1217,29 +1241,20 @@ class PosCheckoutService
 
     private function resolveRequestedSaleNumber(string $outletId, ?string $preferredSaleNumber, $transactionMoment = null): string
     {
-        $preferred = trim((string) ($preferredSaleNumber ?? ''));
+        $preferred = strtoupper(trim((string) ($preferredSaleNumber ?? '')));
+        $preferred = preg_replace('/[^A-Z0-9.\-]+/', '', $preferred) ?? '';
         if ($preferred === '') {
             return $this->generateSaleNumber($outletId, $transactionMoment);
         }
 
         $context = $this->resolveSaleSequenceContext($outletId, $transactionMoment);
         $pattern = sprintf(
-            '/^S\.%s-%s-[A-Z0-9]{4}-\d{3}$/',
+            '/^S\.%s-%s-[A-Z0-9]{4,8}-\d{3,6}$/',
             preg_quote($context['outlet_code'], '/'),
             preg_quote($context['today_token'], '/')
         );
 
         if (!preg_match($pattern, $preferred)) {
-            return $this->generateSaleNumber($outletId, $transactionMoment);
-        }
-
-        $expectedSequence = $this->resolveNextDailySequence($outletId, $context['today_token'], $context['day_start_utc'], $context['day_end_utc']);
-        $preferredSequence = null;
-        if (preg_match('/-(\d{3})$/', $preferred, $sequenceMatches)) {
-            $preferredSequence = (int) $sequenceMatches[1];
-        }
-
-        if ($preferredSequence !== $expectedSequence) {
             return $this->generateSaleNumber($outletId, $transactionMoment);
         }
 
@@ -1249,6 +1264,7 @@ class PosCheckoutService
             ->lockForUpdate()
             ->exists();
 
+        // Preserve sale number that may already be printed before offline sync.
         return $exists ? $this->generateSaleNumber($outletId, $transactionMoment) : $preferred;
     }
 

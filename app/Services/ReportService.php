@@ -3,9 +3,11 @@
 namespace App\Services;
 
 use App\Models\Sale;
+use App\Models\SaleCancelRequest;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Services\ReportSaleScopeCacheService;
 use App\Support\DeliveryNoTaxReadModel;
+use App\Support\SaleRounding;
 use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
@@ -232,6 +234,9 @@ class ReportService
             'o.name as outlet_name',
             'o.timezone as outlet_timezone',
             's.sale_number',
+            's.outlet_id',
+            DB::raw("COALESCE(o.name, o.code, '-') as outlet_name"),
+            DB::raw("COALESCE(o.code, '') as outlet_code"),
             's.channel',
             DB::raw("COALESCE(spm.payment_method_name, COALESCE(s.payment_method_name, '-')) as payment_method_name"),
             's.subtotal',
@@ -440,7 +445,14 @@ class ReportService
                 'grand_total' => (int) ($summary->grand_total ?? 0),
             ],
             'data' => $items,
-            'meta' => ['current_page' => $p->currentPage(), 'per_page' => $p->perPage(), 'last_page' => $p->lastPage(), 'total' => $p->total()],
+            'meta' => [
+                'current_page' => $p->currentPage(),
+                'per_page' => $p->perPage(),
+                'last_page' => $p->lastPage(),
+                'total' => $p->total(),
+                'timezone' => $scopeTimezone,
+                'outlet_scope_name' => (string) ($params['outlet_scope_name'] ?? 'All Outlet'),
+            ],
         ];
     }
 
@@ -482,7 +494,14 @@ class ReportService
         return [
             'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
             'data' => $items,
-            'meta' => ['current_page' => $p->currentPage(), 'per_page' => $p->perPage(), 'last_page' => $p->lastPage(), 'total' => $p->total()],
+            'meta' => [
+                'current_page' => $p->currentPage(),
+                'per_page' => $p->perPage(),
+                'last_page' => $p->lastPage(),
+                'total' => $p->total(),
+                'timezone' => $scopeTimezone,
+                'outlet_scope_name' => (string) ($params['outlet_scope_name'] ?? 'All Outlet'),
+            ],
         ];
     }
 
@@ -506,6 +525,9 @@ class ReportService
         $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
+            ->leftJoin('outlets as o', 'o.id', '=', 's.outlet_id')
+            ->leftJoin('employees as de', 'de.nisj', '=', 's.discount_squad_nisj')
+            ->leftJoin('users as du', 'du.nisj', '=', 's.discount_squad_nisj')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
@@ -521,6 +543,9 @@ class ReportService
         $q->select([
             's.id as sale_id',
             's.sale_number',
+            's.outlet_id',
+            DB::raw("COALESCE(o.name, o.code, '-') as outlet_name"),
+            DB::raw("COALESCE(o.code, '') as outlet_code"),
             's.channel',
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
             DB::raw('GREATEST(COALESCE(s.grand_total, 0) - COALESCE(s.rounding_total, 0), 0) as total_before_rounding'),
@@ -568,7 +593,14 @@ class ReportService
                 'rounding_down_total' => (int) ($summary->rounding_down_total ?? 0),
             ],
             'data' => $items,
-            'meta' => ['current_page' => $p->currentPage(), 'per_page' => $p->perPage(), 'last_page' => $p->lastPage(), 'total' => $p->total()],
+            'meta' => [
+                'current_page' => $p->currentPage(),
+                'per_page' => $p->perPage(),
+                'last_page' => $p->lastPage(),
+                'total' => $p->total(),
+                'timezone' => $scopeTimezone,
+                'outlet_scope_name' => (string) ($params['outlet_scope_name'] ?? 'All Outlet'),
+            ],
         ];
     }
 
@@ -585,6 +617,9 @@ class ReportService
         $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
+            ->leftJoin('outlets as o', 'o.id', '=', 's.outlet_id')
+            ->leftJoin('employees as de', 'de.nisj', '=', 's.discount_squad_nisj')
+            ->leftJoin('users as du', 'du.nisj', '=', 's.discount_squad_nisj')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
@@ -599,6 +634,9 @@ class ReportService
         $q->select([
             's.id as sale_id',
             's.sale_number',
+            's.outlet_id',
+            DB::raw("COALESCE(o.name, o.code, '-') as outlet_name"),
+            DB::raw("COALESCE(o.code, '') as outlet_code"),
             's.channel',
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
             DB::raw('COALESCE(s.grand_total, 0) as total'),
@@ -665,6 +703,9 @@ class ReportService
         $saleScope = $this->resolveCachedSaleScope($scopeOutletIds, $params, $scopeTimezone);
 
         $q = DB::table('sales as s')
+            ->leftJoin('outlets as o', 'o.id', '=', 's.outlet_id')
+            ->leftJoin('employees as de', 'de.nisj', '=', 's.discount_squad_nisj')
+            ->leftJoin('users as du', 'du.nisj', '=', 's.discount_squad_nisj')
             ->leftJoinSub($pmSub, 'spm', function ($join) {
                 $join->on('spm.sale_id', '=', 's.id');
             })
@@ -672,8 +713,8 @@ class ReportService
             ->where('s.discount_amount', '>', 0)
             ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
 
-        if (!empty($outletId)) {
-            $q->where('s.outlet_id', '=', $outletId);
+        if (!empty($scopeOutletIds)) {
+            $q->whereIn('s.outlet_id', $scopeOutletIds);
         }
 
         if (!empty($params['sale_number'])) {
@@ -702,6 +743,9 @@ class ReportService
         $q->select([
             's.id as sale_id',
             's.sale_number',
+            's.outlet_id',
+            DB::raw("COALESCE(o.name, o.code, '-') as outlet_name"),
+            DB::raw("COALESCE(o.code, '') as outlet_code"),
             's.channel',
             DB::raw("COALESCE(spm.payment_method_name, '-') as payment_method_name"),
             DB::raw('COALESCE(s.grand_total, 0) as total'),
@@ -709,6 +753,7 @@ class ReportService
             's.discount_name_snapshot',
             's.discounts_snapshot',
             's.discount_squad_nisj',
+            DB::raw("COALESCE(NULLIF(s.discount_squad_name, ''), NULLIF(de.full_name, ''), NULLIF(du.name, ''), '-') as discount_squad_full_name"),
             's.created_at',
         ])
         ->orderByDesc('s.created_at');
@@ -721,9 +766,13 @@ class ReportService
             return [
                 'sale_id' => (string) $r->sale_id,
                 'sale_number' => (string) $r->sale_number,
+                'outlet_id' => (string) ($r->outlet_id ?? ''),
+                'outlet_name' => (string) ($r->outlet_name ?? '-'),
+                'outlet_code' => (string) ($r->outlet_code ?? ''),
                 'discount_name' => !empty($discountNames) ? implode(', ', $discountNames) : '-',
                 'discount_names' => $discountNames,
                 'discount_squad_nisj' => (string) ($r->discount_squad_nisj ?? ''),
+                'discount_squad_full_name' => (string) ($r->discount_squad_full_name ?? '-'),
                 'channel' => (string) ($r->channel ?? ''),
                 'payment_method_name' => (string) ($r->payment_method_name ?? '-'),
                 'total' => (int) ($r->total ?? 0),
@@ -734,9 +783,11 @@ class ReportService
 
         $optionQ = DB::table('sales as s')
             ->where('s.status', '=', 'PAID')
-            ->where('s.discount_amount', '>', 0);
-        $this->applyOutletUtcDateRange($optionQ, 's.created_at', $params['date_from'] ?? null, $params['date_to'] ?? null, $outletId);
-        if (!empty($outletId)) $optionQ->where('s.outlet_id', '=', $outletId);
+            ->where('s.discount_amount', '>', 0)
+            ->when(!($saleScope['has_rows'] ?? false), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('s.id', $this->cachedSaleIdSubquery($saleScope)));
+        if (!empty($scopeOutletIds)) {
+            $optionQ->whereIn('s.outlet_id', $scopeOutletIds);
+        }
         $optionsRows = $optionQ->select(['s.discount_name_snapshot', 's.discounts_snapshot'])->get();
         $discountNames = [];
         foreach ($optionsRows as $row) {
@@ -751,7 +802,14 @@ class ReportService
         return [
             'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
             'data' => $items,
-            'meta' => ['current_page' => $p->currentPage(), 'per_page' => $p->perPage(), 'last_page' => $p->lastPage(), 'total' => $p->total()],
+            'meta' => [
+                'current_page' => $p->currentPage(),
+                'per_page' => $p->perPage(),
+                'last_page' => $p->lastPage(),
+                'total' => $p->total(),
+                'timezone' => $scopeTimezone,
+                'outlet_scope_name' => (string) ($params['outlet_scope_name'] ?? 'All Outlet'),
+            ],
             'filter_options' => [
                 'discount_names' => array_values(array_keys($discountNames)),
             ],
@@ -921,6 +979,380 @@ class ReportService
             ->all();
     }
 
+
+    private function cashierReportAdjustmentRequests(array $params, ?string $outletId, array $window, string $timezone, array $scopeOutletIds)
+    {
+        $query = SaleCancelRequest::query()
+            ->with(['sale.payments.paymentMethod', 'sale.items', 'sale.outlet'])
+            ->where('status', SaleCancelRequest::STATUS_APPROVED)
+            ->whereIn('request_type', [SaleCancelRequest::REQUEST_TYPE_CANCEL, SaleCancelRequest::REQUEST_TYPE_VOID])
+            ->whereHas('sale', function ($saleQuery) use ($params, $outletId, $window, $timezone, $scopeOutletIds) {
+                if ($this->isMakassarCashierBusinessTimezone($timezone)) {
+                    $candidateDateTo = $window['requested_to']->addDay()->toDateString();
+                    $this->applyBusinessDateScope(
+                        $saleQuery,
+                        'sale_number',
+                        'created_at',
+                        $window['requested_from']->toDateString(),
+                        $candidateDateTo,
+                        $timezone
+                    );
+                } else {
+                    $this->applyBusinessDateScope(
+                        $saleQuery,
+                        'sale_number',
+                        'created_at',
+                        $window['requested_from']->toDateString(),
+                        $window['requested_to']->toDateString(),
+                        $timezone
+                    );
+                }
+
+                if (count($scopeOutletIds) === 1) {
+                    $saleQuery->where('outlet_id', '=', $scopeOutletIds[0]);
+                } elseif (count($scopeOutletIds) > 1) {
+                    $saleQuery->whereIn('outlet_id', $scopeOutletIds);
+                } elseif (!empty($outletId)) {
+                    $saleQuery->where('outlet_id', '=', $outletId);
+                }
+
+                if (!empty($params['cashier_id'])) {
+                    if ((string) $params['cashier_id'] === 'unknown') {
+                        $saleQuery->whereNull('cashier_id');
+                    } else {
+                        $saleQuery->where('cashier_id', '=', $params['cashier_id']);
+                    }
+                }
+            })
+            ->orderBy('created_at');
+
+        $requests = $query->get();
+
+        if ($this->isMakassarCashierBusinessTimezone($timezone)) {
+            $requests = $requests
+                ->filter(fn (SaleCancelRequest $request) => $request->sale && $this->saleFallsWithinCashierBusinessWindow($request->sale, $window['from_local'], $window['to_exclusive_local'], $timezone))
+                ->values();
+        }
+
+        return $requests;
+    }
+
+    private function voidRequestAmount(SaleCancelRequest $request): int
+    {
+        $snapshot = is_array($request->void_items_snapshot ?? null) ? $request->void_items_snapshot : [];
+        return (int) collect($snapshot)->sum(fn ($item) => (int) round((float) ($item['line_total'] ?? $item['total'] ?? 0)));
+    }
+
+    private function saleAmountAttribute(Sale $sale, array $names, int $fallback = 0): int
+    {
+        foreach ($names as $name) {
+            $value = $sale->getAttribute($name);
+            if ($value !== null && $value !== '') {
+                return (int) round((float) $value);
+            }
+        }
+
+        return $fallback;
+    }
+
+    private function proportionalReportAmount(int $originalAmount, float $ratio): int
+    {
+        if ($originalAmount <= 0 || $ratio <= 0) {
+            return 0;
+        }
+
+        return max(0, (int) round($originalAmount * max(0, min(1, $ratio))));
+    }
+
+    private function roundedVoidSaleTotals(Sale $sale, int $remainingSubtotal): array
+    {
+        $originalSubtotal = max(0, $this->saleAmountAttribute($sale, ['subtotal', 'sub_total']));
+        if ($originalSubtotal <= 0 && $sale->relationLoaded('items')) {
+            $originalSubtotal = max(0, (int) $sale->items->sum(fn ($item) => (int) ($item->line_total ?? 0)));
+        }
+
+        $remainingSubtotal = max(0, $remainingSubtotal);
+        if ($originalSubtotal > 0) {
+            $remainingSubtotal = min($originalSubtotal, $remainingSubtotal);
+        }
+
+        $ratio = $originalSubtotal > 0
+            ? max(0, min(1, $remainingSubtotal / max(1, $originalSubtotal)))
+            : ($remainingSubtotal > 0 ? 1.0 : 0.0);
+
+        $discountTotal = min($remainingSubtotal, $this->proportionalReportAmount(max(0, $this->saleAmountAttribute($sale, ['discount_total', 'discount_amount'])), $ratio));
+        $taxTotal = $this->proportionalReportAmount(max(0, $this->saleAmountAttribute($sale, ['tax_total', 'tax_amount'])), $ratio);
+        $serviceChargeTotal = $this->proportionalReportAmount(max(0, $this->saleAmountAttribute($sale, ['service_charge_total', 'service_charge_amount'])), $ratio);
+        $beforeRounding = max(0, $remainingSubtotal - $discountTotal + $taxTotal + $serviceChargeTotal);
+        $rounding = SaleRounding::apply($beforeRounding);
+
+        return [
+            'subtotal' => $remainingSubtotal,
+            'discount_total' => $discountTotal,
+            'tax_total' => $taxTotal,
+            'service_charge_total' => $serviceChargeTotal,
+            'total_before_rounding' => (int) ($rounding['before_rounding'] ?? $beforeRounding),
+            'rounding_total' => (int) ($rounding['rounding_total'] ?? 0),
+            'grand_total' => (int) ($rounding['after_rounding'] ?? $beforeRounding),
+        ];
+    }
+
+    private function voidRequestFinancialAmount(SaleCancelRequest $request): int
+    {
+        $voidSubtotal = $this->voidRequestAmount($request);
+        if ($voidSubtotal <= 0 || ! $request->sale) {
+            return $voidSubtotal;
+        }
+
+        $sale = $request->sale;
+        $originalGrand = max(0, $this->saleAmountAttribute($sale, ['grand_total']));
+        if ($originalGrand <= 0) {
+            return $voidSubtotal;
+        }
+
+        $originalSubtotal = max(0, $this->saleAmountAttribute($sale, ['subtotal', 'sub_total']));
+        if ($originalSubtotal <= 0 && $sale->relationLoaded('items')) {
+            $originalSubtotal = max(0, (int) $sale->items->sum(fn ($item) => (int) ($item->line_total ?? 0)));
+        }
+
+        if ($originalSubtotal <= 0) {
+            return min($originalGrand, $voidSubtotal);
+        }
+
+        $totals = $this->roundedVoidSaleTotals($sale, max(0, $originalSubtotal - min($originalSubtotal, $voidSubtotal)));
+
+        return max(0, min($originalGrand, $originalGrand - (int) ($totals['grand_total'] ?? 0)));
+    }
+
+    private function approvedVoidAmountsBySale($requests): array
+    {
+        $totals = [];
+
+        foreach ($requests as $request) {
+            if ((string) ($request->request_type ?? '') !== SaleCancelRequest::REQUEST_TYPE_VOID) {
+                continue;
+            }
+
+            $saleId = (string) ($request->sale_id ?? $request->sale?->id ?? '');
+            if ($saleId === '') {
+                continue;
+            }
+
+            $amount = $this->voidRequestAmount($request);
+            if ($amount <= 0) {
+                continue;
+            }
+
+            $totals[$saleId] = ($totals[$saleId] ?? 0) + $amount;
+        }
+
+        return $totals;
+    }
+
+    private function voidSnapshotQtyByItemId(SaleCancelRequest $request): array
+    {
+        $qty = [];
+        $snapshot = is_array($request->void_items_snapshot ?? null) ? $request->void_items_snapshot : [];
+
+        foreach ($snapshot as $item) {
+            if (! is_array($item)) {
+                continue;
+            }
+
+            $id = (string) ($item['id'] ?? $item['sale_item_id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+
+            $qty[$id] = ($qty[$id] ?? 0) + max(1, (int) ($item['qty'] ?? 1));
+        }
+
+        return $qty;
+    }
+
+    private function approvedVoidQtyBySaleAndItem($requests): array
+    {
+        $totals = [];
+
+        foreach ($requests as $request) {
+            if ((string) ($request->request_type ?? '') !== SaleCancelRequest::REQUEST_TYPE_VOID) {
+                continue;
+            }
+
+            $saleId = (string) ($request->sale_id ?? $request->sale?->id ?? '');
+            if ($saleId === '') {
+                continue;
+            }
+
+            foreach ($this->voidSnapshotQtyByItemId($request) as $itemId => $qty) {
+                $totals[$saleId][$itemId] = ($totals[$saleId][$itemId] ?? 0) + $qty;
+            }
+        }
+
+        return $totals;
+    }
+
+    private function applyApprovedVoidAdjustmentsToCashierSales($sales, $requests)
+    {
+        $voidAmounts = $this->approvedVoidAmountsBySale($requests);
+        $voidQtyBySale = $this->approvedVoidQtyBySaleAndItem($requests);
+
+        if (empty($voidAmounts) && empty($voidQtyBySale)) {
+            return $sales;
+        }
+
+        return $sales->map(function (Sale $sale) use ($voidAmounts, $voidQtyBySale) {
+            $saleId = (string) $sale->id;
+            $originalGrand = max(0, (int) ($sale->grand_total ?? 0));
+            $originalSubtotal = max(0, $this->saleAmountAttribute($sale, ['subtotal', 'sub_total']));
+            if ($originalSubtotal <= 0 && $sale->relationLoaded('items')) {
+                $originalSubtotal = max(0, (int) $sale->items->sum(fn ($item) => (int) ($item->line_total ?? 0)));
+            }
+            $voidSubtotal = max(0, (int) ($voidAmounts[$saleId] ?? 0));
+            $voidSubtotal = $originalSubtotal > 0 ? min($originalSubtotal, $voidSubtotal) : min($originalGrand, $voidSubtotal);
+            $totals = $this->roundedVoidSaleTotals($sale, max(0, $originalSubtotal - $voidSubtotal));
+            $remainingGrand = max(0, (int) ($totals['grand_total'] ?? 0));
+            $voidAmount = max(0, min($originalGrand, $originalGrand - $remainingGrand));
+
+            if ($voidSubtotal > 0 || $voidAmount > 0) {
+                $originalPaymentAmounts = [];
+                $payments = $sale->payments ?? collect();
+                if ($payments instanceof \Illuminate\Support\Collection && $payments->isNotEmpty()) {
+                    foreach ($payments as $payment) {
+                        $originalPaymentAmounts[(string) $payment->id] = $this->resolvePaymentSnapshotAmount($sale, $payment);
+                    }
+                    $originalPaymentTotal = max(0, array_sum($originalPaymentAmounts));
+                    $ratio = $originalPaymentTotal > 0 ? max(0, min(1, $remainingGrand / $originalPaymentTotal)) : 0;
+                    $allocated = 0;
+                    $lastIndex = $payments->count() - 1;
+                    foreach ($payments->values() as $index => $payment) {
+                        $base = max(0, (int) ($originalPaymentAmounts[(string) $payment->id] ?? 0));
+                        $amount = $index === $lastIndex ? max(0, $remainingGrand - $allocated) : max(0, (int) round($base * $ratio));
+                        $allocated += $amount;
+                        $payment->setAttribute('amount', $amount);
+                    }
+                }
+
+                $sale->setAttribute('report_original_grand_total', $originalGrand);
+                $sale->setAttribute('report_void_total', $voidAmount);
+                $sale->setAttribute('report_void_item_total', $voidSubtotal);
+                $sale->setAttribute('subtotal', (int) ($totals['subtotal'] ?? 0));
+                $sale->setAttribute('sub_total', (int) ($totals['subtotal'] ?? 0));
+                $sale->setAttribute('discount_total', (int) ($totals['discount_total'] ?? 0));
+                $sale->setAttribute('discount_amount', (int) ($totals['discount_total'] ?? 0));
+                $sale->setAttribute('tax_total', (int) ($totals['tax_total'] ?? 0));
+                $sale->setAttribute('tax_amount', (int) ($totals['tax_total'] ?? 0));
+                $sale->setAttribute('service_charge_total', (int) ($totals['service_charge_total'] ?? 0));
+                $sale->setAttribute('service_charge_amount', (int) ($totals['service_charge_total'] ?? 0));
+                $sale->setAttribute('total_before_rounding', (int) ($totals['total_before_rounding'] ?? 0));
+                $sale->setAttribute('rounding_total', (int) ($totals['rounding_total'] ?? 0));
+                $sale->setAttribute('rounding_amount', (int) ($totals['rounding_total'] ?? 0));
+                $sale->setAttribute('grand_total', $remainingGrand);
+                $sale->setAttribute('paid_total', $remainingGrand);
+                $sale->setAttribute('change_total', 0);
+            }
+
+            $voidQty = $voidQtyBySale[$saleId] ?? [];
+            if (! empty($voidQty) && $sale->relationLoaded('items')) {
+                $sale->setRelation('items', $sale->items->map(function ($item) use (&$voidQty) {
+                    $itemId = (string) ($item->id ?? '');
+                    $voidedQty = max(0, (int) ($voidQty[$itemId] ?? 0));
+                    if ($itemId === '' || $voidedQty <= 0) {
+                        return $item;
+                    }
+
+                    $originalQty = max(0, (int) ($item->qty ?? 0));
+                    $remainingQty = max(0, $originalQty - $voidedQty);
+                    $unitPrice = max(0, (int) ($item->unit_price ?? 0));
+                    $item->setAttribute('report_original_qty', $originalQty);
+                    $item->setAttribute('report_void_qty', min($originalQty, $voidedQty));
+                    $item->setAttribute('qty', $remainingQty);
+                    $item->setAttribute('line_total', $remainingQty * $unitPrice);
+                    return $item;
+                }));
+            }
+
+            return $sale;
+        });
+    }
+
+    private function summarizeCancelVoidPaymentMethods($requests): array
+    {
+        $totals = [];
+
+        foreach ($requests as $request) {
+            $sale = $request->sale;
+            if (! $sale) {
+                continue;
+            }
+
+            $type = (string) ($request->request_type ?? SaleCancelRequest::REQUEST_TYPE_CANCEL);
+            $kind = $type === SaleCancelRequest::REQUEST_TYPE_VOID ? 'void_bill' : 'cancel_bill';
+            $prefix = $kind === 'void_bill' ? 'Void' : 'Cancel Bill';
+            $requestAmount = $kind === 'void_bill' ? $this->voidRequestFinancialAmount($request) : null;
+            if ($kind === 'void_bill' && $requestAmount <= 0) {
+                continue;
+            }
+
+            $payments = $sale->payments ?? collect();
+            if ($payments instanceof \Illuminate\Support\Collection && $payments->isNotEmpty()) {
+                foreach ($payments as $payment) {
+                    $name = $this->resolveSalePaymentMethodName($sale, $payment);
+                    $baseAmount = $this->resolvePaymentSnapshotAmount($sale, $payment);
+                    $amount = $kind === 'void_bill' ? min($requestAmount, max(0, (int) $baseAmount)) : $baseAmount;
+                    if ($amount <= 0) {
+                        continue;
+                    }
+                    $key = $kind . ':' . $name;
+                    if (!isset($totals[$key])) {
+                        $totals[$key] = [
+                            'name' => $prefix . ' - ' . $name,
+                            'payment_method_name' => $name,
+                            'total' => 0,
+                            'transaction_count' => 0,
+                            'kind' => $kind,
+                        ];
+                    }
+                    $totals[$key]['total'] += $amount;
+                    $totals[$key]['transaction_count'] += 1;
+                }
+                continue;
+            }
+
+            $name = $this->resolveSalePaymentMethodName($sale, null);
+            $amount = $kind === 'void_bill' ? $requestAmount : $this->resolvePaymentSnapshotAmount($sale, null);
+            if ($amount <= 0) {
+                continue;
+            }
+            $key = $kind . ':' . $name;
+            if (!isset($totals[$key])) {
+                $totals[$key] = [
+                    'name' => $prefix . ' - ' . $name,
+                    'payment_method_name' => $name,
+                    'total' => 0,
+                    'transaction_count' => 0,
+                    'kind' => $kind,
+                ];
+            }
+            $totals[$key]['total'] += $amount;
+            $totals[$key]['transaction_count'] += 1;
+        }
+
+        return collect($totals)
+            ->sortBy(fn ($row) => ($row['kind'] ?? '') . ':' . ($row['payment_method_name'] ?? ''))
+            ->values()
+            ->map(fn ($row) => [
+                'name' => (string) ($row['name'] ?? '-'),
+                'payment_method_name' => (string) ($row['payment_method_name'] ?? '-'),
+                'total' => (int) ($row['total'] ?? 0),
+                'transaction_count' => (int) ($row['transaction_count'] ?? 0),
+                'kind' => (string) ($row['kind'] ?? 'adjustment'),
+                'is_adjustment' => true,
+                'tone' => 'danger',
+            ])
+            ->all();
+    }
+
     private function saleLocalIsoForSorting($sale, ?string $timezone = null): ?string
     {
         if (!$sale) {
@@ -1081,8 +1513,12 @@ class ReportService
             'tax_total' => (int) ($sale->tax_total ?? 0),
             'service_charge_total' => (int) ($sale->service_charge_total ?? 0),
             'rounding_total' => (int) ($sale->rounding_total ?? 0),
+            'total_before_rounding' => (int) ($sale->total_before_rounding ?? max(0, (int) ($sale->grand_total ?? 0) - (int) ($sale->rounding_total ?? 0))),
             'grand_total' => (int) ($sale->grand_total ?? 0),
             'paid_total' => (int) ($sale->paid_total ?? 0),
+            'void_total' => (int) ($sale->report_void_total ?? 0),
+            'void_items_total' => (int) ($sale->report_void_item_total ?? 0),
+            'original_grand_total' => (int) ($sale->report_original_grand_total ?? $sale->grand_total ?? 0),
             'change_total' => (int) ($sale->change_total ?? 0),
             'payment_method_type' => (string) ($sale->payment_method_type ?? ''),
             'payment_method_name' => $this->resolveSalePaymentMethodName($sale),
@@ -1179,13 +1615,19 @@ class ReportService
                 ->values();
         }
 
+        $adjustmentRequests = $this->cashierReportAdjustmentRequests($params, $outletId, $window, $timezone, $scopeOutletIds);
+        $sales = $this->applyApprovedVoidAdjustmentsToCashierSales($sales, $adjustmentRequests);
+
         $summary = [
             'transaction_count' => $sales->count(),
             'grand_total' => (int) $sales->sum('grand_total'),
             'paid_total' => (int) $sales->sum('paid_total'),
             'change_total' => (int) $sales->sum('change_total'),
             'items_sold' => (int) $sales->sum(fn ($sale) => $sale->items->sum('qty')),
-            'payment_methods' => $this->summarizePaymentMethods($sales),
+            'payment_methods' => [
+                ...$this->summarizePaymentMethods($sales),
+                ...$this->summarizeCancelVoidPaymentMethods($adjustmentRequests),
+            ],
         ];
 
         $cashiers = $sales
