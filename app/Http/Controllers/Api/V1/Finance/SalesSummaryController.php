@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListSalesSummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
+use App\Services\FinanceNetReadService;
 use App\Services\ReportDailySummaryService;
 use App\Support\AnalyticsResponseCache;
 use App\Support\FinanceOutletFilter;
@@ -16,6 +17,7 @@ class SalesSummaryController extends Controller
 {
     public function __construct(
         private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
 
@@ -121,6 +123,7 @@ class SalesSummaryController extends Controller
             }
 
             $this->dailySummaryService->ensureCoverage($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+            $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
             $rows = $this->buildRows($outletIds, $v, $sort, $dir)->get();
 
             $items = $rows->map(function ($row) {
@@ -143,6 +146,8 @@ class SalesSummaryController extends Controller
                     'total_collected' => $totalCollected,
                 ];
             })->values();
+
+            $items = $this->financeNetReadService->applyToSalesSummaryItems($items, $netAdjustments);
 
             $discountTotal = (int) $items->sum('discount');
             $summary = [
@@ -174,6 +179,7 @@ class SalesSummaryController extends Controller
                     'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                     'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                     'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                    'net_read' => $this->financeNetReadService->adjustmentMeta($netAdjustments),
                 ],
             ];
 

@@ -25,9 +25,13 @@ class ProductService
 
         $withVariants = (bool) ($filters['with_variants'] ?? false);
         $forPos = (bool) ($filters['for_pos'] ?? false);
+        $activeInOutlet = (bool) ($filters['active_in_outlet'] ?? false);
         $channel = $filters['channel'] ?? null;
 
         $query = Product::query();
+        if (!$forPos) {
+            $query->with('category');
+        }
 
         // For admin management view, include outlet pivot state for the currently selected outlet (if provided)
         if (!$forPos && !empty($outletId)) {
@@ -45,8 +49,17 @@ class ProductService
                         ->where('outlet_product.is_active', true);
                 });
         } else {
-            // Admin/product management: show all products; outlet-specific active state is on pivot.
-            if (!is_null($isActive)) {
+            // Admin/product management: show all products by default; outlet-specific active state is on pivot.
+            // active_in_outlet=1 is used by the backoffice Active Products tab to avoid loading
+            // all global products and filtering them in the browser.
+            if ($activeInOutlet && !empty($outletId)) {
+                $query
+                    ->where('is_active', true)
+                    ->whereHas('outlets', function ($sub) use ($outletId) {
+                        $sub->where('outlets.id', $outletId)
+                            ->where('outlet_product.is_active', true);
+                    });
+            } elseif (!is_null($isActive)) {
                 $query->where('is_active', $isActive);
             }
         }

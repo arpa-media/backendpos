@@ -35,8 +35,14 @@ class SaleDetailResource extends JsonResource
             'id' => (string) $s->id,
             'outlet_id' => (string) $s->outlet_id,
 
-            'sale_number' => (string) $s->sale_number,
-            'queue_no' => $s->queue_no ? (string) $s->queue_no : null,
+            'sale_number' => (string) (($s->printed_sale_number ?? null) ?: $s->sale_number),
+            'queue_no' => ($s->printed_queue_no ?? null) ? (string) $s->printed_queue_no : ($s->queue_no ? (string) $s->queue_no : null),
+            'canonical_sale_number' => (string) $s->sale_number,
+            'canonical_queue_no' => $s->queue_no ? (string) $s->queue_no : null,
+            'printed_sale_number' => ($s->printed_sale_number ?? null) ? (string) $s->printed_sale_number : (string) $s->sale_number,
+            'printed_queue_no' => ($s->printed_queue_no ?? null) ? (string) $s->printed_queue_no : ($s->queue_no ? (string) $s->queue_no : null),
+            'printed_cashier_name' => ($s->printed_cashier_name ?? null) ? (string) $s->printed_cashier_name : (string) ($s->cashier_name ?? ''),
+            'printed_at' => optional($s->printed_at)->toISOString(),
             'channel' => (string) $s->channel,
             'online_order_source' => $s->online_order_source ? (string) $s->online_order_source : null,
             'status' => (string) $s->status,
@@ -51,6 +57,10 @@ class SaleDetailResource extends JsonResource
 
             'cashier_id' => (string) $s->cashier_id,
             'cashier_name' => $s->cashier_name,
+            'cashier' => [
+                'id' => (string) $s->cashier_id,
+                'name' => (string) ($s->cashier_name ?? ''),
+            ],
 
             'outlet_name' => (string) optional($s->outlet)->name,
             'outlet_name_snapshot' => (string) (optional($s->outlet)->name ?? ''),

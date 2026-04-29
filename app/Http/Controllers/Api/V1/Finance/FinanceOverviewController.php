@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListFinanceOverviewRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
+use App\Services\FinanceNetReadService;
 use App\Services\ReportDailySummaryService;
 use App\Support\AnalyticsResponseCache;
 use App\Support\FinanceOutletFilter;
@@ -28,6 +29,7 @@ class FinanceOverviewController extends Controller
 
     public function __construct(
         private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
 
@@ -125,6 +127,7 @@ class FinanceOverviewController extends Controller
             }
 
             $this->dailySummaryService->ensureCoverage($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+            $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
 
             $summaryRow = $this->dailySummaryService
                 ->salesSummaryQuery($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null)
@@ -212,8 +215,11 @@ class FinanceOverviewController extends Controller
                     'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                     'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                     'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                    'net_read' => $this->financeNetReadService->adjustmentMeta($netAdjustments),
                 ],
             ];
+
+            $payload = $this->financeNetReadService->applyToFinanceOverviewPayload($payload, $netAdjustments);
 
             if ($isExport) {
                 $payload['export'] = [

@@ -19,6 +19,12 @@ class ProductResource extends JsonResource
         return [
             'id' => (string) $p->id,
             'category_id' => $p->category_id ? (string) $p->category_id : null,
+            'category' => $this->whenLoaded('category', fn () => [
+                'id' => $p->category ? (string) $p->category->id : null,
+                'name' => $p->category ? (string) $p->category->name : null,
+                'slug' => $p->category ? (string) ($p->category->slug ?? '') : '',
+                'kind' => $p->category ? (string) ($p->category->kind ?? '') : '',
+            ]),
             'name' => (string) $p->name,
             'slug' => (string) $p->slug,
             'description' => $p->description,
@@ -37,6 +43,12 @@ class ProductResource extends JsonResource
 
             'variants' => ProductVariantResource::collection($this->whenLoaded('variants')),
             'addons' => AddonResource::collection($this->whenLoaded('addons')),
+
+            // POS modifier notes are intentionally opt-in. They are only attached by
+            // ProductController when include_modifiers=1 is requested, so legacy APK login
+            // and normal product payloads stay slim.
+            'modifier_notes' => $this->when(isset($p->modifier_notes), fn () => array_values((array) ($p->modifier_notes ?? []))),
+            'modifiers' => $this->when(isset($p->modifiers), fn () => array_values((array) ($p->modifiers ?? []))),
 
             'created_at' => optional($p->created_at)->toISOString(),
             'updated_at' => optional($p->updated_at)->toISOString(),

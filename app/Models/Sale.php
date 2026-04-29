@@ -20,6 +20,10 @@ class Sale extends Model
         'client_sync_id',
         'sale_number',
         'queue_no',
+        'printed_sale_number',
+        'printed_queue_no',
+        'printed_cashier_name',
+        'printed_at',
         'channel',
         'online_order_source',
         'status',
@@ -73,6 +77,7 @@ class Sale extends Model
         'paid_total' => 'integer',
         'change_total' => 'integer',
         'marking' => 'integer',
+        'printed_at' => 'datetime',
     ];
 
     public function outlet()

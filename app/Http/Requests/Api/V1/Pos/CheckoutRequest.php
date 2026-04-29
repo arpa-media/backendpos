@@ -52,6 +52,14 @@ class CheckoutRequest extends FormRequest
             'queue_no' => ['nullable', 'string', 'max:20'],
             'transaction_at' => ['nullable', 'date'],
 
+            // Patch 06: print identity is optional and additive.
+            // It preserves the first printed receipt identity during offline sync/reprint
+            // without adding any required field to legacy POS APK payloads.
+            'printed_sale_number' => ['nullable', 'string', 'max:40'],
+            'printed_queue_no' => ['nullable', 'string', 'max:20'],
+            'printed_cashier_name' => ['nullable', 'string', 'max:120'],
+            'printed_at' => ['nullable', 'date'],
+
             // Backward compat: if items.*.channel not provided, use this channel.
             // Patch-6: allow mixed transaction (DINE_IN + TAKEAWAY) by sending channel=MIXED and item-level channels.
             'channel' => ['required', 'string', Rule::in(SalesChannels::ALL)],
@@ -126,6 +134,10 @@ class CheckoutRequest extends FormRequest
             'offline_snapshot.payment_method_name' => ['nullable', 'string', 'max:120'],
             'offline_snapshot.payment_method_type' => ['nullable', 'string', 'max:50'],
             'offline_snapshot.preferred_sale_number' => ['nullable', 'string', 'max:40'],
+            'offline_snapshot.printed_sale_number' => ['nullable', 'string', 'max:40'],
+            'offline_snapshot.printed_queue_no' => ['nullable', 'string', 'max:20'],
+            'offline_snapshot.printed_cashier_name' => ['nullable', 'string', 'max:120'],
+            'offline_snapshot.printed_at' => ['nullable', 'date'],
 
             'note' => ['nullable', 'string', 'max:500'],
         ];

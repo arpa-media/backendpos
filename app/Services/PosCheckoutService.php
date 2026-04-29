@@ -19,12 +19,59 @@ use App\Support\SaleRounding;
 use App\Support\SalesChannels;
 use App\Support\SaleStatuses;
 use Illuminate\Support\Carbon;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 class PosCheckoutService
 {
+    private function findExistingSaleByClientSyncId(string $outletId, ?string $clientSyncId): ?Sale
+    {
+        $normalized = trim((string) ($clientSyncId ?? ''));
+        if ($normalized === '') {
+            return null;
+        }
+
+        return Sale::query()
+            ->where('outlet_id', $outletId)
+            ->where('client_sync_id', $normalized)
+            ->with(['items', 'payments', 'customer', 'outlet'])
+            ->first();
+    }
+
+    private function isUniqueConstraintViolation(QueryException $e): bool
+    {
+        $sqlState = (string) ($e->errorInfo[0] ?? $e->getCode());
+        $driverCode = (string) ($e->errorInfo[1] ?? '');
+
+        return in_array($sqlState, ['23000', '23505'], true)
+            || in_array($driverCode, ['1062', '2067'], true);
+    }
+
+    private function applyPrintedIdentityColumns(array $attributes, array $identity): array
+    {
+        static $hasPrintedColumns = null;
+        if ($hasPrintedColumns === null) {
+            $hasPrintedColumns = Schema::hasColumn('sales', 'printed_sale_number')
+                && Schema::hasColumn('sales', 'printed_queue_no')
+                && Schema::hasColumn('sales', 'printed_cashier_name')
+                && Schema::hasColumn('sales', 'printed_at');
+        }
+
+        if (! $hasPrintedColumns) {
+            return $attributes;
+        }
+
+        return array_merge($attributes, [
+            'printed_sale_number' => $identity['printed_sale_number'] ?? null,
+            'printed_queue_no' => $identity['printed_queue_no'] ?? null,
+            'printed_cashier_name' => $identity['printed_cashier_name'] ?? null,
+            'printed_at' => $identity['printed_at'] ?? null,
+        ]);
+    }
+
     private function isOfflineLikePayload(array $payload): bool
     {
         if (trim((string) ($payload['client_sync_id'] ?? '')) !== '') {
@@ -267,6 +314,20 @@ class PosCheckoutService
                 && (array_key_exists('unit_price_snapshot', $row) || array_key_exists('line_total_snapshot', $row));
         });
         $preferredSaleNumber = trim((string) ($offlineSnapshot['preferred_sale_number'] ?? ''));
+        $requestedPrintedSaleNumber = trim((string) ($offlineSnapshot['printed_sale_number'] ?? $preferredSaleNumber));
+        $requestedPrintedQueueNo = trim((string) ($offlineSnapshot['printed_queue_no'] ?? ($payload['printed_queue_no'] ?? $queueNo)));
+        $requestedPrintedCashierName = trim((string) ($offlineSnapshot['printed_cashier_name'] ?? ($payload['printed_cashier_name'] ?? ($user->name ?? ''))));
+        $requestedPrintedAt = trim((string) ($offlineSnapshot['printed_at'] ?? ($payload['printed_at'] ?? '')));
+        $printedAtUtc = $requestedPrintedAt !== ''
+            ? $this->resolveTransactionMoment($requestedPrintedAt, $outletTimezone)->copy()->utc()
+            : $transactionAtUtc->copy();
+
+        if ($clientSyncId !== null && $clientSyncId !== '') {
+            $existingSale = $this->findExistingSaleByClientSyncId($outletId, $clientSyncId);
+            if ($existingSale) {
+                return $existingSale;
+            }
+        }
 
         // Discount payload (backward compatible with Phase-1 fields)
         // - Manual (single): discount: { type, value, reason }
@@ -329,7 +390,10 @@ class PosCheckoutService
             ]);
         }
 
-        $sale = DB::transaction(function () use (
+        $checkoutReturnedExisting = false;
+
+        try {
+            $sale = DB::transaction(function () use (
             $outletId,
             $user,
             $payloadChannel,
@@ -356,20 +420,23 @@ class PosCheckoutService
             $preferredSaleNumber,
             $transactionAtTz,
             $transactionAtUtc,
-            $outletTimezone
+            $outletTimezone,
+            $requestedPrintedSaleNumber,
+            $requestedPrintedQueueNo,
+            $requestedPrintedCashierName,
+            $printedAtUtc,
+            &$checkoutReturnedExisting
         ) {
 
             // 0) Optional: validate customer globally.
             // Customer master is now treated as cross-outlet for POS selection,
             // while the sale/payment still belongs to the active outlet.
             if ($clientSyncId !== null && $clientSyncId !== '') {
-                $existingSale = Sale::query()
-                    ->where('client_sync_id', $clientSyncId)
-                    ->where('outlet_id', $outletId)
-                    ->first();
+                $existingSale = $this->findExistingSaleByClientSyncId($outletId, $clientSyncId);
 
                 if ($existingSale) {
-                    return $existingSale->load(['items', 'payments', 'customer', 'outlet']);
+                    $checkoutReturnedExisting = true;
+                    return $existingSale;
                 }
             }
 
@@ -1056,14 +1123,16 @@ class PosCheckoutService
             }
 
             // 9) Create Sale
-            $sale = Sale::query()->forceCreate([
+            $resolvedSaleNumber = $this->resolveRequestedSaleNumber($outletId, $preferredSaleNumber, $transactionAtTz);
+            $resolvedQueueNo = $this->resolveRequestedQueueNumber($outletId, $queueNo !== '' ? $queueNo : null, $transactionAtTz, $clientSyncId);
+            $saleAttributes = [
                 'outlet_id' => $outletId,
                 'cashier_id' => (string) $user->id,
                 'cashier_name' => (string) ($user->name ?? ''),
 
                 'client_sync_id' => $clientSyncId ?: null,
-                'sale_number' => $this->resolveRequestedSaleNumber($outletId, $preferredSaleNumber, $transactionAtTz),
-                'queue_no' => $this->resolveRequestedQueueNumber($outletId, $queueNo !== '' ? $queueNo : null, $transactionAtTz, $clientSyncId),
+                'sale_number' => $resolvedSaleNumber,
+                'queue_no' => $resolvedQueueNo,
                 'channel' => (string) $saleChannel,
                 'online_order_source' => (string) $onlineOrderSource,
                 'status' => SaleStatuses::PAID,
@@ -1119,7 +1188,14 @@ class PosCheckoutService
                 'note' => $payload['note'] ?? null,
                 'created_at' => $transactionAtUtc,
                 'updated_at' => $transactionAtUtc,
-            ]);
+            ];
+
+            $sale = Sale::query()->forceCreate($this->applyPrintedIdentityColumns($saleAttributes, [
+                'printed_sale_number' => $requestedPrintedSaleNumber !== '' ? substr($requestedPrintedSaleNumber, 0, 40) : $resolvedSaleNumber,
+                'printed_queue_no' => $requestedPrintedQueueNo !== '' ? substr($requestedPrintedQueueNo, 0, 20) : $resolvedQueueNo,
+                'printed_cashier_name' => $requestedPrintedCashierName !== '' ? substr($requestedPrintedCashierName, 0, 120) : (string) ($user->name ?? ''),
+                'printed_at' => $printedAtUtc,
+            ]));
 
             // 10) Insert items
             foreach ($saleItems as $item) {
@@ -1146,11 +1222,23 @@ class PosCheckoutService
 
             return $sale->load(['items', 'payments', 'customer', 'outlet']);
         });
+        } catch (QueryException $e) {
+            if ($clientSyncId !== null && $clientSyncId !== '' && $this->isUniqueConstraintViolation($e)) {
+                $existingSale = $this->findExistingSaleByClientSyncId($outletId, $clientSyncId);
+                if ($existingSale) {
+                    return $existingSale;
+                }
+            }
 
-        try {
-            app(ReportDailySummaryRefreshService::class)->markSale($sale, 'checkout_paid');
-        } catch (\Throwable $e) {
-            report($e);
+            throw $e;
+        }
+
+        if (! $checkoutReturnedExisting) {
+            try {
+                app(ReportDailySummaryRefreshService::class)->markSale($sale, 'checkout_paid');
+            } catch (\Throwable $e) {
+                report($e);
+            }
         }
 
         return $sale;

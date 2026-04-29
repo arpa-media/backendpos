@@ -25,6 +25,7 @@ use App\Http\Controllers\Api\V1\ReportController;
 use App\Http\Controllers\Api\V1\ReportPortalController;
 use App\Http\Controllers\Api\V1\OwnerOverviewController;
 use App\Http\Controllers\Api\V1\UserManagementController;
+use App\Http\Controllers\Api\V1\ModifierController;
 
 
 use App\Http\Resources\Api\V1\Common\ApiResponse;
@@ -149,6 +150,25 @@ Route::prefix('v1')->group(function () {
         });
 
          /**
+         * MODIFIERS (POS outlet auto notes)
+         * Additive endpoints: legacy APKs do not call these routes.
+         */
+        Route::prefix('modifiers')->group(function () {
+            Route::get('/', [ModifierController::class, 'index'])
+                ->middleware('permission_or_snapshot:modifier.view');
+            Route::get('/catalog-options', [ModifierController::class, 'catalogOptions'])
+                ->middleware('permission_or_snapshot:modifier.view');
+            Route::post('/', [ModifierController::class, 'store'])
+                ->middleware('permission_or_snapshot:modifier.create');
+            Route::get('/{id}', [ModifierController::class, 'show'])
+                ->middleware('permission_or_snapshot:modifier.view');
+            Route::put('/{id}', [ModifierController::class, 'update'])
+                ->middleware('permission_or_snapshot:modifier.update');
+            Route::delete('/{id}', [ModifierController::class, 'destroy'])
+                ->middleware('permission_or_snapshot:modifier.delete');
+        });
+
+        /**
          * ADD-ONS
          */
         Route::prefix('addons')->group(function () {
@@ -326,6 +346,9 @@ Route::put('/outlet', [OutletController::class, 'update'])
 
             Route::post('/', [ProductController::class, 'store'])
                 ->middleware('permission:product.create');
+
+            Route::get('/category-options', [ProductController::class, 'categoryOptions'])
+                ->middleware('permission:product.view');
 
             Route::get('/{id}', [ProductController::class, 'show'])
                 ->middleware('permission:product.view');

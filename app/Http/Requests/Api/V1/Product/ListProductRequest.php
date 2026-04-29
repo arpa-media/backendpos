@@ -27,6 +27,7 @@ class ListProductRequest extends FormRequest
             'dir' => ['nullable', 'string', Rule::in(['asc', 'desc'])],
 
             'with_variants' => ['nullable', 'boolean'],
+            'active_in_outlet' => ['nullable', 'boolean'],
 
             // POS: filter sellable variants by channel (optional)
             'channel' => ['nullable', 'string', Rule::in(['DINE_IN','TAKEAWAY','DELIVERY'])],
