@@ -24,20 +24,25 @@ class ProductController extends Controller
 
     private function resolveOutletId(Request $request): ?string
     {
-        $outletId = OutletScope::id($request);
-        if ($outletId) return $outletId;
+        $scopeOutletId = OutletScope::id($request);
+        $isLocked = OutletScope::isLocked($request);
 
-        if (OutletScope::isLocked($request)) {
-            return null;
+        // Product backoffice pages use their own page-level outlet scope. Admin users can
+        // also have a global outlet header attached by the API interceptor. To avoid saving
+        // variants/prices into the stale global header outlet, honor an explicit outlet_id
+        // from query/body first for non-locked users. Locked outlet users (SPV/cashier) must
+        // keep using the server-resolved outlet scope and cannot override it from payload.
+        if (!$isLocked) {
+            $candidate = $request->input('outlet_id') ?? $request->query('outlet_id');
+            if (is_string($candidate) && trim($candidate) !== '') {
+                $candidate = trim($candidate);
+                return Outlet::query()->whereKey($candidate)->exists() ? $candidate : null;
+            }
         }
 
-        $candidate = $request->input('outlet_id') ?? $request->query('outlet_id');
-        if (!is_string($candidate) || trim($candidate) === '') return null;
+        if ($scopeOutletId) return $scopeOutletId;
 
-        $candidate = trim($candidate);
-        if (!Outlet::query()->whereKey($candidate)->exists()) return null;
-
-        return $candidate;
+        return null;
     }
 
 
