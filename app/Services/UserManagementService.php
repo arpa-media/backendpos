@@ -11,7 +11,9 @@ use App\Models\AccessRolePortalPermission;
 use App\Models\AccessUserType;
 use App\Models\Assignment;
 use App\Models\Employee;
+use App\Models\Outlet;
 use App\Models\User;
+use App\Models\UserReportOutletAssignment;
 use App\Models\UserAccessAssignment;
 use App\Support\UserManagementCatalog;
 use Illuminate\Database\Eloquent\Collection;
@@ -540,6 +542,78 @@ class UserManagementService
         });
     }
 
+
+    public function updateStakeholderObserverScope(User $actor, User $subject, string $roleCode, array $outletIds): array
+    {
+        $roleCode = strtoupper(trim($roleCode));
+        if (! in_array($roleCode, ['STAKEHOLDER', 'OBSERVER'], true)) {
+            throw new \InvalidArgumentException('Role scope hanya mendukung STAKEHOLDER atau OBSERVER.');
+        }
+
+        return DB::transaction(function () use ($actor, $subject, $roleCode, $outletIds) {
+            $role = AccessRole::query()->where('code', $roleCode)->firstOrFail();
+            $level = AccessLevel::query()->where('code', 'DEFAULT')->first() ?: AccessLevel::query()->first();
+
+            $cleanOutletIds = Outlet::query()
+                ->whereIn('id', array_values(array_filter(array_map(fn ($id) => trim((string) $id), $outletIds))))
+                ->orderBy('name')
+                ->pluck('id')
+                ->map(fn ($id) => (string) $id)
+                ->values()
+                ->all();
+
+            if (count($cleanOutletIds) === 0) {
+                throw new \InvalidArgumentException('Minimal pilih satu outlet scope.');
+            }
+
+
+            $sync = $this->updateUserAssignment(
+                $actor,
+                $subject,
+                (string) $role->id,
+                $level?->id ? (string) $level->id : null,
+            );
+
+            $portalCode = $this->reportPortalCodeForStakeholderObserverRole($roleCode);
+
+            UserReportOutletAssignment::query()
+                ->where('user_id', (string) $subject->id)
+                ->whereIn('portal_code', ['omzet-report', 'sales-report'])
+                ->delete();
+
+            foreach ($cleanOutletIds as $outletId) {
+                UserReportOutletAssignment::query()->updateOrCreate(
+                    [
+                        'user_id' => (string) $subject->id,
+                        'portal_code' => $portalCode,
+                        'outlet_id' => (string) $outletId,
+                    ],
+                    []
+                );
+            }
+
+            $fresh = $subject->fresh([
+                'employee.assignment.outlet',
+                'outlet',
+                'roles',
+                'accessAssignment.role.userType',
+                'accessAssignment.level',
+                'reportOutletAssignments.outlet',
+            ]);
+
+            return [
+                'user' => $fresh,
+                'subject_access' => $sync['access'] ?? null,
+                'subject_permissions' => $sync['permissions'] ?? [],
+                'current_actor_session' => $this->currentSessionSnapshot($actor),
+            ];
+        });
+    }
+
+    public function reportPortalCodeForStakeholderObserverRole(string $roleCode): string
+    {
+        return strtoupper(trim($roleCode)) === 'OBSERVER' ? 'sales-report' : 'omzet-report';
+    }
     private function nullableString(mixed $value): ?string
     {
         if ($value === null) {

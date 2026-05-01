@@ -42,6 +42,7 @@ class UserManagementController extends Controller
             'roles',
             'accessAssignment.role.userType',
             'accessAssignment.level',
+            'reportOutletAssignments.outlet',
         ]);
 
         if ($q !== '') {
@@ -75,6 +76,7 @@ class UserManagementController extends Controller
             'roles',
             'accessAssignment.role.userType',
             'accessAssignment.level',
+            'reportOutletAssignments.outlet',
         ]);
 
         $masters = $this->buildMasters();
@@ -156,6 +158,7 @@ class UserManagementController extends Controller
                     'roles' => $user->roles->pluck('name')->values()->all(),
                 ],
                 'provision_control' => $provisionControl,
+                'report_outlet_scope' => $this->serializeReportOutletScope($user),
             ];
         })->values()->all();
 
@@ -475,6 +478,44 @@ class UserManagementController extends Controller
         ], 'User profile updated');
     }
 
+
+    public function updateStakeholderObserverScope(Request $request, string $userId)
+    {
+        $this->userManagement->ensureMasters();
+
+        $subject = User::query()->with(['reportOutletAssignments.outlet', 'accessAssignment.role.userType', 'accessAssignment.level'])->find($userId);
+        if (! $subject) {
+            return ApiResponse::error('User tidak ditemukan.', 'USER_NOT_FOUND', 404);
+        }
+
+        $data = $request->validate([
+            'role_code' => ['required', 'string', Rule::in(['STAKEHOLDER', 'OBSERVER'])],
+            'outlet_ids' => ['required', 'array', 'min:1'],
+            'outlet_ids.*' => ['required', 'string', Rule::exists('outlets', 'id')],
+        ]);
+
+        try {
+            $result = $this->userManagement->updateStakeholderObserverScope(
+                $request->user(),
+                $subject,
+                (string) $data['role_code'],
+                $data['outlet_ids'] ?? [],
+            );
+        } catch (\InvalidArgumentException $exception) {
+            return ApiResponse::error($exception->getMessage(), 'STAKEHOLDER_OBSERVER_SCOPE_INVALID', 422);
+        }
+
+        $fresh = $result['user'];
+
+        return ApiResponse::ok([
+            'user_id' => (string) $fresh->id,
+            'role_code' => (string) ($fresh->accessAssignment?->role?->code ?? $data['role_code']),
+            'report_outlet_scope' => $this->serializeReportOutletScope($fresh),
+            'subject_access' => $result['subject_access'] ?? null,
+            'subject_permissions' => $result['subject_permissions'] ?? [],
+            'current_actor_session' => $result['current_actor_session'] ?? $this->userManagement->currentSessionSnapshot($request->user()),
+        ], 'Stakeholder/Observer scope updated');
+    }
     public function updateUserProvisionControl(Request $request, string $userId)
     {
         $this->userManagement->ensureMasters();
@@ -773,6 +814,72 @@ class UserManagementController extends Controller
         return $assignmentTitle !== '' && (str_contains($assignmentTitle, 'spv') || str_contains($assignmentTitle, 'supervisor'));
     }
 
+
+    private function serializeReportOutletScope(User $user): array
+    {
+        $user->loadMissing(['reportOutletAssignments.outlet', 'accessAssignment.role']);
+
+        $roleCode = strtoupper((string) ($user->accessAssignment?->role?->code ?? ''));
+        $primaryPortalCode = match ($roleCode) {
+            'OBSERVER' => 'sales-report',
+            'STAKEHOLDER' => 'omzet-report',
+            default => null,
+        };
+
+        $portalRows = $user->reportOutletAssignments
+            ? $user->reportOutletAssignments->filter(fn ($row) => $row->outlet !== null)
+            : collect();
+
+        $allowedRows = $primaryPortalCode
+            ? $portalRows->filter(fn ($row) => strtolower((string) $row->portal_code) === $primaryPortalCode)
+            : $portalRows;
+
+        $allowedOutlets = $allowedRows
+            ->map(fn ($row) => $row->outlet)
+            ->filter()
+            ->unique('id')
+            ->sortBy('name')
+            ->values()
+            ->map(fn ($outlet) => [
+                'id' => (string) $outlet->id,
+                'code' => (string) ($outlet->code ?? ''),
+                'name' => (string) ($outlet->name ?? ''),
+                'type' => $outlet->type,
+                'timezone' => $outlet->timezone,
+            ])
+            ->all();
+
+        $portalScopes = $portalRows
+            ->groupBy(fn ($row) => strtolower((string) $row->portal_code))
+            ->map(function ($rows, string $portalCode) {
+                return [
+                    'portal_code' => $portalCode,
+                    'allowed_outlets' => $rows
+                        ->map(fn ($row) => $row->outlet)
+                        ->filter()
+                        ->unique('id')
+                        ->sortBy('name')
+                        ->values()
+                        ->map(fn ($outlet) => [
+                            'id' => (string) $outlet->id,
+                            'code' => (string) ($outlet->code ?? ''),
+                            'name' => (string) ($outlet->name ?? ''),
+                            'type' => $outlet->type,
+                            'timezone' => $outlet->timezone,
+                        ])
+                        ->all(),
+                ];
+            })
+            ->values()
+            ->all();
+
+        return [
+            'role_code' => $roleCode ?: null,
+            'primary_portal_code' => $primaryPortalCode,
+            'allowed_outlets' => $allowedOutlets,
+            'portal_scopes' => $portalScopes,
+        ];
+    }
     private function outletDeleteBillPin(?Outlet $outlet): string
     {
         $raw = '0341';
