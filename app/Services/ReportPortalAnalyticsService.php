@@ -70,6 +70,18 @@ class ReportPortalAnalyticsService
         );
     }
 
+    private function businessDateSqlExpression(string $createdAtColumn, ?string $saleNumberColumn = null, ?string $timezone = null): string
+    {
+        $resolvedLocalExpr = TransactionDate::resolvedSaleLocalSqlExpression($createdAtColumn, $saleNumberColumn, $timezone);
+        $startHour = TransactionDate::businessDayStartHour($timezone);
+
+        if ($startHour <= 0) {
+            return $resolvedLocalExpr;
+        }
+
+        return "DATE_SUB({$resolvedLocalExpr}, INTERVAL {$startHour} HOUR)";
+    }
+
     private function effectiveScopeOutletIds(array $scope): array
     {
         $selectedOutletId = (string) ($scope['selected_outlet_id'] ?? '');
@@ -355,6 +367,214 @@ class ReportPortalAnalyticsService
                 ],
             ],
         ];
+    }
+
+
+    public function summaryCsv(array $scope, array $params): array
+    {
+        $this->setScopeTimezone($scope);
+        [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
+        $dashboard = $this->dashboard($scope, $params);
+        $metrics = $dashboard['metrics'] ?? [];
+        $byChannel = $dashboard['breakdowns']['by_channel'] ?? [];
+        $byPayment = $dashboard['breakdowns']['by_payment_method_snapshot'] ?? [];
+        $dailyRows = $this->dailySummaryRows($scope, $params, $from, $to);
+
+        $csvRows = [];
+        $csvRows[] = ['Summary'];
+        $csvRows[] = ['Gross Sales', (int) ($metrics['gross_sales'] ?? 0)];
+        $csvRows[] = ['Transaction', (int) ($metrics['transaction_count'] ?? 0)];
+        $csvRows[] = ['Item Sold', (int) ($metrics['items_sold'] ?? 0)];
+        $csvRows[] = ['Avg Ticket', (int) ($metrics['avg_ticket'] ?? 0)];
+        $csvRows[] = [];
+
+        $csvRows[] = ['Channel Summary'];
+        $csvRows[] = ['Channel', 'Trx', 'Gross'];
+        foreach ($byChannel as $row) {
+            $csvRows[] = [
+                (string) ($row['channel'] ?? ''),
+                (int) ($row['trx_count'] ?? 0),
+                (int) ($row['gross_sales'] ?? 0),
+            ];
+        }
+        $csvRows[] = [];
+
+        $csvRows[] = ['Payment Method Summary'];
+        $csvRows[] = ['Payment Method', 'Trx', 'Gross'];
+        foreach ($byPayment as $row) {
+            $csvRows[] = [
+                (string) (($row['payment_method_name'] ?? '') ?: ($row['payment_method_type'] ?? '-')),
+                (int) ($row['trx_count'] ?? 0),
+                (int) ($row['gross_sales'] ?? 0),
+            ];
+        }
+        $csvRows[] = [];
+
+        $dailyHeader = [
+            'Date',
+            'Transaction',
+            'Item Sold',
+            'Avg Ticket',
+            'Gross Sales',
+            'Discount',
+            'Net Sales',
+            'Tax',
+            'Rounding',
+            'Total Collected',
+            'Tunai',
+            'Qris BCA',
+            'EDC BCA',
+            'TF BCA',
+            'QRIS BRI',
+            'EDC BRI',
+            'TF BRI',
+            'GoFood',
+            'GrabFood',
+            'Debit/Card',
+        ];
+        $csvRows[] = ['Daily Summary'];
+        $csvRows[] = $dailyHeader;
+        foreach ($dailyRows as $row) {
+            $csvRows[] = [
+                $row['date'],
+                $row['transaction'],
+                $row['item_sold'],
+                $row['avg_ticket'],
+                $row['gross_sales'],
+                $row['discount'],
+                $row['net_sales'],
+                $row['tax'],
+                $row['rounding'],
+                $row['total_collected'],
+                $row['tunai'],
+                $row['qris_bca'],
+                $row['edc_bca'],
+                $row['tf_bca'],
+                $row['qris_bri'],
+                $row['edc_bri'],
+                $row['tf_bri'],
+                $row['gofood'],
+                $row['grabfood'],
+                $row['debit_card'],
+            ];
+        }
+
+        $handle = fopen('php://temp', 'r+');
+        foreach ($csvRows as $row) {
+            fputcsv($handle, $row);
+        }
+        rewind($handle);
+        $csv = stream_get_contents($handle) ?: '';
+        fclose($handle);
+
+        return [
+            'filename' => sprintf(
+                '%s-summary-%s-to-%s.csv',
+                str_replace('_', '-', strtolower((string) ($scope['portal_code'] ?? 'omzet-report'))),
+                $from->toDateString(),
+                $to->toDateString()
+            ),
+            'content' => $csv,
+        ];
+    }
+
+    private function dailySummaryRows(array $scope, array $params, CarbonImmutable $from, CarbonImmutable $to): array
+    {
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+        $saleScope = $this->resolveEligibleSalesScope($scope, $params);
+        $scopeKey = (string) ($saleScope['scope_key'] ?? '');
+        $outletIds = $this->effectiveScopeOutletIds($scope);
+        $dateExpr = $this->businessDateSqlExpression('s.created_at', 's.sale_number', $timezone);
+        $paymentBucketExpr = $this->paymentBucketSqlExpression('s.channel', 's.online_order_source', 's.payment_method_type', 's.payment_method_name');
+
+        $salesRows = collect();
+        $itemRows = collect();
+
+        if ($scopeKey !== '' && ($saleScope['has_rows'] ?? false)) {
+            $salesQuery = DB::table('sales as s')
+                ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
+                ->whereNull('s.deleted_at')
+                ->where('s.status', '=', 'PAID')
+                ->when(! empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds));
+
+            $this->scopeService->applySalesScope($salesQuery, $scope, 's');
+
+            $salesRows = $salesQuery
+                ->selectRaw("DATE({$dateExpr}) as sale_date")
+                ->selectRaw('COUNT(*) as transaction')
+                ->selectRaw('COALESCE(SUM(s.grand_total),0) as gross_sales')
+                ->selectRaw('COALESCE(SUM(s.discount_total),0) as discount')
+                ->selectRaw('COALESCE(SUM(s.subtotal - s.discount_total),0) as net_sales')
+                ->selectRaw('COALESCE(SUM(s.tax_total),0) as tax')
+                ->selectRaw('COALESCE(SUM(s.rounding_total),0) as rounding')
+                ->selectRaw('COALESCE(SUM(s.paid_total - s.change_total),0) as total_collected')
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'tunai' THEN s.grand_total ELSE 0 END),0) as tunai")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'qris_bca' THEN s.grand_total ELSE 0 END),0) as qris_bca")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'edc_bca' THEN s.grand_total ELSE 0 END),0) as edc_bca")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'tf_bca' THEN s.grand_total ELSE 0 END),0) as tf_bca")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'qris_bri' THEN s.grand_total ELSE 0 END),0) as qris_bri")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'edc_bri' THEN s.grand_total ELSE 0 END),0) as edc_bri")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'tf_bri' THEN s.grand_total ELSE 0 END),0) as tf_bri")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'gofood' THEN s.grand_total ELSE 0 END),0) as gofood")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'grabfood' THEN s.grand_total ELSE 0 END),0) as grabfood")
+                ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'debit_card' THEN s.grand_total ELSE 0 END),0) as debit_card")
+                ->groupBy('sale_date')
+                ->orderBy('sale_date')
+                ->get()
+                ->keyBy(fn ($row) => (string) $row->sale_date);
+
+            $itemDateExpr = $this->businessDateSqlExpression('s.created_at', 's.sale_number', $timezone);
+            $itemQuery = DB::table('sale_items as si')
+                ->join('sales as s', 's.id', '=', 'si.sale_id')
+                ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
+                ->whereNull('si.voided_at')
+                ->whereNull('s.deleted_at')
+                ->where('s.status', '=', 'PAID')
+                ->when(! empty($outletIds), fn ($query) => $query->whereIn('s.outlet_id', $outletIds));
+
+            $this->scopeService->applySalesScope($itemQuery, $scope, 's');
+
+            $itemRows = $itemQuery
+                ->selectRaw("DATE({$itemDateExpr}) as sale_date")
+                ->selectRaw('COALESCE(SUM(si.qty),0) as item_sold')
+                ->groupBy('sale_date')
+                ->get()
+                ->keyBy(fn ($row) => (string) $row->sale_date);
+        }
+
+        $rows = [];
+        for ($cursor = $from->startOfDay(); $cursor->lessThanOrEqualTo($to->startOfDay()); $cursor = $cursor->addDay()) {
+            $date = $cursor->toDateString();
+            $saleRow = $salesRows->get($date);
+            $itemRow = $itemRows->get($date);
+            $transaction = (int) ($saleRow->transaction ?? 0);
+            $grossSales = (int) ($saleRow->gross_sales ?? 0);
+
+            $rows[] = [
+                'date' => $date,
+                'transaction' => $transaction,
+                'item_sold' => (int) ($itemRow->item_sold ?? 0),
+                'avg_ticket' => $transaction > 0 ? (int) floor($grossSales / $transaction) : 0,
+                'gross_sales' => $grossSales,
+                'discount' => (int) ($saleRow->discount ?? 0),
+                'net_sales' => (int) ($saleRow->net_sales ?? 0),
+                'tax' => (int) ($saleRow->tax ?? 0),
+                'rounding' => (int) ($saleRow->rounding ?? 0),
+                'total_collected' => (int) ($saleRow->total_collected ?? 0),
+                'tunai' => (int) ($saleRow->tunai ?? 0),
+                'qris_bca' => (int) ($saleRow->qris_bca ?? 0),
+                'edc_bca' => (int) ($saleRow->edc_bca ?? 0),
+                'tf_bca' => (int) ($saleRow->tf_bca ?? 0),
+                'qris_bri' => (int) ($saleRow->qris_bri ?? 0),
+                'edc_bri' => (int) ($saleRow->edc_bri ?? 0),
+                'tf_bri' => (int) ($saleRow->tf_bri ?? 0),
+                'gofood' => (int) ($saleRow->gofood ?? 0),
+                'grabfood' => (int) ($saleRow->grabfood ?? 0),
+                'debit_card' => (int) ($saleRow->debit_card ?? 0),
+            ];
+        }
+
+        return $rows;
     }
 
     public function ledger(array $scope, array $params): array
@@ -659,6 +879,28 @@ class ReportPortalAnalyticsService
             'scope' => $this->scopeMeta($scope),
             'sale' => $this->transformSaleDetail($sale),
         ];
+    }
+
+
+    private function paymentBucketSqlExpression(string $channelColumn, string $onlineOrderSourceColumn, string $paymentMethodTypeColumn, string $paymentMethodNameColumn): string
+    {
+        $haystack = "LOWER(CONCAT_WS(' ', COALESCE({$channelColumn}, ''), COALESCE({$onlineOrderSourceColumn}, ''), COALESCE({$paymentMethodTypeColumn}, ''), COALESCE({$paymentMethodNameColumn}, '')))";
+
+        return implode(' ', [
+            'CASE',
+            "WHEN {$haystack} LIKE '%gofood%' OR {$haystack} LIKE '%go food%' THEN 'gofood'",
+            "WHEN {$haystack} LIKE '%grabfood%' OR {$haystack} LIKE '%grab food%' THEN 'grabfood'",
+            "WHEN ({$haystack} LIKE '%qris%' OR {$haystack} LIKE '%qr%') AND {$haystack} LIKE '%bca%' THEN 'qris_bca'",
+            "WHEN {$haystack} LIKE '%edc%' AND {$haystack} LIKE '%bca%' THEN 'edc_bca'",
+            "WHEN ({$haystack} LIKE '%tf%' OR {$haystack} LIKE '%transfer%') AND {$haystack} LIKE '%bca%' THEN 'tf_bca'",
+            "WHEN ({$haystack} LIKE '%qris%' OR {$haystack} LIKE '%qr%') AND {$haystack} LIKE '%bri%' THEN 'qris_bri'",
+            "WHEN {$haystack} LIKE '%edc%' AND {$haystack} LIKE '%bri%' THEN 'edc_bri'",
+            "WHEN ({$haystack} LIKE '%tf%' OR {$haystack} LIKE '%transfer%') AND {$haystack} LIKE '%bri%' THEN 'tf_bri'",
+            "WHEN {$haystack} LIKE '%tunai%' OR {$haystack} LIKE '%cash%' THEN 'tunai'",
+            "WHEN {$haystack} LIKE '%debit%' OR {$haystack} LIKE '%card%' OR {$haystack} LIKE '%credit%' OR {$haystack} LIKE '%kartu%' THEN 'debit_card'",
+            "ELSE 'other'",
+            'END',
+        ]);
     }
 
     private function saleListing(array $scope, array $params, int $defaultPerPage): array

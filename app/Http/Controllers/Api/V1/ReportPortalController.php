@@ -49,6 +49,23 @@ class ReportPortalController extends Controller
         return $this->okCached($request, 'report-portal.dashboard', $scope, fn () => $this->analyticsService->dashboard($scope, $request->validated()));
     }
 
+
+    public function downloadSummary(ReportPortalQueryRequest $request, string $portalCode)
+    {
+        $scope = $this->resolveScope($request, $portalCode);
+        if ($scope['ok'] !== true) {
+            return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
+        }
+
+        $csv = $this->analyticsService->summaryCsv($scope, $request->validated());
+
+        return response($csv['content'] ?? '', 200, [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="' . ($csv['filename'] ?? 'omzet-report-summary.csv') . '"',
+            'Cache-Control' => 'no-store, no-cache, must-revalidate, max-age=0',
+        ]);
+    }
+
     public function ledger(ReportPortalQueryRequest $request, string $portalCode)
     {
         $scope = $this->resolveScope($request, $portalCode);

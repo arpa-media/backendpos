@@ -68,6 +68,8 @@ Route::prefix('v1')->group(function () {
          */
         Route::get('/dashboard/summary', [DashboardController::class, 'summary'])
             ->middleware('permission_or_snapshot:dashboard.view');
+        Route::get('/dashboard/summary/download', [DashboardController::class, 'downloadSummary'])
+            ->middleware('permission_or_snapshot:dashboard.view');
 
         /**
          * REPORT PORTALS (Patch-02)
@@ -81,6 +83,9 @@ Route::prefix('v1')->group(function () {
 
         Route::prefix('report-portals/{portalCode}')->middleware('report_observe')->group(function () {
             Route::get('/dashboard', [ReportPortalController::class, 'dashboard'])
+                ->middleware('permission:dashboard.view');
+
+            Route::get('/dashboard/summary-download', [ReportPortalController::class, 'downloadSummary'])
                 ->middleware('permission:dashboard.view');
 
             Route::get('/ledger', [ReportPortalController::class, 'ledger'])

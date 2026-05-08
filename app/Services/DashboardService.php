@@ -200,6 +200,241 @@ class DashboardService
         ];
     }
 
+
+    public function summaryCsv(?string $outletId, array $filters): array
+    {
+        $status = $filters['status'] ?? SaleStatuses::PAID;
+        $timezone = $this->resolveTimezone($outletId, $filters);
+        $window = TransactionDate::businessDateWindow($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
+
+        $selectedOutletIds = $this->selectedOutletIds($outletId, $filters);
+        if (empty($selectedOutletIds)) {
+            $selectedOutletIds = DB::table('outlets')
+                ->whereRaw('LOWER(COALESCE(type, ?)) = ?', ['outlet', 'outlet'])
+                ->pluck('id')
+                ->map(fn ($id) => (string) $id)
+                ->all();
+        }
+
+        $eligibleSaleIds = $this->cashierAlignedSaleScope->eligibleSaleIds(
+            $selectedOutletIds,
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone
+        );
+
+        $salesBase = Sale::query()
+            ->where('status', $status)
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('id', $eligibleSaleIds));
+        $this->applyOutletSelection($salesBase, $outletId, $filters, 'outlet_id');
+        TransactionDate::applyExactBusinessDateScope($salesBase, 'created_at', $filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone, 'sale_number');
+
+        $summaryPayload = $this->summary($outletId, $filters);
+        $metrics = $summaryPayload['metrics'] ?? [];
+        $byChannel = $summaryPayload['by_channel'] ?? [];
+        $byPayment = $summaryPayload['by_payment_method'] ?? [];
+
+        $dailyRows = $this->buildDailySummaryRows($salesBase, $eligibleSaleIds, $outletId, $filters, $window['timezone'], $window);
+
+        $csvRows = [];
+        $csvRows[] = ['Summary'];
+        $csvRows[] = ['Gross Sales', (int) ($metrics['gross_sales'] ?? 0)];
+        $csvRows[] = ['Transaction', (int) ($metrics['trx_count'] ?? 0)];
+        $csvRows[] = ['Item Sold', (int) ($metrics['items_sold'] ?? 0)];
+        $csvRows[] = ['Avg Ticket', (int) ($metrics['avg_ticket'] ?? 0)];
+        $csvRows[] = [];
+
+        $csvRows[] = ['Channel Summary'];
+        $csvRows[] = ['Channel', 'Trx', 'Gross'];
+        foreach ($byChannel as $row) {
+            $csvRows[] = [
+                (string) ($row['channel'] ?? ''),
+                (int) ($row['trx_count'] ?? 0),
+                (int) ($row['gross_sales'] ?? 0),
+            ];
+        }
+        $csvRows[] = [];
+
+        $csvRows[] = ['Payment Method Summary'];
+        $csvRows[] = ['Payment Method', 'Trx', 'Gross'];
+        foreach ($byPayment as $row) {
+            $csvRows[] = [
+                (string) (($row['payment_method_name'] ?? '') ?: ($row['payment_method_type'] ?? '-')),
+                (int) ($row['trx_count'] ?? 0),
+                (int) ($row['gross_sales'] ?? 0),
+            ];
+        }
+        $csvRows[] = [];
+
+        $dailyHeader = [
+            'Date',
+            'Transaction',
+            'Item Sold',
+            'Avg Ticket',
+            'Gross Sales',
+            'Discount',
+            'Net Sales',
+            'Tax',
+            'Rounding',
+            'Total Collected',
+            'Tunai',
+            'Qris BCA',
+            'EDC BCA',
+            'TF BCA',
+            'QRIS BRI',
+            'EDC BRI',
+            'TF BRI',
+            'GoFood',
+            'GrabFood',
+            'Debit/Card',
+        ];
+        $csvRows[] = ['Daily Summary'];
+        $csvRows[] = $dailyHeader;
+        foreach ($dailyRows as $row) {
+            $csvRows[] = [
+                $row['date'],
+                $row['transaction'],
+                $row['item_sold'],
+                $row['avg_ticket'],
+                $row['gross_sales'],
+                $row['discount'],
+                $row['net_sales'],
+                $row['tax'],
+                $row['rounding'],
+                $row['total_collected'],
+                $row['tunai'],
+                $row['qris_bca'],
+                $row['edc_bca'],
+                $row['tf_bca'],
+                $row['qris_bri'],
+                $row['edc_bri'],
+                $row['tf_bri'],
+                $row['gofood'],
+                $row['grabfood'],
+                $row['debit_card'],
+            ];
+        }
+
+        $handle = fopen('php://temp', 'r+');
+        foreach ($csvRows as $row) {
+            fputcsv($handle, $row);
+        }
+        rewind($handle);
+        $csv = stream_get_contents($handle) ?: '';
+        fclose($handle);
+
+        $filename = sprintf(
+            'omzet-summary-%s-to-%s.csv',
+            $window['requested_from']->toDateString(),
+            $window['requested_to']->toDateString()
+        );
+
+        return [
+            'filename' => $filename,
+            'content' => $csv,
+        ];
+    }
+
+    private function buildDailySummaryRows($salesBase, array $eligibleSaleIds, ?string $outletId, array $filters, string $timezone, array $window): array
+    {
+        $dateExpr = TransactionDate::resolvedSaleLocalSqlExpression('created_at', 'sale_number', $timezone);
+        $paymentBucketExpr = $this->paymentBucketSqlExpression('channel', 'online_order_source', 'payment_method_type', 'payment_method_name');
+
+        $salesRows = (clone $salesBase)
+            ->selectRaw("DATE({$dateExpr}) as sale_date")
+            ->selectRaw('COUNT(*) as transaction')
+            ->selectRaw('COALESCE(SUM(grand_total),0) as gross_sales')
+            ->selectRaw('COALESCE(SUM(discount_total),0) as discount')
+            ->selectRaw('COALESCE(SUM(subtotal - discount_total),0) as net_sales')
+            ->selectRaw('COALESCE(SUM(tax_total),0) as tax')
+            ->selectRaw('COALESCE(SUM(rounding_total),0) as rounding')
+            ->selectRaw('COALESCE(SUM(paid_total - change_total),0) as total_collected')
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'tunai' THEN grand_total ELSE 0 END),0) as tunai")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'qris_bca' THEN grand_total ELSE 0 END),0) as qris_bca")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'edc_bca' THEN grand_total ELSE 0 END),0) as edc_bca")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'tf_bca' THEN grand_total ELSE 0 END),0) as tf_bca")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'qris_bri' THEN grand_total ELSE 0 END),0) as qris_bri")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'edc_bri' THEN grand_total ELSE 0 END),0) as edc_bri")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'tf_bri' THEN grand_total ELSE 0 END),0) as tf_bri")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'gofood' THEN grand_total ELSE 0 END),0) as gofood")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'grabfood' THEN grand_total ELSE 0 END),0) as grabfood")
+            ->selectRaw("COALESCE(SUM(CASE WHEN {$paymentBucketExpr} = 'debit_card' THEN grand_total ELSE 0 END),0) as debit_card")
+            ->groupBy('sale_date')
+            ->orderBy('sale_date')
+            ->get()
+            ->keyBy(fn ($row) => (string) $row->sale_date);
+
+        $itemDateExpr = TransactionDate::resolvedSaleLocalSqlExpression('sales.created_at', 'sales.sale_number', $timezone);
+        $itemRowsQuery = SaleItem::query()
+            ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
+            ->where('sales.status', $filters['status'] ?? SaleStatuses::PAID)
+            ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('sales.id', $eligibleSaleIds));
+        $this->applyOutletSelection($itemRowsQuery, $outletId, $filters, 'sales.outlet_id');
+        TransactionDate::applyExactBusinessDateScope($itemRowsQuery, 'sales.created_at', $filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone, 'sales.sale_number');
+
+        $itemRows = $itemRowsQuery
+            ->selectRaw("DATE({$itemDateExpr}) as sale_date")
+            ->selectRaw('COALESCE(SUM(sale_items.qty),0) as item_sold')
+            ->groupBy('sale_date')
+            ->get()
+            ->keyBy(fn ($row) => (string) $row->sale_date);
+
+        $rows = [];
+        for ($cursor = $window['requested_from']->startOfDay(); $cursor->lessThanOrEqualTo($window['requested_to']->startOfDay()); $cursor = $cursor->addDay()) {
+            $date = $cursor->toDateString();
+            $saleRow = $salesRows->get($date);
+            $itemRow = $itemRows->get($date);
+            $transaction = (int) ($saleRow->transaction ?? 0);
+            $grossSales = (int) ($saleRow->gross_sales ?? 0);
+
+            $rows[] = [
+                'date' => $date,
+                'transaction' => $transaction,
+                'item_sold' => (int) ($itemRow->item_sold ?? 0),
+                'avg_ticket' => $transaction > 0 ? (int) floor($grossSales / $transaction) : 0,
+                'gross_sales' => $grossSales,
+                'discount' => (int) ($saleRow->discount ?? 0),
+                'net_sales' => (int) ($saleRow->net_sales ?? 0),
+                'tax' => (int) ($saleRow->tax ?? 0),
+                'rounding' => (int) ($saleRow->rounding ?? 0),
+                'total_collected' => (int) ($saleRow->total_collected ?? 0),
+                'tunai' => (int) ($saleRow->tunai ?? 0),
+                'qris_bca' => (int) ($saleRow->qris_bca ?? 0),
+                'edc_bca' => (int) ($saleRow->edc_bca ?? 0),
+                'tf_bca' => (int) ($saleRow->tf_bca ?? 0),
+                'qris_bri' => (int) ($saleRow->qris_bri ?? 0),
+                'edc_bri' => (int) ($saleRow->edc_bri ?? 0),
+                'tf_bri' => (int) ($saleRow->tf_bri ?? 0),
+                'gofood' => (int) ($saleRow->gofood ?? 0),
+                'grabfood' => (int) ($saleRow->grabfood ?? 0),
+                'debit_card' => (int) ($saleRow->debit_card ?? 0),
+            ];
+        }
+
+        return $rows;
+    }
+
+    private function paymentBucketSqlExpression(string $channelColumn, string $onlineOrderSourceColumn, string $paymentMethodTypeColumn, string $paymentMethodNameColumn): string
+    {
+        $haystack = "LOWER(CONCAT_WS(' ', COALESCE({$channelColumn}, ''), COALESCE({$onlineOrderSourceColumn}, ''), COALESCE({$paymentMethodTypeColumn}, ''), COALESCE({$paymentMethodNameColumn}, '')))";
+
+        return implode(' ', [
+            'CASE',
+            "WHEN {$haystack} LIKE '%gofood%' OR {$haystack} LIKE '%go food%' THEN 'gofood'",
+            "WHEN {$haystack} LIKE '%grabfood%' OR {$haystack} LIKE '%grab food%' THEN 'grabfood'",
+            "WHEN ({$haystack} LIKE '%qris%' OR {$haystack} LIKE '%qr%') AND {$haystack} LIKE '%bca%' THEN 'qris_bca'",
+            "WHEN {$haystack} LIKE '%edc%' AND {$haystack} LIKE '%bca%' THEN 'edc_bca'",
+            "WHEN ({$haystack} LIKE '%tf%' OR {$haystack} LIKE '%transfer%') AND {$haystack} LIKE '%bca%' THEN 'tf_bca'",
+            "WHEN ({$haystack} LIKE '%qris%' OR {$haystack} LIKE '%qr%') AND {$haystack} LIKE '%bri%' THEN 'qris_bri'",
+            "WHEN {$haystack} LIKE '%edc%' AND {$haystack} LIKE '%bri%' THEN 'edc_bri'",
+            "WHEN ({$haystack} LIKE '%tf%' OR {$haystack} LIKE '%transfer%') AND {$haystack} LIKE '%bri%' THEN 'tf_bri'",
+            "WHEN {$haystack} LIKE '%tunai%' OR {$haystack} LIKE '%cash%' THEN 'tunai'",
+            "WHEN {$haystack} LIKE '%debit%' OR {$haystack} LIKE '%card%' OR {$haystack} LIKE '%credit%' OR {$haystack} LIKE '%kartu%' THEN 'debit_card'",
+            "ELSE 'other'",
+            'END',
+        ]);
+    }
+
     private function summaryForMakassarBusinessWindow(string $outletId, array $filters, string $status, int $recentLimit, string $timezone, array $window): array
     {
         $candidateQuery = Sale::query()->where('status', $status);

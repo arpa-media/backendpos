@@ -32,4 +32,25 @@ class DashboardController extends Controller
 
         return ApiResponse::ok(new DashboardSummaryResource($data), 'OK');
     }
+
+    public function downloadSummary(DashboardSummaryRequest $request)
+    {
+        $validated = $request->validated();
+        $scope = BackofficeOutletScope::resolve($request, (string) ($validated['outlet_filter'] ?? ''));
+        $outletId = OutletScope::isLocked($request) ? OutletScope::id($request) : (count($scope['outlet_ids'] ?? []) === 1 ? (string) ($scope['outlet_ids'][0] ?? '') : null);
+
+        $validated['scope_outlet_ids'] = $scope['outlet_ids'] ?? [];
+        $validated['scope_label'] = $scope['label'] ?? 'All Outlet';
+        $validated['scope_timezone'] = $scope['timezone'] ?? config('app.timezone', 'Asia/Jakarta');
+        $validated['outlet_filter'] = $scope['value'] ?? ($validated['outlet_filter'] ?? 'ALL');
+
+        $csv = $this->service->summaryCsv($outletId ?: null, $validated);
+
+        return response($csv['content'] ?? '', 200, [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => 'attachment; filename="' . ($csv['filename'] ?? 'omzet-summary.csv') . '"',
+            'Cache-Control' => 'no-store, no-cache, must-revalidate, max-age=0',
+        ]);
+    }
+
 }
