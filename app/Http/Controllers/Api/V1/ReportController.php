@@ -55,23 +55,45 @@ class ReportController extends Controller
 
         return response()->json(['data' => $payload]);
     }
+
+    private function jsonFresh(callable $callback): JsonResponse
+    {
+        @ini_set('max_execution_time', '240');
+        @set_time_limit(240);
+
+        return response()
+            ->json(['data' => $callback()])
+            ->withHeaders([
+                'Cache-Control' => 'no-store, no-cache, must-revalidate, max-age=0',
+                'Pragma' => 'no-cache',
+                'Expires' => '0',
+            ]);
+    }
+
     public function cashierReport(CashierReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return $this->jsonCached($request, 'report.cashier-report', $params, fn () => $service->cashierReport($params, OutletScope::id($request)));
+
+        // Cashier Report harus menampilkan transaksi tersync terbaru dari server.
+        // Jangan gunakan analytics cache di endpoint ini karena POS Android sering
+        // membuka report beberapa detik setelah sync transaksi berhasil. Cache 300s
+        // bisa membuat sumber tetap tertulis "server" tetapi payload masih snapshot lama.
+        return $this->jsonFresh(fn () => $service->cashierReport($params, OutletScope::id($request)));
     }
 
     public function cashierReportCashiers(CashierReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return $this->jsonCached($request, 'report.cashier-report-cashiers', $params, fn () => $service->cashierReportCashiers($params, OutletScope::id($request)));
+
+        return $this->jsonFresh(fn () => $service->cashierReportCashiers($params, OutletScope::id($request)));
     }
 
     public function cashierReportByCashier(CashierReportRequest $request, string $cashierId, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
         $params['cashier_id'] = $cashierId;
-        return $this->jsonCached($request, 'report.cashier-report-by-cashier', $params, fn () => $service->cashierReport($params, OutletScope::id($request)));
+
+        return $this->jsonFresh(fn () => $service->cashierReport($params, OutletScope::id($request)));
     }
 
     public function ledger(LedgerReportRequest $request, ReportService $service): JsonResponse
