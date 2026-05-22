@@ -75,6 +75,7 @@ class DashboardService
 
         $itemsSoldQuery = SaleItem::query()
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
+            ->whereNull('sale_items.voided_at')
             ->where('sales.status', $status)
             ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('sales.id', $eligibleSaleIds));
         $this->applyOutletSelection($itemsSoldQuery, $outletId, $filters, 'sales.outlet_id');
@@ -118,6 +119,7 @@ class DashboardService
 
         $topItemsQuery = SaleItem::query()
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
+            ->whereNull('sale_items.voided_at')
             ->where('sales.status', $status)
             ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('sales.id', $eligibleSaleIds));
         $this->applyOutletSelection($topItemsQuery, $outletId, $filters, 'sales.outlet_id');
@@ -367,6 +369,7 @@ class DashboardService
         $itemDateExpr = TransactionDate::resolvedSaleLocalSqlExpression('sales.created_at', 'sales.sale_number', $timezone);
         $itemRowsQuery = SaleItem::query()
             ->join('sales', 'sales.id', '=', 'sale_items.sale_id')
+            ->whereNull('sale_items.voided_at')
             ->where('sales.status', $filters['status'] ?? SaleStatuses::PAID)
             ->when(empty($eligibleSaleIds), fn ($query) => $query->whereRaw('1 = 0'), fn ($query) => $query->whereIn('sales.id', $eligibleSaleIds));
         $this->applyOutletSelection($itemRowsQuery, $outletId, $filters, 'sales.outlet_id');
@@ -475,10 +478,11 @@ class DashboardService
         $byPayment = [];
 
         if (!empty($saleIds)) {
-            $itemsSold = (int) SaleItem::query()->whereIn('sale_id', $saleIds)->sum('qty');
+            $itemsSold = (int) SaleItem::query()->whereIn('sale_id', $saleIds)->whereNull('voided_at')->sum('qty');
 
             $topItems = SaleItem::query()
                 ->whereIn('sale_id', $saleIds)
+                ->whereNull('voided_at')
                 ->select('variant_id', 'product_name', 'variant_name')
                 ->selectRaw('COALESCE(SUM(qty),0) as qty_sold')
                 ->selectRaw('COALESCE(SUM(line_total),0) as revenue')

@@ -35,6 +35,7 @@ class SaleCancelRequest extends Model
         'requested_by_user_id',
         'requested_by_name',
         'reason',
+        'void_item_ids',
         'request_type',
         'status',
         'decided_by_user_id',
@@ -46,6 +47,7 @@ class SaleCancelRequest extends Model
 
     protected $casts = [
         'decided_at' => 'datetime',
+        'void_item_ids' => 'array',
         'void_items_snapshot' => 'array',
     ];
 

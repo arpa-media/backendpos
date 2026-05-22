@@ -9,6 +9,7 @@ use App\Models\Sale;
 use App\Models\SaleCancelRequest;
 use App\Models\SaleItem;
 use App\Services\ReportImmediateRefreshBridge;
+use App\Services\SaleAdjustmentService;
 use App\Support\AnalyticsResponseCache;
 use App\Support\BackofficeOutletScope;
 use App\Support\OutletScope;
@@ -97,29 +98,174 @@ class SaleCancelRequestController extends Controller
             $sale->save();
         }
 
+        if ($sale && (string) $req->request_type === SaleCancelRequest::REQUEST_TYPE_VOID) {
+            $this->applyApprovedVoidQuantities($req, $user);
+        }
+
         return $req;
     }
 
-    private function mapVoidSnapshotItems($sale, array $itemIds = []): array
+    private function applyApprovedVoidQuantities(SaleCancelRequest $req, $user): void
     {
-        $normalizedIds = collect($itemIds)->map(fn ($id) => (string) $id)->filter()->values();
-        $items = $sale->relationLoaded('items') ? $sale->items : $sale->items()->get();
+        if ((string) ($req->request_type ?? '') !== SaleCancelRequest::REQUEST_TYPE_VOID) {
+            return;
+        }
+
+        $sale = $req->sale;
+        if (! $sale || (string) $sale->status !== SaleStatuses::PAID) {
+            return;
+        }
+
+        $snapshot = is_array($req->void_items_snapshot ?? null) ? $req->void_items_snapshot : [];
+        if (! count($snapshot)) {
+            return;
+        }
+
+        $sale->loadMissing(['items', 'payments']);
+        $timestamp = $req->decided_at ?: now();
+        $voidReason = trim((string) ($req->reason ?: $req->decision_note ?: 'Void item approved'));
+
+        foreach ($snapshot as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $itemId = (string) ($row['sale_item_id'] ?? $row['id'] ?? '');
+            if ($itemId === '') {
+                continue;
+            }
+
+            /** @var SaleItem|null $item */
+            $item = $sale->items
+                ->first(fn (SaleItem $candidate) => (string) $candidate->id === $itemId && is_null($candidate->voided_at));
+            if (! $item) {
+                continue;
+            }
+
+            $sourceQty = max(0, (int) ($item->qty ?? 0));
+            $voidQty = min($sourceQty, max(1, (int) ($row['void_qty'] ?? $row['qty'] ?? 1)));
+            if ($sourceQty <= 0 || $voidQty <= 0) {
+                continue;
+            }
+
+            $unitPrice = max(0, (int) ($item->unit_price ?? 0));
+            $originalLineTotal = max(0, (int) ($item->line_total ?? ($unitPrice * $sourceQty)));
+            $remainingQty = max(0, $sourceQty - $voidQty);
+
+            if ($remainingQty > 0) {
+                $item->qty = $remainingQty;
+                $item->line_total = $unitPrice * $remainingQty;
+                $item->save();
+
+                $voidLine = $item->replicate();
+                $voidLine->qty = $voidQty;
+                $voidLine->unit_price = 0;
+                $voidLine->line_total = 0;
+                $voidLine->original_unit_price_before_void = $unitPrice;
+                $voidLine->original_line_total_before_void = $unitPrice * $voidQty;
+                $voidLine->voided_at = $timestamp;
+                $voidLine->voided_by_user_id = $user?->id ? (string) $user->id : null;
+                $voidLine->voided_by_name = trim((string) ($user?->name ?? '')) ?: 'Outlet PIN';
+                $voidLine->void_reason = $voidReason !== '' ? $voidReason : null;
+                $voidLine->save();
+            } else {
+                if (is_null($item->original_unit_price_before_void)) {
+                    $item->original_unit_price_before_void = $unitPrice;
+                }
+                if (is_null($item->original_line_total_before_void)) {
+                    $item->original_line_total_before_void = $originalLineTotal;
+                }
+                $item->unit_price = 0;
+                $item->line_total = 0;
+                $item->voided_at = $timestamp;
+                $item->voided_by_user_id = $user?->id ? (string) $user->id : null;
+                $item->voided_by_name = trim((string) ($user?->name ?? '')) ?: 'Outlet PIN';
+                $item->void_reason = $voidReason !== '' ? $voidReason : null;
+                $item->save();
+            }
+        }
+
+        app(SaleAdjustmentService::class)->recalculateSaleTotals($sale->fresh(['items', 'payments']));
+    }
+
+    private function normalizeVoidQtyMap(array $itemIds = [], array $voidItems = []): array
+    {
+        $map = [];
+
+        foreach ($itemIds as $id) {
+            $key = (string) $id;
+            if ($key === '') {
+                continue;
+            }
+            $map[$key] = ($map[$key] ?? 0) + 999999;
+        }
+
+        foreach ($voidItems as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+            $key = (string) ($row['id'] ?? $row['item_id'] ?? $row['sale_item_id'] ?? '');
+            if ($key === '') {
+                continue;
+            }
+            $qty = max(0, (int) ($row['qty'] ?? $row['void_qty'] ?? 0));
+            if ($qty <= 0) {
+                continue;
+            }
+            $map[$key] = ($map[$key] ?? 0) + $qty;
+        }
+
+        return $map;
+    }
+
+    private function categoryRouteKey(SaleItem $item): string
+    {
+        $item->loadMissing('product.category');
+        $category = $item->product?->category;
+        $raw = (string) ($category?->slug ?: $category?->name ?: $item->category_name_snapshot ?: $item->category_id_snapshot ?: $category?->id ?: '');
+        $key = strtolower(trim($raw));
+        $key = preg_replace('/[^a-z0-9]+/', '_', $key) ?: '';
+        return trim($key, '_');
+    }
+
+    private function mapVoidSnapshotItems($sale, array $itemIds = [], array $voidItems = []): array
+    {
+        $qtyMap = $this->normalizeVoidQtyMap($itemIds, $voidItems);
+        $items = $sale->relationLoaded('items') ? $sale->items : $sale->items()->with('product.category')->get();
 
         return $items
-            ->filter(fn ($item) => $normalizedIds->contains((string) $item->id))
-            ->map(function (SaleItem $item) {
+            ->filter(fn ($item) => array_key_exists((string) $item->id, $qtyMap))
+            ->map(function (SaleItem $item) use ($qtyMap) {
+                $sourceQty = max(0, (int) ($item->qty ?? 0));
+                $voidQty = min($sourceQty, max(1, (int) ($qtyMap[(string) $item->id] ?? 0)));
+                $unitPrice = (int) ($item->unit_price ?? 0);
+                $lineTotal = $unitPrice * $voidQty;
+                $item->loadMissing('product.category');
+                $category = $item->product?->category;
+
                 return [
                     'id' => (string) $item->id,
+                    'sale_item_id' => (string) $item->id,
+                    'product_id' => (string) ($item->product_id ?? ''),
                     'product_name' => (string) ($item->product_name ?? ''),
                     'variant_name' => (string) ($item->variant_name ?? ''),
                     'note' => $item->note,
-                    'qty' => (int) ($item->qty ?? 0),
-                    'unit_price' => (int) ($item->unit_price ?? 0),
-                    'line_total' => (int) ($item->line_total ?? 0),
+                    'qty' => $voidQty,
+                    'void_qty' => $voidQty,
+                    'original_qty' => $sourceQty,
+                    'unit_price' => $unitPrice,
+                    'line_total' => $lineTotal,
                     'channel' => (string) ($item->channel ?? ''),
-                    'category_kind' => (string) ($item->category_kind_snapshot ?? ''),
+                    'category_kind' => (string) ($item->category_kind_snapshot ?: $category?->kind ?: ''),
+                    'category_kind_snapshot' => (string) ($item->category_kind_snapshot ?: $category?->kind ?: ''),
+                    'category_name' => (string) ($category?->name ?: $item->category_name_snapshot ?: ''),
+                    'category_name_snapshot' => (string) ($item->category_name_snapshot ?: $category?->name ?: ''),
+                    'category_slug' => (string) ($category?->slug ?: ''),
+                    'category_id' => (string) ($category?->id ?: $item->category_id_snapshot ?: ''),
+                    'category_route_key' => $this->categoryRouteKey($item),
                 ];
             })
+            ->filter(fn ($row) => (int) ($row['qty'] ?? 0) > 0)
             ->values()
             ->all();
     }
@@ -207,8 +353,14 @@ class SaleCancelRequestController extends Controller
     {
         $validated = $request->validate([
             'reason' => ['nullable', 'string', 'max:500'],
-            'item_ids' => ['required', 'array', 'min:1'],
+            'item_ids' => ['nullable', 'array'],
             'item_ids.*' => ['required', 'string'],
+            'void_items' => ['nullable', 'array'],
+            'void_items.*.id' => ['nullable', 'string'],
+            'void_items.*.item_id' => ['nullable', 'string'],
+            'void_items.*.sale_item_id' => ['nullable', 'string'],
+            'void_items.*.qty' => ['nullable', 'integer', 'min:1'],
+            'void_items.*.void_qty' => ['nullable', 'integer', 'min:1'],
             'auto_approve' => ['nullable', 'boolean'],
             'pin' => ['nullable', 'string', 'max:32'],
         ]);
@@ -236,7 +388,11 @@ class SaleCancelRequestController extends Controller
             return $pinError;
         }
 
-        $voidItems = $this->mapVoidSnapshotItems($sale, $validated['item_ids'] ?? []);
+        if (empty($validated['item_ids']) && empty($validated['void_items'])) {
+            return ApiResponse::error('Pilih minimal satu item untuk void.', 'VOID_ITEMS_REQUIRED', 422);
+        }
+
+        $voidItems = $this->mapVoidSnapshotItems($sale, $validated['item_ids'] ?? [], $validated['void_items'] ?? []);
         if (! count($voidItems)) {
             return ApiResponse::error('Void items not found', 'VOID_ITEMS_NOT_FOUND', 422);
         }
@@ -250,10 +406,9 @@ class SaleCancelRequestController extends Controller
                 ->first();
 
             if ($existing) {
-                if (empty($existing->void_items_snapshot)) {
-                    $existing->void_items_snapshot = $voidItems;
-                    $existing->save();
-                }
+                $existing->void_items_snapshot = $voidItems;
+                $existing->void_item_ids = array_values(array_filter(array_map(fn ($row) => (string) ($row['sale_item_id'] ?? $row['id'] ?? ''), $voidItems)));
+                $existing->save();
                 return $autoApprove ? $this->approveRequestWithOutletPin($existing, $user) : $existing;
             }
 
@@ -265,6 +420,7 @@ class SaleCancelRequestController extends Controller
                 'reason' => $validated['reason'] ?? null,
                 'request_type' => SaleCancelRequest::REQUEST_TYPE_VOID,
                 'status' => SaleCancelRequest::STATUS_PENDING,
+                'void_item_ids' => array_values(array_filter(array_map(fn ($row) => (string) ($row['sale_item_id'] ?? $row['id'] ?? ''), $voidItems))),
                 'void_items_snapshot' => $voidItems,
             ]);
             $req->setRelation('sale', $sale);
@@ -419,6 +575,9 @@ class SaleCancelRequestController extends Controller
                 if ($sale && (string) $req->request_type === SaleCancelRequest::REQUEST_TYPE_CANCEL && (string) $sale->status === SaleStatuses::PAID) {
                     $sale->status = SaleStatuses::VOID;
                     $sale->save();
+                }
+                if ($sale && (string) $req->request_type === SaleCancelRequest::REQUEST_TYPE_VOID) {
+                    $this->applyApprovedVoidQuantities($req, $user);
                 }
             }
 
