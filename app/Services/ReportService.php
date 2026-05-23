@@ -1170,6 +1170,15 @@ class ReportService
         return $qty;
     }
 
+    private function saleHasMaterializedVoidRows(Sale $sale): bool
+    {
+        if (! $sale->relationLoaded('items')) {
+            return false;
+        }
+
+        return $sale->items->contains(fn ($item) => ! is_null($item->voided_at ?? null));
+    }
+
     private function approvedVoidQtyBySaleAndItem($requests): array
     {
         $totals = [];
@@ -1202,6 +1211,15 @@ class ReportService
         }
 
         return $sales->map(function (Sale $sale) use ($voidAmounts, $voidQtyBySale) {
+            // Newer approve-void flow physically splits sale_items into:
+            // - remaining paid qty with normal price
+            // - voided qty with unit_price/line_total = 0
+            // In that case the sale totals coming from server are already net.
+            // Do not subtract void snapshot again in cashier report.
+            if ($this->saleHasMaterializedVoidRows($sale)) {
+                return $sale;
+            }
+
             $saleId = (string) $sale->id;
             $originalGrand = max(0, (int) ($sale->grand_total ?? 0));
             $originalSubtotal = max(0, $this->saleAmountAttribute($sale, ['subtotal', 'sub_total']));

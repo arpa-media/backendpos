@@ -90,6 +90,14 @@ class FinanceNetReadService
             $voidedItemIds = array_fill_keys($voidedItemIds, true);
         }
 
+        $materializedVoidSaleIds = DB::table('sale_items')
+            ->whereIn('sale_id', $saleIds)
+            ->whereNotNull('voided_at')
+            ->pluck('sale_id')
+            ->map(fn ($value) => (string) $value)
+            ->all();
+        $materializedVoidSaleIds = array_fill_keys($materializedVoidSaleIds, true);
+
         $adjustments = [];
         $seen = [];
 
@@ -97,6 +105,12 @@ class FinanceNetReadService
             $outletId = (string) ($row->outlet_id ?? '');
             $saleId = (string) ($row->sale_id ?? '');
             if ($outletId === '' || $saleId === '') {
+                continue;
+            }
+
+            if (isset($materializedVoidSaleIds[$saleId])) {
+                // Sale totals/report summaries are already net after the approved
+                // void physically split sale_items. Avoid a second subtraction.
                 continue;
             }
 

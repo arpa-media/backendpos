@@ -191,14 +191,7 @@ class SaleCancelRequestController extends Controller
     private function normalizeVoidQtyMap(array $itemIds = [], array $voidItems = []): array
     {
         $map = [];
-
-        foreach ($itemIds as $id) {
-            $key = (string) $id;
-            if ($key === '') {
-                continue;
-            }
-            $map[$key] = ($map[$key] ?? 0) + 999999;
-        }
+        $explicitQtyKeys = [];
 
         foreach ($voidItems as $row) {
             if (! is_array($row)) {
@@ -212,7 +205,24 @@ class SaleCancelRequestController extends Controller
             if ($qty <= 0) {
                 continue;
             }
+
+            // Explicit per-quantity rows from the POS/backoffice UI must win over
+            // the legacy item_ids fallback. The previous order added item_ids as
+            // a huge quantity first, so sending both item_ids + void_items made
+            // a partial void (ex: 1 of 3) become a full-line void.
             $map[$key] = ($map[$key] ?? 0) + $qty;
+            $explicitQtyKeys[$key] = true;
+        }
+
+        foreach ($itemIds as $id) {
+            $key = (string) $id;
+            if ($key === '' || isset($explicitQtyKeys[$key])) {
+                continue;
+            }
+
+            // Backward compatible behavior for older APKs/clients that only send
+            // item_ids: treat the selected item line as fully voided.
+            $map[$key] = ($map[$key] ?? 0) + 999999;
         }
 
         return $map;
