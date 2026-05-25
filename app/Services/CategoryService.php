@@ -54,7 +54,7 @@ class CategoryService
         $sortOrder = (int) ($data['sort_order'] ?? 0);
 
         $kind = strtoupper(trim((string) ($data['kind'] ?? 'OTHER')));
-        if (!in_array($kind, ['FOOD', 'DRINK', 'OTHER'], true)) {
+        if (!in_array($kind, ['FOOD', 'DRINK', 'OTHER', 'PACKAGING'], true)) {
             $kind = 'OTHER';
         }
 
@@ -91,7 +91,7 @@ class CategoryService
 
         if (array_key_exists('kind', $data)) {
             $kind = strtoupper(trim((string) ($data['kind'] ?? 'OTHER')));
-            if (!in_array($kind, ['FOOD', 'DRINK', 'OTHER'], true)) {
+            if (!in_array($kind, ['FOOD', 'DRINK', 'OTHER', 'PACKAGING'], true)) {
                 $kind = 'OTHER';
             }
             $payload['kind'] = $kind;

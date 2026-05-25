@@ -154,6 +154,24 @@ class PosCheckoutService
         return array_values(array_unique($normalized));
     }
 
+    private function isPackagingSaleItem(array $row): bool
+    {
+        return strtoupper(trim((string) ($row['category_kind_snapshot'] ?? $row['category_kind'] ?? ''))) === 'PACKAGING';
+    }
+
+    private function nonPackagingSubtotal(array $saleItems): int
+    {
+        $total = 0;
+        foreach ($saleItems as $row) {
+            if ($this->isPackagingSaleItem((array) $row)) {
+                continue;
+            }
+            $total += max(0, (int) ($row['line_total'] ?? 0));
+        }
+
+        return max(0, (int) $total);
+    }
+
     private function calculateDiscountAmountFromBase(string $discountType, int $discountValue, int $base): int
     {
         $base = max(0, (int) $base);
@@ -198,7 +216,7 @@ class PosCheckoutService
                 return 0;
             }
 
-            return $subtotal;
+            return $this->nonPackagingSubtotal($saleItems);
         }
 
         if ($applies === 'PRODUCT') {
@@ -209,7 +227,7 @@ class PosCheckoutService
             $base = 0;
             foreach ($saleItems as $row) {
                 $productId = trim((string) ($row['product_id'] ?? ''));
-                if ($productId === '' || !in_array($productId, $normalizedProductIds, true)) {
+                if ($productId === '' || !in_array($productId, $normalizedProductIds, true) || $this->isPackagingSaleItem((array) $row)) {
                     continue;
                 }
 
@@ -230,26 +248,24 @@ class PosCheckoutService
                 }
             }
 
-            if (!empty($normalizedProductIds)) {
-                $base = 0;
-                foreach ($saleItems as $row) {
-                    $productId = trim((string) ($row['product_id'] ?? ''));
-                    if ($productId === '' || !in_array($productId, $normalizedProductIds, true)) {
-                        continue;
-                    }
-
-                    $base += max(0, (int) ($row['line_total'] ?? 0));
-                }
-
-                if ($base > 0) {
-                    return max(0, (int) $base);
-                }
+            if (empty($normalizedProductIds)) {
+                return 0;
             }
 
-            return $subtotal;
+            $base = 0;
+            foreach ($saleItems as $row) {
+                $productId = trim((string) ($row['product_id'] ?? ''));
+                if ($productId === '' || !in_array($productId, $normalizedProductIds, true) || $this->isPackagingSaleItem((array) $row)) {
+                    continue;
+                }
+
+                $base += max(0, (int) ($row['line_total'] ?? 0));
+            }
+
+            return max(0, (int) $base);
         }
 
-        return $subtotal;
+        return $this->nonPackagingSubtotal($saleItems);
     }
 
     /**
@@ -807,17 +823,8 @@ class PosCheckoutService
                 foreach ($discountPackages as $pkg) {
                     $appliesTo = strtoupper((string) $pkg->applies_to);
 
-                    // base by applies_to
-                    $base = $subtotal;
-                    if ($appliesTo === 'PRODUCT') {
-                        $productIdsForDiscount = $pkg->products->pluck('id')->map(fn ($x) => (string) $x)->all();
-                        $base = 0;
-                        foreach ($saleItems as $row) {
-                            if (in_array((string) $row['product_id'], $productIdsForDiscount, true)) {
-                                $base += (int) $row['line_total'];
-                            }
-                        }
-                    } elseif ($appliesTo === 'CUSTOMER') {
+                    // base by applies_to; PACKAGING is never discountable.
+                    if ($appliesTo === 'CUSTOMER') {
                         if (!$customer) {
                             throw ValidationException::withMessages([
                                 'customer_id' => ['Customer is required for this discount.'],
@@ -829,11 +836,17 @@ class PosCheckoutService
                                 'customer_id' => ['Customer not eligible for this discount.'],
                             ]);
                         }
-                        // CUSTOMER => subtotal semua cart (per instruksi)
-                        $base = $subtotal;
-                    } else {
-                        $base = $subtotal;
                     }
+
+                    $base = $this->resolveDiscountBase(
+                        $appliesTo,
+                        (int) $subtotal,
+                        $saleItems,
+                        $pkg->products->pluck('id')->map(fn ($x) => (string) $x)->all(),
+                        $pkg->customers->pluck('id')->map(fn ($x) => (string) $x)->all(),
+                        $customer,
+                        $discountSquadNisjInput
+                    );
 
                     $base = max(0, (int) $base);
                     $amt = 0;
@@ -866,7 +879,7 @@ class PosCheckoutService
                 $discountType = in_array($discountType, ['NONE', 'PERCENT', 'FIXED'], true) ? $discountType : 'NONE';
                 $discountValue = max(0, (int) $discountValue);
 
-                $base = (int) $subtotal;
+                $base = (int) $this->nonPackagingSubtotal($saleItems);
                 if ($discountType === 'PERCENT') {
                     $pct = max(0, min(100, $discountValue));
                     $discountAmount = (int) floor(($base * $pct) / 100);
@@ -877,9 +890,10 @@ class PosCheckoutService
                 }
             }
 
-            // cap at subtotal
-            $discountAmount = max(0, min((int) $subtotal, (int) $discountAmount));
-            $taxableBase = max(0, (int) $subtotal - (int) $discountAmount);
+            // cap at subtotal; PACKAGING amount stays inside subtotal but is never discountable/taxable.
+            $discountableSubtotal = $this->nonPackagingSubtotal($saleItems);
+            $discountAmount = max(0, min((int) $discountableSubtotal, (int) $discountAmount));
+            $taxableBase = max(0, (int) $discountableSubtotal - (int) $discountAmount);
 
             // Snapshot helpers (for receipts/history)
             if (!$useOfflineSnapshot && $usePackages) {
@@ -1061,20 +1075,14 @@ class PosCheckoutService
                 $serviceChargeTotal = 0;
                 $roundingTotal = (int) ($offlineSnapshot['rounding_total'] ?? 0);
 
-                // Canonical server-side rule: tax must always be applied after discount.
+                // Canonical server-side rule: tax must always be applied after discount,
+                // but PACKAGING lines are excluded from both discount and tax bases.
                 // DELIVERY is always forced to no-tax, even when legacy offline payloads still
                 // carry stale tax snapshots from the active outlet default tax.
-                $canonicalAmounts = SaleAmountBreakdown::canonical(
-                    (int) ($offlineSnapshot['subtotal'] ?? $subtotal),
-                    (int) $discountAmount,
-                    (int) $effectiveTaxPercent,
-                    (int) $roundingTotal,
-                    0
-                );
-
-                $taxTotal = (int) $canonicalAmounts['tax_total'];
-                $grandTotalBeforeRounding = (int) $canonicalAmounts['before_rounding'];
-                $grandTotal = (int) $canonicalAmounts['grand_total'];
+                $effectiveSubtotal = (int) ($offlineSnapshot['subtotal'] ?? $subtotal);
+                $taxTotal = (int) floor(($taxableBase * $effectiveTaxPercent) / 100);
+                $grandTotalBeforeRounding = max(0, (int) ($effectiveSubtotal - $discountAmount + $taxTotal + $serviceChargeTotal));
+                $grandTotal = max(0, (int) ($grandTotalBeforeRounding + $roundingTotal));
             } else {
                 $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
                 $effectiveTaxId = $isOnlineNoTax ? null : $taxId;
@@ -1084,7 +1092,7 @@ class PosCheckoutService
                 $taxTotal = (int) floor(($taxableBase * $effectiveTaxPercent) / 100);
                 $serviceChargeTotal = 0;
 
-                $roundingSnapshot = SaleRounding::apply((int) ($taxableBase + $taxTotal + $serviceChargeTotal));
+                $roundingSnapshot = SaleRounding::apply((int) ($subtotal - $discountAmount + $taxTotal + $serviceChargeTotal));
                 $roundingTotal = (int) ($roundingSnapshot['rounding_total'] ?? 0);
                 $grandTotalBeforeRounding = (int) ($roundingSnapshot['before_rounding'] ?? 0);
                 $grandTotal = (int) ($roundingSnapshot['after_rounding'] ?? 0);

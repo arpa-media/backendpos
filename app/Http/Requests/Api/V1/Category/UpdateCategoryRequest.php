@@ -17,7 +17,7 @@ class UpdateCategoryRequest extends FormRequest
         return [
             'name' => ['sometimes', 'required', 'string', 'max:120'],
             'slug' => ['sometimes', 'nullable', 'string', 'max:140', 'regex:/^[a-z0-9]+(?:-[a-z0-9]+)*$/'],
-            'kind' => ['sometimes', 'nullable', 'string', 'in:FOOD,DRINK,OTHER'],
+            'kind' => ['sometimes', 'nullable', 'string', 'in:FOOD,DRINK,OTHER,PACKAGING'],
             'sort_order' => ['sometimes', 'nullable', 'integer', 'min:0', 'max:1000000'],
             'image' => ['sometimes', 'nullable', 'image', 'mimes:jpg,jpeg,png,webp', 'max:2048'], // 2MB
         ];

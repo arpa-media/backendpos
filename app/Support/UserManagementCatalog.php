@@ -94,7 +94,11 @@ final class UserManagementCatalog
         $permissions[] = 'admin.access';
         $permissions[] = 'pos.checkout';
         $permissions[] = 'pos.provision.view';
+        // Keep cancel permissions registered for existing POS/cancel workflows even
+        // after the finance portal menu is removed from the canonical catalog.
         $permissions[] = 'sale.cancel.request';
+        $permissions[] = 'sale.cancel.view';
+        $permissions[] = 'sale.cancel.approve';
 
         return array_values(array_unique($permissions));
     }

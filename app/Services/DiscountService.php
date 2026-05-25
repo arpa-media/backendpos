@@ -21,7 +21,7 @@ class DiscountService
         $dir = strtolower((string) ($filters['dir'] ?? 'desc')) === 'asc' ? 'asc' : 'desc';
         $perPage = (int) ($filters['per_page'] ?? 15);
 
-        $query = Discount::query()->where('outlet_id', $outletId);
+        $query = Discount::query()->where('outlet_id', $outletId)->with(['products', 'customers']);
 
         if ($q !== '') {
             $query->where(function (Builder $b) use ($q) {
@@ -114,15 +114,32 @@ class DiscountService
         $appliesTo = strtoupper((string) ($data['applies_to'] ?? $discount->applies_to));
 
         if (in_array($appliesTo, ['PRODUCT', 'SQUAD'], true)) {
-            $ids = array_values(array_unique(array_filter($data['product_ids'] ?? [])));
+            $ids = array_values(array_unique(array_filter(array_map(fn ($id) => trim((string) $id), $data['product_ids'] ?? []))));
             if (count($ids) === 0) {
                 throw ValidationException::withMessages(['product_ids' => ["product_ids is required for {$appliesTo} discount."]]);
             }
 
-            $exists = Product::query()->whereIn('id', $ids)->pluck('id')->map(fn ($x) => (string) $x)->all();
+            $products = Product::query()
+                ->with('category:id,kind,name,slug')
+                ->whereIn('id', $ids)
+                ->get(['id', 'category_id', 'name']);
+
+            $exists = $products->pluck('id')->map(fn ($x) => (string) $x)->all();
             $missing = array_values(array_diff($ids, $exists));
             if (!empty($missing)) {
                 throw ValidationException::withMessages(['product_ids' => ['Some products not found.']]);
+            }
+
+            $packagingProducts = $products
+                ->filter(fn (Product $product) => strtoupper((string) ($product->category?->kind ?? '')) === 'PACKAGING')
+                ->map(fn (Product $product) => (string) ($product->name ?? $product->id))
+                ->values()
+                ->all();
+
+            if (!empty($packagingProducts)) {
+                throw ValidationException::withMessages([
+                    'product_ids' => ['Produk category PACKAGING tidak bisa dimasukkan ke paket discount: '.implode(', ', $packagingProducts)],
+                ]);
             }
 
             $discount->products()->sync($ids);

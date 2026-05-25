@@ -17,7 +17,7 @@ class StoreCategoryRequest extends FormRequest
         return [
             'name' => ['required', 'string', 'max:120'],
             'slug' => ['nullable', 'string', 'max:140', 'regex:/^[a-z0-9]+(?:-[a-z0-9]+)*$/'],
-            'kind' => ['nullable', 'string', 'in:FOOD,DRINK,OTHER'],
+            'kind' => ['nullable', 'string', 'in:FOOD,DRINK,OTHER,PACKAGING'],
             'sort_order' => ['nullable', 'integer', 'min:0', 'max:1000000'],
             'image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp', 'max:2048'], // 2MB
         ];
