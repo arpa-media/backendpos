@@ -179,13 +179,18 @@ class ItemSummaryController extends Controller
             $timezone
         );
 
-        $query = DB::table('sale_item_addons as sia')
-            ->join('sale_items as si', 'si.id', '=', 'sia.sale_item_id')
+        // Backoffice-only fix:
+        // Modifier summary must read what was actually saved in checkout history.
+        // Existing checkout already stores free-text modifier/item note in sale_items.note,
+        // while selected paid/free add-ons are stored in sale_item_addons.addon_name.
+        // Start from sale_items and LEFT JOIN addons so note-only items are not dropped.
+        $query = DB::table('sale_items as si')
             ->join('sales as s', 's.id', '=', 'si.sale_id')
             ->join('report_sale_business_dates as rsbd', function ($join) {
                 $join->on('rsbd.sale_id', '=', 's.id')
                     ->on('rsbd.outlet_id', '=', 's.outlet_id');
             })
+            ->leftJoin('sale_item_addons as sia', 'sia.sale_item_id', '=', 'si.id')
             ->leftJoin('products as p', 'p.id', '=', 'si.product_id')
             ->leftJoin('categories as c', 'c.id', '=', 'p.category_id')
             ->whereNull('s.deleted_at')
@@ -210,25 +215,42 @@ class ItemSummaryController extends Controller
                         }
                     });
                 }
+            })
+            ->where(function ($query) {
+                $query->whereNotNull('sia.addon_name')
+                    ->orWhere(function ($noteQuery) {
+                        $noteQuery->whereNotNull('si.note')
+                            ->whereRaw("TRIM(COALESCE(si.note, '')) <> ''");
+                    });
             });
 
         FinanceCategorySegment::apply($query, 'c.name', $categorySegment);
 
         $modifierRows = $query
             ->selectRaw("CONCAT(COALESCE(si.product_id, ''), ':', COALESCE(si.variant_id, '')) as row_key")
-            ->selectRaw('sia.addon_name as modifier_name')
-            ->groupBy('row_key', 'sia.addon_name')
+            ->selectRaw('sia.addon_name as addon_name')
+            ->selectRaw('si.note as item_note')
+            ->groupBy('row_key', 'sia.addon_name', 'si.note')
             ->orderBy('sia.addon_name')
+            ->orderBy('si.note')
             ->get();
 
         $map = [];
         foreach ($modifierRows as $modifier) {
             $rowKey = (string) ($modifier->row_key ?? '');
-            $name = trim((string) ($modifier->modifier_name ?? ''));
-            if ($rowKey === '' || $name === '') {
+            if ($rowKey === '') {
                 continue;
             }
-            $map[$rowKey][$name] = $name;
+
+            $addonName = $this->normalizeModifierText((string) ($modifier->addon_name ?? ''));
+            $itemNote = $this->normalizeModifierText((string) ($modifier->item_note ?? ''));
+
+            foreach ([$addonName, $itemNote] as $name) {
+                if ($name === '') {
+                    continue;
+                }
+                $map[$rowKey][$name] = $name;
+            }
         }
 
         foreach ($map as $rowKey => $names) {
@@ -236,6 +258,13 @@ class ItemSummaryController extends Controller
         }
 
         return $map;
+    }
+
+    private function normalizeModifierText(string $value): string
+    {
+        $value = trim(preg_replace('/\s+/u', ' ', $value) ?? '');
+
+        return mb_substr($value, 0, 255);
     }
 
     private function buildRows(array $outletIds, array $filters, string $sort, string $dir, string $categorySegment): Builder
