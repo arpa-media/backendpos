@@ -19,6 +19,7 @@ class OwnerOverviewService
         private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
         private readonly ReportSaleBusinessDateIndexService $businessDateIndex,
         private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
 
@@ -142,6 +143,13 @@ class OwnerOverviewService
             $params['date_to'] ?? null,
             $timezone,
             ['outlet_chunk' => 4, 'date_chunk_days' => 2]
+        );
+
+        $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet(
+            $outletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone
         );
 
         $summaryRow = $this->dailySummaryService
@@ -353,7 +361,7 @@ class OwnerOverviewService
             }
         }
 
-        return [
+        $payload = [
             'filters' => [
                 'date_from' => $fromLocal->toDateString(),
                 'date_to' => $toLocal->toDateString(),
@@ -391,6 +399,8 @@ class OwnerOverviewService
                 ],
             ],
         ];
+
+        return $this->financeNetReadService->applyToOwnerOverviewPayload($payload, $netAdjustments);
     }
 
     private function ownerOverviewMetricsQuery(string $scopeKey, array $outletIds): Builder

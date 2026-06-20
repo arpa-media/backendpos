@@ -11,6 +11,7 @@ use App\Support\FinanceCategorySegment;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Support\Facades\DB;
 
 class ItemSummaryController extends Controller
 {
@@ -96,8 +97,9 @@ class ItemSummaryController extends Controller
             }
 
             $rows = $this->buildRows($outletIds, $v, $sort, $dir, $categorySegment)->get();
+            $modifierMap = $this->buildSelectedModifierMap($rows, $outletIds, $v, $timezone, $categorySegment);
 
-            $items = $rows->map(function ($row) {
+            $items = $rows->map(function ($row) use ($modifierMap) {
                 $grossSales = (int) round((float) ($row->gross_sales ?? 0));
                 $discount = (int) round((float) ($row->discount ?? 0));
                 $netSales = max(0, $grossSales - $discount);
@@ -112,6 +114,7 @@ class ItemSummaryController extends Controller
                     'item_name_variant' => (string) ($row->item_name_variant ?? '-'),
                     'category_id' => (string) ($row->category_id ?? ''),
                     'category_name' => (string) ($row->category_name ?? '-'),
+                    'modifier' => $modifierMap[(string) ($row->row_key ?? '')] ?? '-',
                     'item_sold' => (int) ($row->item_sold ?? 0),
                     'gross_sales' => $grossSales,
                     'discount' => $discount,
@@ -163,12 +166,86 @@ class ItemSummaryController extends Controller
         }), 'OK');
     }
 
+    private function buildSelectedModifierMap($rows, array $outletIds, array $filters, string $timezone, string $categorySegment): array
+    {
+        $rowKeys = $rows->pluck('row_key')->filter()->map(fn ($key) => (string) $key)->unique()->values();
+        if ($rowKeys->isEmpty() || $outletIds === []) {
+            return [];
+        }
+
+        $window = TransactionDate::businessDateWindow(
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone
+        );
+
+        $query = DB::table('sale_item_addons as sia')
+            ->join('sale_items as si', 'si.id', '=', 'sia.sale_item_id')
+            ->join('sales as s', 's.id', '=', 'si.sale_id')
+            ->join('report_sale_business_dates as rsbd', function ($join) {
+                $join->on('rsbd.sale_id', '=', 's.id')
+                    ->on('rsbd.outlet_id', '=', 's.outlet_id');
+            })
+            ->leftJoin('products as p', 'p.id', '=', 'si.product_id')
+            ->leftJoin('categories as c', 'c.id', '=', 'p.category_id')
+            ->whereNull('s.deleted_at')
+            ->where('s.status', '=', 'PAID')
+            ->whereNull('si.voided_at')
+            ->whereIn('rsbd.outlet_id', $outletIds)
+            ->whereBetween('rsbd.business_date', [
+                $window['requested_from']->format('Y-m-d'),
+                $window['requested_to']->format('Y-m-d'),
+            ])
+            ->where(function ($query) use ($rowKeys) {
+                foreach ($rowKeys as $rowKey) {
+                    [$productId, $variantId] = array_pad(explode(':', (string) $rowKey, 2), 2, '');
+                    $query->orWhere(function ($sub) use ($productId, $variantId) {
+                        $sub->where('si.product_id', $productId === '' ? null : $productId);
+                        if ($variantId === '') {
+                            $sub->where(function ($variant) {
+                                $variant->whereNull('si.variant_id')->orWhere('si.variant_id', '');
+                            });
+                        } else {
+                            $sub->where('si.variant_id', $variantId);
+                        }
+                    });
+                }
+            });
+
+        FinanceCategorySegment::apply($query, 'c.name', $categorySegment);
+
+        $modifierRows = $query
+            ->selectRaw("CONCAT(COALESCE(si.product_id, ''), ':', COALESCE(si.variant_id, '')) as row_key")
+            ->selectRaw('sia.addon_name as modifier_name')
+            ->groupBy('row_key', 'sia.addon_name')
+            ->orderBy('sia.addon_name')
+            ->get();
+
+        $map = [];
+        foreach ($modifierRows as $modifier) {
+            $rowKey = (string) ($modifier->row_key ?? '');
+            $name = trim((string) ($modifier->modifier_name ?? ''));
+            if ($rowKey === '' || $name === '') {
+                continue;
+            }
+            $map[$rowKey][$name] = $name;
+        }
+
+        foreach ($map as $rowKey => $names) {
+            $map[$rowKey] = implode(' | ', array_values($names));
+        }
+
+        return $map;
+    }
+
     private function buildRows(array $outletIds, array $filters, string $sort, string $dir, string $categorySegment): Builder
     {
         $query = $this->dailySummaryService
             ->variantSummaryQuery($outletIds, $filters['date_from'] ?? null, $filters['date_to'] ?? null, $categorySegment)
             ->groupBy('rdvar.product_id', 'rdvar.variant_id', 'rdvar.product_name', 'rdvar.variant_name', 'rdvar.category_id', 'rdvar.category_name')
             ->selectRaw("CONCAT(COALESCE(rdvar.product_id, ''), ':', COALESCE(rdvar.variant_id, '')) as row_key")
+            ->selectRaw('rdvar.product_id as product_id')
+            ->selectRaw('rdvar.variant_id as variant_id')
             ->selectRaw('rdvar.product_name as item_name')
             ->selectRaw('rdvar.variant_name as variant_name')
             ->selectRaw("CASE WHEN COALESCE(rdvar.variant_name, '') = '' THEN rdvar.product_name ELSE CONCAT(rdvar.product_name, ' - ', rdvar.variant_name) END as item_name_variant")

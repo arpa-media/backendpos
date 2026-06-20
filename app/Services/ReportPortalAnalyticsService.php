@@ -22,6 +22,7 @@ class ReportPortalAnalyticsService
         private readonly ReportPortalScopeService $scopeService,
         private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
         private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
+        private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
 
@@ -177,6 +178,12 @@ class ReportPortalAnalyticsService
         $topLimit = max(1, min(10, (int) ($params['top_limit'] ?? 5)));
         $saleScope = $this->resolveEligibleSalesScope($scope, $params);
         $outletIds = $this->effectiveScopeOutletIds($scope);
+        $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet(
+            $outletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta')
+        );
 
         if (! ($saleScope['has_rows'] ?? false)) {
             return [
@@ -339,7 +346,7 @@ class ReportPortalAnalyticsService
             ->values()
             ->all();
 
-        return [
+        $payload = [
             'scope' => $this->scopeMeta($scope),
             'range' => [
                 'date_from' => $from->toDateString(),
@@ -367,6 +374,8 @@ class ReportPortalAnalyticsService
                 ],
             ],
         ];
+
+        return $this->financeNetReadService->applyToReportPortalDashboardPayload($payload, $netAdjustments);
     }
 
 

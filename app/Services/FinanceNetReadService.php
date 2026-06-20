@@ -49,6 +49,7 @@ class FinanceNetReadService
                 's.grand_total',
                 's.payment_method_name',
                 's.payment_method_type',
+                's.channel',
                 'pm.name as payment_method_name_db',
                 'sp.amount as payment_amount',
                 'rsbd.marking',
@@ -152,6 +153,7 @@ class FinanceNetReadService
                 (string) ($row->payment_method_name_db ?? $row->payment_method_name ?? ''),
                 (string) ($row->payment_method_type ?? '')
             );
+            $channelBucket = $this->channelKeyForVoid((string) ($row->channel ?? ''));
 
             if (! isset($adjustments[$outletId])) {
                 $adjustments[$outletId] = $this->emptyAdjustment();
@@ -174,6 +176,13 @@ class FinanceNetReadService
                     $adjustments[$outletId]['payment_buckets'][$paymentBucket] = 0;
                 }
                 $adjustments[$outletId]['payment_buckets'][$paymentBucket] += $totalAdjustment;
+            }
+
+            if ($channelBucket !== '') {
+                if (! isset($adjustments[$outletId]['channel_buckets'][$channelBucket])) {
+                    $adjustments[$outletId]['channel_buckets'][$channelBucket] = 0;
+                }
+                $adjustments[$outletId]['channel_buckets'][$channelBucket] += $totalAdjustment;
             }
         }
 
@@ -258,6 +267,143 @@ class FinanceNetReadService
         return $payload;
     }
 
+    public function applyToOwnerOverviewPayload(array $payload, array $adjustments): array
+    {
+        if ($adjustments === []) {
+            return $payload;
+        }
+
+        $total = $this->sumAdjustments($adjustments);
+
+        foreach (['gross_sales', 'marking_gross_sales', 'tax_total'] as $key) {
+            $adjustmentKey = $key === 'tax_total' ? 'tax' : $key;
+            if (isset($payload['metrics'][$key])) {
+                $payload['metrics'][$key] = max(0, (int) ($payload['metrics'][$key] ?? 0) - (int) ($total[$adjustmentKey] ?? 0));
+            }
+        }
+
+        if (isset($payload['metrics']['cash_sales'])) {
+            $cashAdjustment = 0;
+            foreach ($adjustments as $adjustment) {
+                $cashAdjustment += (int) ($adjustment['payment_buckets']['cash'] ?? 0);
+            }
+            $payload['metrics']['cash_sales'] = max(0, (int) ($payload['metrics']['cash_sales'] ?? 0) - $cashAdjustment);
+        }
+
+        if (isset($payload['summaries']['outlet_sales']) && is_array($payload['summaries']['outlet_sales'])) {
+            $payload['summaries']['outlet_sales'] = collect($payload['summaries']['outlet_sales'])
+                ->map(function (array $row) use ($adjustments) {
+                    $outletId = (string) ($row['outlet_id'] ?? '');
+                    $adjustment = $adjustments[$outletId] ?? null;
+                    if (! $adjustment) {
+                        return $row;
+                    }
+
+                    $row['gross_sales'] = max(0, (int) ($row['gross_sales'] ?? 0) - (int) ($adjustment['gross_sales'] ?? 0));
+                    $row['marking_gross_sales'] = max(0, (int) ($row['marking_gross_sales'] ?? 0) - (int) ($adjustment['marking_gross_sales'] ?? 0));
+                    $row['tax_total'] = max(0, (int) ($row['tax_total'] ?? 0) - (int) ($adjustment['tax'] ?? 0));
+                    $row['cash_sales'] = max(0, (int) ($row['cash_sales'] ?? 0) - (int) ($adjustment['payment_buckets']['cash'] ?? 0));
+
+                    return $row;
+                })
+                ->values()
+                ->all();
+        }
+
+        if (isset($payload['breakdowns']['by_payment_method']) && is_array($payload['breakdowns']['by_payment_method'])) {
+            $payload['breakdowns']['by_payment_method'] = collect($payload['breakdowns']['by_payment_method'])
+                ->map(function (array $row) use ($adjustments) {
+                    $bucket = $this->bucketKeyForPayment(
+                        (string) ($row['payment_method_name'] ?? ''),
+                        (string) ($row['payment_method_type'] ?? '')
+                    );
+                    if ($bucket === null) {
+                        return $row;
+                    }
+
+                    $amount = 0;
+                    foreach ($adjustments as $adjustment) {
+                        $amount += (int) ($adjustment['payment_buckets'][$bucket] ?? 0);
+                    }
+
+                    $row['gross_sales'] = max(0, (int) ($row['gross_sales'] ?? 0) - $amount);
+
+                    return $row;
+                })
+                ->values()
+                ->all();
+        }
+
+        $payload['meta']['net_read'] = $this->adjustmentMeta($adjustments);
+
+        return $payload;
+    }
+
+    public function applyToReportPortalDashboardPayload(array $payload, array $adjustments): array
+    {
+        if ($adjustments === []) {
+            return $payload;
+        }
+
+        $total = $this->sumAdjustments($adjustments);
+        $grossAdjustment = (int) ($total['total_collected'] ?? $total['gross_sales'] ?? 0);
+
+        if (isset($payload['metrics']['gross_sales'])) {
+            $payload['metrics']['gross_sales'] = max(0, (int) ($payload['metrics']['gross_sales'] ?? 0) - $grossAdjustment);
+            $trxCount = max(0, (int) ($payload['metrics']['transaction_count'] ?? 0));
+            $payload['metrics']['avg_ticket'] = $trxCount > 0 ? (int) floor(((int) $payload['metrics']['gross_sales']) / $trxCount) : 0;
+        }
+
+        if (isset($payload['breakdowns']['by_payment_method_snapshot']) && is_array($payload['breakdowns']['by_payment_method_snapshot'])) {
+            $payload['breakdowns']['by_payment_method_snapshot'] = collect($payload['breakdowns']['by_payment_method_snapshot'])
+                ->map(function (array $row) use ($adjustments) {
+                    $bucket = $this->bucketKeyForPayment(
+                        (string) ($row['payment_method_name'] ?? ''),
+                        (string) ($row['payment_method_type'] ?? '')
+                    );
+                    if ($bucket === null) {
+                        return $row;
+                    }
+
+                    $amount = 0;
+                    foreach ($adjustments as $adjustment) {
+                        $amount += (int) ($adjustment['payment_buckets'][$bucket] ?? 0);
+                    }
+
+                    $row['gross_sales'] = max(0, (int) ($row['gross_sales'] ?? 0) - $amount);
+
+                    return $row;
+                })
+                ->values()
+                ->all();
+        }
+
+        if (isset($payload['breakdowns']['by_channel']) && is_array($payload['breakdowns']['by_channel'])) {
+            $payload['breakdowns']['by_channel'] = collect($payload['breakdowns']['by_channel'])
+                ->map(function (array $row) use ($adjustments) {
+                    $key = $this->channelKeyForVoid((string) ($row['channel'] ?? ''));
+                    if ($key === '') {
+                        return $row;
+                    }
+
+                    $amount = 0;
+                    foreach ($adjustments as $adjustment) {
+                        $amount += (int) ($adjustment['channel_buckets'][$key] ?? 0);
+                    }
+
+                    $row['gross_sales'] = max(0, (int) ($row['gross_sales'] ?? 0) - $amount);
+
+                    return $row;
+                })
+                ->values()
+                ->all();
+        }
+
+        $payload['meta']['net_read'] = $this->adjustmentMeta($adjustments);
+
+        return $payload;
+    }
+
     public function adjustmentMeta(array $adjustments): array
     {
         $total = $this->sumAdjustments($adjustments);
@@ -305,6 +451,7 @@ class FinanceNetReadService
             'void_request_count' => 0,
             'void_request_ids' => [],
             'payment_buckets' => [],
+            'channel_buckets' => [],
         ];
     }
 
@@ -341,6 +488,21 @@ class FinanceNetReadService
             $normalizedName === 'grabfood' => 'grabfood',
             str_contains($normalizedName, 'debit') || str_contains($normalizedName, 'card') || str_contains($normalizedName, 'credit') => 'debit_card',
             default => null,
+        };
+    }
+
+    private function channelKeyForVoid(string $channel): string
+    {
+        $normalized = mb_strtolower(trim($channel));
+        if ($normalized === '') {
+            return '';
+        }
+
+        return match (true) {
+            str_contains($normalized, 'delivery') || str_contains($normalized, 'online') || str_contains($normalized, 'gofood') || str_contains($normalized, 'grabfood') => 'ONLINE',
+            str_contains($normalized, 'take') => 'TAKEAWAY',
+            str_contains($normalized, 'dine') => 'DINE IN',
+            default => mb_strtoupper($channel),
         };
     }
 
