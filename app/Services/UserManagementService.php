@@ -378,7 +378,7 @@ class UserManagementService
             );
         }
 
-        return count($rows);
+        return $this->syncUsersForAccessMatrixScope($roleId, $levelId);
     }
 
     public function upsertMenuPermissions(string $roleId, ?string $levelId, array $rows): int
@@ -399,7 +399,39 @@ class UserManagementService
             );
         }
 
-        return count($rows);
+        return $this->syncUsersForAccessMatrixScope($roleId, $levelId);
+    }
+
+    public function syncUsersForAccessMatrixScope(string $roleId, ?string $levelId): int
+    {
+        $query = UserAccessAssignment::query()
+            ->where('access_role_id', $roleId);
+
+        if ($levelId === null || trim((string) $levelId) === '') {
+            $query->whereNull('access_level_id');
+        } else {
+            $query->where('access_level_id', $levelId);
+        }
+
+        $userIds = $query
+            ->pluck('user_id')
+            ->filter()
+            ->map(fn ($id) => (string) $id)
+            ->unique()
+            ->values();
+
+        $synced = 0;
+        foreach ($userIds as $userId) {
+            $user = User::query()->find($userId);
+            if (! $user) {
+                continue;
+            }
+
+            $this->syncUserPermissions($user);
+            $synced++;
+        }
+
+        return $synced;
     }
 
 
