@@ -76,10 +76,13 @@ Route::prefix('v1')->group(function () {
          */
 
         Route::get('/owner-overview', [OwnerOverviewController::class, 'index'])
-            ->middleware(['report_observe', 'permission:dashboard.view', 'role:admin']);
+            // Access Matrix is the source of truth. Do not restrict Owner Overview to admin role only.
+            ->middleware(['report_observe', 'permission_or_snapshot:dashboard.view']);
 
         Route::get('/owner-overview/sales/{saleId}', [OwnerOverviewController::class, 'saleDetail'])
-            ->middleware(['report_observe', 'permission:owner_overview.sale_detail.view', 'role:admin']);
+            // Access Matrix is the source of truth. Support both the explicit detail permission
+            // and the legacy sale.view permission used by the menu catalog.
+            ->middleware(['report_observe', 'permission_or_snapshot:owner_overview.sale_detail.view,sale.view']);
 
         Route::prefix('report-portals/{portalCode}')->middleware('report_observe')->group(function () {
             Route::get('/dashboard', [ReportPortalController::class, 'dashboard'])
