@@ -243,6 +243,14 @@ class AuthController extends Controller
     public function me(Request $request)
     {
         $user = $request->user()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+
+        // PATCH-ACCESS-MATRIX-02:
+        // /auth/me juga harus mengikuti Access Matrix terbaru, bukan snapshot
+        // permission lama. Ini penting setelah matrix role+level diubah saat user
+        // masih punya token lama/localStorage lama.
+        $this->userManagement->syncUserPermissions($user);
+        $user = $user->fresh()->loadMissing(['roles', 'permissions', 'employee.assignment.outlet', 'outlet', 'reportOutletAssignments.outlet']);
+
         $tokenName = strtolower((string) optional($user->currentAccessToken())->name);
         $isPosSession = $tokenName === 'pos' || str_starts_with($tokenName, 'pos:');
         $authContext = $this->resolver->resolve($user);
