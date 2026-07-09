@@ -146,6 +146,9 @@ class UserManagementService
             $portalCode = strtolower((string) ($menu->portal?->code ?? ''));
             $portalVisible = in_array($portalCode, $visiblePortalCodes, true);
             $standaloneHiddenAccess = $this->menuAllowsHiddenPortalAccess($menu);
+            $isPortalLandingMenu = $this->isPortalLandingMenu($menu, $portalCode);
+            $canView = (($portalVisible || $standaloneHiddenAccess) && (bool) ($effective['can_view'] ?? false))
+                || ($portalVisible && $isPortalLandingMenu);
 
             return [
                 'id' => (string) $menu->id,
@@ -155,7 +158,7 @@ class UserManagementService
                 'portal_id' => $menu->portal_id ? (string) $menu->portal_id : null,
                 'portal_code' => $portalCode,
                 'portal_name' => (string) ($menu->portal?->name ?? ''),
-                'can_view' => ($portalVisible || $standaloneHiddenAccess) && (bool) ($effective['can_view'] ?? false),
+                'can_view' => $canView,
                 'can_create' => $portalVisible && (bool) ($effective['can_create'] ?? false),
                 'can_edit' => $portalVisible && (bool) ($effective['can_edit'] ?? false),
                 'can_delete' => $portalVisible && (bool) ($effective['can_delete'] ?? false),
@@ -217,6 +220,20 @@ class UserManagementService
     private function portalAllowsImplicitVisibility(string $portalCode): bool
     {
         return in_array(strtolower($portalCode), ['finance', 'pos'], true);
+    }
+
+    private function isPortalLandingMenu(AccessMenu $menu, string $portalCode): bool
+    {
+        $path = '/' . ltrim((string) $menu->path, '/');
+        $code = strtolower((string) $menu->code);
+        $portalCode = strtolower($portalCode);
+
+        if ($portalCode === '') {
+            return false;
+        }
+
+        return $path === "/portal/{$portalCode}/dashboard"
+            || $code === "{$portalCode}-dashboard";
     }
 
     private function menuAllowsHiddenPortalAccess(AccessMenu $menu): bool
@@ -378,7 +395,7 @@ class UserManagementService
             );
         }
 
-        return $this->syncUsersForAccessMatrixScope($roleId, $levelId);
+        return $this->syncUsersForAccessScope($roleId, $levelId);
     }
 
     public function upsertMenuPermissions(string $roleId, ?string $levelId, array $rows): int
@@ -399,37 +416,29 @@ class UserManagementService
             );
         }
 
-        return $this->syncUsersForAccessMatrixScope($roleId, $levelId);
+        return $this->syncUsersForAccessScope($roleId, $levelId);
     }
 
-    public function syncUsersForAccessMatrixScope(string $roleId, ?string $levelId): int
+    public function syncUsersForAccessScope(string $roleId, ?string $levelId): int
     {
-        $query = UserAccessAssignment::query()
-            ->where('access_role_id', $roleId);
+        $query = User::query()
+            ->whereHas('accessAssignment', function ($assignmentQuery) use ($roleId, $levelId) {
+                $assignmentQuery->where('access_role_id', $roleId);
 
-        if ($levelId === null || trim((string) $levelId) === '') {
-            $query->whereNull('access_level_id');
-        } else {
-            $query->where('access_level_id', $levelId);
-        }
-
-        $userIds = $query
-            ->pluck('user_id')
-            ->filter()
-            ->map(fn ($id) => (string) $id)
-            ->unique()
-            ->values();
+                if ($levelId === null || $levelId === '') {
+                    $assignmentQuery->whereNull('access_level_id');
+                } else {
+                    $assignmentQuery->where('access_level_id', $levelId);
+                }
+            });
 
         $synced = 0;
-        foreach ($userIds as $userId) {
-            $user = User::query()->find($userId);
-            if (! $user) {
-                continue;
+        $query->chunkById(100, function ($users) use (&$synced) {
+            foreach ($users as $user) {
+                $this->syncUserPermissions($user);
+                $synced++;
             }
-
-            $this->syncUserPermissions($user);
-            $synced++;
-        }
+        });
 
         return $synced;
     }
