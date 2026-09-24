@@ -471,7 +471,7 @@ class FinanceNetReadService
         return [];
     }
 
-    private function bucketKeyForPayment(string $name, string $type): ?string
+    private function bucketKeyForPayment(string $name, string $type): string
     {
         $normalizedName = mb_strtolower(trim($name));
         $normalizedType = mb_strtolower(trim($type));
@@ -487,7 +487,7 @@ class FinanceNetReadService
             $normalizedName === 'gofood' => 'gofood',
             $normalizedName === 'grabfood' => 'grabfood',
             str_contains($normalizedName, 'debit') || str_contains($normalizedName, 'card') || str_contains($normalizedName, 'credit') => 'debit_card',
-            default => null,
+            default => 'pm_' . substr(sha1($normalizedName . '|' . $normalizedType), 0, 12),
         };
     }
 

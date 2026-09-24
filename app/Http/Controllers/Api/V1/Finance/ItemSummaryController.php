@@ -11,6 +11,7 @@ use App\Support\FinanceCategorySegment;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 class ItemSummaryController extends Controller
@@ -22,9 +23,6 @@ class ItemSummaryController extends Controller
 
     private function okCached($request, string $namespace, array $params, callable $callback)
     {
-        @ini_set('max_execution_time', '240');
-        @set_time_limit(240);
-
         return AnalyticsResponseCache::remember(
             $namespace,
             $params,
@@ -38,7 +36,29 @@ class ItemSummaryController extends Controller
     {
         $validated = $request->validated();
 
-        return ApiResponse::ok($this->okCached($request, 'finance-item-summary.index', $validated, function () use ($request, $validated) {
+        $reportingSource = null;
+        if (! $request->boolean('filters_only')) {
+            $readFilter = FinanceOutletFilter::resolve((string) ($validated['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
+            $readOutletIds = array_values(array_unique(array_map('strval', $readFilter['outlet_ids'] ?? [])));
+            $reportingSource = $this->dailySummaryService->readContractStatus(
+                $readOutletIds,
+                $validated['date_from'] ?? null,
+                $validated['date_to'] ?? null,
+                (string) ($readFilter['timezone'] ?? TransactionDate::appTimezone())
+            );
+
+            if (! ($reportingSource['ready'] ?? false)) {
+                return ApiResponse::error(
+                    'Data Item Summary untuk rentang tanggal ini belum selesai dimaterialisasi. Proses warm berjalan melalui scheduler; coba lagi setelah coverage siap.',
+                    'REPORT_DAILY_SUMMARY_NOT_READY',
+                    409,
+                    [],
+                    ['reporting_source' => $reportingSource]
+                );
+            }
+        }
+
+        return ApiResponse::ok($this->okCached($request, 'finance-item-summary.v8i03.index', $validated, function () use ($request, $validated, $reportingSource) {
             $v = $validated;
             $sort = (string) ($v['sort'] ?? 'category_name');
             $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
@@ -84,16 +104,13 @@ class ItemSummaryController extends Controller
                         'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                         'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                         'generated_at' => null,
+                        'reporting_source' => $reportingSource,
                         'category_segment_active' => $categorySegment,
                         'category_segment_label' => FinanceCategorySegment::label($categorySegment),
                         'bar_category_names' => FinanceCategorySegment::barCategoryNames(),
                         'cogs_source' => 'not_available',
                     ],
                 ];
-            }
-
-            if ($outletIds !== []) {
-                $this->dailySummaryService->ensureCoverage($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
             }
 
             $rows = $this->buildRows($outletIds, $v, $sort, $dir, $categorySegment)->get();
@@ -157,6 +174,7 @@ class ItemSummaryController extends Controller
                     'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                     'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                     'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                    'reporting_source' => $reportingSource,
                     'category_segment_active' => $categorySegment,
                     'category_segment_label' => FinanceCategorySegment::label($categorySegment),
                     'bar_category_names' => FinanceCategorySegment::barCategoryNames(),
@@ -168,7 +186,7 @@ class ItemSummaryController extends Controller
 
     private function buildSelectedModifierMap($rows, array $outletIds, array $filters, string $timezone, string $categorySegment): array
     {
-        $rowKeys = $rows->pluck('row_key')->filter()->map(fn ($key) => (string) $key)->unique()->values();
+        $rowKeys = $rows->pluck('row_key')->filter()->map(fn ($key) => (string) $key)->unique()->sort()->values();
         if ($rowKeys->isEmpty() || $outletIds === []) {
             return [];
         }
@@ -178,86 +196,92 @@ class ItemSummaryController extends Controller
             $filters['date_to'] ?? null,
             $timezone
         );
+        $fromDate = $window['requested_from']->format('Y-m-d');
+        $toDate = $window['requested_to']->format('Y-m-d');
+        $normalizedOutletIds = array_values(array_unique(array_map('strval', $outletIds)));
+        sort($normalizedOutletIds);
 
-        // Backoffice-only fix:
-        // Modifier summary must read what was actually saved in checkout history.
-        // Existing checkout already stores free-text modifier/item note in sale_items.note,
-        // while selected paid/free add-ons are stored in sale_item_addons.addon_name.
-        // Start from sale_items and LEFT JOIN addons so note-only items are not dropped.
-        $query = DB::table('sale_items as si')
-            ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->join('report_sale_business_dates as rsbd', function ($join) {
-                $join->on('rsbd.sale_id', '=', 's.id')
-                    ->on('rsbd.outlet_id', '=', 's.outlet_id');
-            })
-            ->leftJoin('sale_item_addons as sia', 'sia.sale_item_id', '=', 'si.id')
-            ->leftJoin('products as p', 'p.id', '=', 'si.product_id')
-            ->leftJoin('categories as c', 'c.id', '=', 'p.category_id')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID')
-            ->whereNull('si.voided_at')
-            ->whereIn('rsbd.outlet_id', $outletIds)
-            ->whereBetween('rsbd.business_date', [
-                $window['requested_from']->format('Y-m-d'),
-                $window['requested_to']->format('Y-m-d'),
-            ])
-            ->where(function ($query) use ($rowKeys) {
-                foreach ($rowKeys as $rowKey) {
-                    [$productId, $variantId] = array_pad(explode(':', (string) $rowKey, 2), 2, '');
-                    $query->orWhere(function ($sub) use ($productId, $variantId) {
-                        $sub->where('si.product_id', $productId === '' ? null : $productId);
-                        if ($variantId === '') {
-                            $sub->where(function ($variant) {
-                                $variant->whereNull('si.variant_id')->orWhere('si.variant_id', '');
-                            });
-                        } else {
-                            $sub->where('si.variant_id', $variantId);
-                        }
-                    });
-                }
-            })
-            ->where(function ($query) {
-                $query->whereNotNull('sia.addon_name')
-                    ->orWhere(function ($noteQuery) {
-                        $noteQuery->whereNotNull('si.note')
-                            ->whereRaw("TRIM(COALESCE(si.note, '')) <> ''");
-                    });
-            });
+        $cacheKey = 'finance-item-summary:v8i03:modifier-map:' . sha1(json_encode([
+            'outlets' => $normalizedOutletIds,
+            'date_from' => $fromDate,
+            'date_to' => $toDate,
+            'category_segment' => $categorySegment,
+            'row_keys' => $rowKeys->all(),
+        ]));
 
-        FinanceCategorySegment::apply($query, 'c.name', $categorySegment);
+        return Cache::remember($cacheKey, now()->addMinutes(5), function () use ($rowKeys, $normalizedOutletIds, $fromDate, $toDate, $categorySegment) {
+            // Modifier is decorative metadata, not a financial aggregate. Restrict its
+            // history scan to the canonical business-date sale IDs and selected rows.
+            // This avoids joining the full sales table across a 1-year range.
+            $scopeSales = DB::table('report_sale_business_dates as rsbd')
+                ->whereIn('rsbd.outlet_id', $normalizedOutletIds)
+                ->whereBetween('rsbd.business_date', [$fromDate, $toDate])
+                ->selectRaw('rsbd.sale_id');
 
-        $modifierRows = $query
-            ->selectRaw("CONCAT(COALESCE(si.product_id, ''), ':', COALESCE(si.variant_id, '')) as row_key")
-            ->selectRaw('sia.addon_name as addon_name')
-            ->selectRaw('si.note as item_note')
-            ->groupBy('row_key', 'sia.addon_name', 'si.note')
-            ->orderBy('sia.addon_name')
-            ->orderBy('si.note')
-            ->get();
+            $query = DB::table('sale_items as si')
+                ->joinSub($scopeSales, 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 'si.sale_id'))
+                ->leftJoin('sale_item_addons as sia', 'sia.sale_item_id', '=', 'si.id')
+                ->leftJoin('products as p', 'p.id', '=', 'si.product_id')
+                ->leftJoin('categories as c', 'c.id', '=', 'p.category_id')
+                ->whereNull('si.voided_at')
+                ->where(function ($query) use ($rowKeys) {
+                    foreach ($rowKeys as $rowKey) {
+                        [$productId, $variantId] = array_pad(explode(':', (string) $rowKey, 2), 2, '');
+                        $query->orWhere(function ($sub) use ($productId, $variantId) {
+                            $sub->where('si.product_id', $productId === '' ? null : $productId);
+                            if ($variantId === '') {
+                                $sub->where(function ($variant) {
+                                    $variant->whereNull('si.variant_id')->orWhere('si.variant_id', '');
+                                });
+                            } else {
+                                $sub->where('si.variant_id', $variantId);
+                            }
+                        });
+                    }
+                })
+                ->where(function ($query) {
+                    $query->whereNotNull('sia.addon_name')
+                        ->orWhere(function ($noteQuery) {
+                            $noteQuery->whereNotNull('si.note')
+                                ->whereRaw("TRIM(COALESCE(si.note, '')) <> ''");
+                        });
+                });
 
-        $map = [];
-        foreach ($modifierRows as $modifier) {
-            $rowKey = (string) ($modifier->row_key ?? '');
-            if ($rowKey === '') {
-                continue;
-            }
+            FinanceCategorySegment::apply($query, 'c.name', $categorySegment);
 
-            $addonName = $this->normalizeModifierText((string) ($modifier->addon_name ?? ''));
-            $itemNote = $this->normalizeModifierText((string) ($modifier->item_note ?? ''));
+            $modifierRows = $query
+                ->selectRaw("CONCAT(COALESCE(si.product_id, ''), ':', COALESCE(si.variant_id, '')) as row_key")
+                ->selectRaw('sia.addon_name as addon_name')
+                ->selectRaw('si.note as item_note')
+                ->groupBy('row_key', 'sia.addon_name', 'si.note')
+                ->orderBy('sia.addon_name')
+                ->orderBy('si.note')
+                ->get();
 
-            foreach ([$addonName, $itemNote] as $name) {
-                if ($name === '') {
+            $map = [];
+            foreach ($modifierRows as $modifier) {
+                $rowKey = (string) ($modifier->row_key ?? '');
+                if ($rowKey === '') {
                     continue;
                 }
-                $map[$rowKey][$name] = $name;
+
+                $addonName = $this->normalizeModifierText((string) ($modifier->addon_name ?? ''));
+                $itemNote = $this->normalizeModifierText((string) ($modifier->item_note ?? ''));
+
+                foreach ([$addonName, $itemNote] as $name) {
+                    if ($name === '') {
+                        continue;
+                    }
+                    $map[$rowKey][$name] = $name;
+                }
             }
-        }
 
-        foreach ($map as $rowKey => $names) {
-            $map[$rowKey] = implode(' | ', array_values($names));
-        }
+            foreach ($map as $rowKey => $names) {
+                $map[$rowKey] = implode(' | ', array_values($names));
+            }
 
-        return $map;
+            return $map;
+        });
     }
 
     private function normalizeModifierText(string $value): string

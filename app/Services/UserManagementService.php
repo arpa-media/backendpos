@@ -19,14 +19,19 @@ use App\Support\UserManagementCatalog;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
 use Spatie\Permission\Models\Permission;
+use Spatie\Permission\Models\Role as SpatieRole;
 use Spatie\Permission\PermissionRegistrar;
 
 class UserManagementService
 {
-    public function __construct(private readonly ReportPortalAccessService $reportPortalAccess)
-    {
+    public function __construct(
+        private readonly ReportPortalAccessService $reportPortalAccess,
+        private readonly HrSquadUserWiringService $hrSquadWiring,
+    ) {
     }
 
     public function ensureAccessAssignment(User $user): UserAccessAssignment
@@ -162,6 +167,14 @@ class UserManagementService
                 'can_create' => $portalVisible && (bool) ($effective['can_create'] ?? false),
                 'can_edit' => $portalVisible && (bool) ($effective['can_edit'] ?? false),
                 'can_delete' => $portalVisible && (bool) ($effective['can_delete'] ?? false),
+                // STOCK-HPP-ITERASI-01: keep permission metadata inside the
+                // session snapshot so PermissionOrSnapshot and the frontend
+                // can honor Access Matrix changes immediately, even before a
+                // user's direct Spatie permissions are re-synchronized.
+                'permission_view' => $menu->permission_view ? (string) $menu->permission_view : null,
+                'permission_create' => $menu->permission_create ? (string) $menu->permission_create : null,
+                'permission_update' => $menu->permission_update ? (string) $menu->permission_update : null,
+                'permission_delete' => $menu->permission_delete ? (string) $menu->permission_delete : null,
             ];
         })->values()->all();
 
@@ -219,7 +232,7 @@ class UserManagementService
 
     private function portalAllowsImplicitVisibility(string $portalCode): bool
     {
-        return in_array(strtolower($portalCode), ['finance', 'pos'], true);
+        return in_array(strtolower($portalCode), ['finance', 'pos', 'attendance'], true);
     }
 
     private function isPortalLandingMenu(AccessMenu $menu, string $portalCode): bool
@@ -307,44 +320,16 @@ class UserManagementService
         return strtoupper((string) ($assignment->role?->code ?? '')) === 'ADMIN';
     }
 
-    public function syncUserPermissions(User $user): array
+    public function syncUserPermissions(User $user, bool $forgetPermissionCache = true): array
     {
-        $user->loadMissing(['roles', 'permissions']);
         $assignment = $this->ensureAccessAssignment($user);
         $access = $this->buildSessionAccess($user);
         $role = $assignment->role;
 
-        $permissionNames = collect(['auth.me']);
-        foreach ($access['menus'] as $menu) {
-            $accessMenu = AccessMenu::query()->find($menu['id']);
-            if (!$accessMenu) {
-                continue;
-            }
-
-            if (($menu['can_view'] ?? false) && $accessMenu->permission_view) {
-                $permissionNames->push($accessMenu->permission_view);
-            }
-            if (($menu['can_create'] ?? false) && $accessMenu->permission_create) {
-                $permissionNames->push($accessMenu->permission_create);
-            }
-            if (($menu['can_edit'] ?? false) && $accessMenu->permission_update) {
-                $permissionNames->push($accessMenu->permission_update);
-            }
-            if (($menu['can_delete'] ?? false) && $accessMenu->permission_delete) {
-                $permissionNames->push($accessMenu->permission_delete);
-            }
-        }
-
-        if ($this->shouldImplicitOwnerOverviewDetailAccess($assignment, $access['menus'] ?? [])) {
-            $permissionNames->push('owner_overview.sale_detail.view');
-        }
-
-        $permissionNames = $permissionNames
-            ->filter()
-            ->map(fn ($name) => (string) $name)
-            ->unique()
-            ->values();
-
+        // HOTFIX I11.01: the access snapshot already carries permission metadata.
+        // Do not execute AccessMenu::find() once per visible menu (N+1) and do not
+        // rebuild the same Access Matrix a second time after pivot synchronization.
+        $permissionNames = $this->permissionNamesFromAccessSnapshot($access, $assignment);
         $guard = config('auth.defaults.guard', 'web');
         $availablePermissions = Permission::query()
             ->where('guard_name', $guard)
@@ -353,23 +338,58 @@ class UserManagementService
             ->all();
 
         DB::transaction(function () use ($user, $role, $availablePermissions) {
-            if ($role?->spatie_role_name) {
-                $user->syncRoles([$role->spatie_role_name]);
-            }
+            // ERP POS FINAL I07-HF02: role synchronization is replacement based.
+            // A target Access Role without Spatie mapping must also clear a
+            // legacy role left by the previous assignment.
+            $user->syncRoles($role?->spatie_role_name ? [$role->spatie_role_name] : []);
             $user->syncPermissions($availablePermissions);
         });
 
-        app(PermissionRegistrar::class)->forgetCachedPermissions();
+        if ($forgetPermissionCache) {
+            app(PermissionRegistrar::class)->forgetCachedPermissions();
+        }
 
         return [
             'assignment' => $assignment->fresh(['role.userType', 'level']),
-            'access' => $this->buildSessionAccess($user->fresh(['roles', 'permissions'])),
+            'access' => $access,
             'permissions' => $availablePermissions,
         ];
     }
 
+    private function permissionNamesFromAccessSnapshot(array $access, ?UserAccessAssignment $assignment = null): \Illuminate\Support\Collection
+    {
+        $permissionNames = collect(['auth.me']);
+
+        foreach (($access['menus'] ?? []) as $menu) {
+            if (($menu['can_view'] ?? false) && ! empty($menu['permission_view'])) {
+                $permissionNames->push((string) $menu['permission_view']);
+            }
+            if (($menu['can_create'] ?? false) && ! empty($menu['permission_create'])) {
+                $permissionNames->push((string) $menu['permission_create']);
+            }
+            if (($menu['can_edit'] ?? false) && ! empty($menu['permission_update'])) {
+                $permissionNames->push((string) $menu['permission_update']);
+            }
+            if (($menu['can_delete'] ?? false) && ! empty($menu['permission_delete'])) {
+                $permissionNames->push((string) $menu['permission_delete']);
+            }
+        }
+
+        if ($assignment && $this->shouldImplicitOwnerOverviewDetailAccess($assignment, $access['menus'] ?? [])) {
+            $permissionNames->push('owner_overview.sale_detail.view');
+        }
+
+        return $permissionNames
+            ->filter()
+            ->map(fn ($name) => (string) $name)
+            ->unique()
+            ->values();
+    }
+
     public function updateUserAssignment(User $actor, User $subject, string $accessRoleId, ?string $accessLevelId): array
     {
+        $this->assertActorCanAssignAccess($actor, $accessRoleId, $accessLevelId);
+
         $assignment = $this->ensureAccessAssignment($subject);
         $assignment->fill([
             'access_role_id' => $accessRoleId,
@@ -377,70 +397,526 @@ class UserManagementService
             'assigned_by_user_id' => $actor->id,
         ])->save();
 
-        return $this->syncUserPermissions($subject);
+        $sync = $this->syncUserPermissions($subject);
+        $freshSubject = $subject->fresh([
+            'employee.assignment.outlet',
+            'outlet',
+            'accessAssignment.role',
+            'accessAssignment.level',
+        ]) ?: $subject;
+        $sync['hr_squad'] = $this->hrSquadWiring->ensureForUser($freshSubject, true);
+
+        return $sync;
+    }
+
+    /**
+     * ERP Finance V7 I11: atomic bulk role/level assignment.
+     *
+     * The access role and access level are authoritative Access Matrix dimensions.
+     * A batch either commits completely or is rolled back. Each subject receives an
+     * immutable before/after audit row using one shared batch id.
+     */
+    public function bulkUpdateUserAssignments(
+        User $actor,
+        array $userIds,
+        ?string $accessRoleId,
+        string $accessLevelMode,
+        ?string $accessLevelId,
+        ?string $ipAddress = null,
+        ?string $userAgent = null,
+    ): array {
+        $ids = collect($userIds)
+            ->map(fn ($id) => trim((string) $id))
+            ->filter()
+            ->unique()
+            ->values();
+
+        if ($ids->isEmpty()) {
+            throw ValidationException::withMessages(['user_ids' => ['Pilih minimal satu user.']]);
+        }
+        if ($ids->count() > 100) {
+            throw ValidationException::withMessages(['user_ids' => ['Bulk access maksimal 100 user per proses.']]);
+        }
+
+        $mode = strtoupper(trim($accessLevelMode));
+        if (! in_array($mode, ['KEEP', 'CLEAR', 'SET'], true)) {
+            throw ValidationException::withMessages(['access_level_mode' => ['Mode Access Level tidak valid.']]);
+        }
+        if ($accessRoleId === null && $mode === 'KEEP') {
+            throw ValidationException::withMessages(['bulk' => ['Pilih Access Role atau Access Level yang akan diubah.']]);
+        }
+        if ($mode === 'SET' && ! $accessLevelId) {
+            throw ValidationException::withMessages(['access_level_id' => ['Access Level wajib dipilih saat mode SET.']]);
+        }
+        if ($ids->contains((string) $actor->id)) {
+            throw ValidationException::withMessages(['user_ids' => ['Akses akun yang sedang login tidak boleh diubah melalui bulk edit. Gunakan single edit untuk mencegah lockout tidak sengaja.']]);
+        }
+
+        $batchId = (string) Str::ulid();
+
+        $result = DB::transaction(function () use ($actor, $ids, $accessRoleId, $mode, $accessLevelId, $batchId, $ipAddress, $userAgent) {
+            $subjects = User::query()
+                ->with(['accessAssignment.role.userType', 'accessAssignment.level'])
+                ->whereIn('id', $ids->all())
+                ->lockForUpdate()
+                ->get()
+                ->keyBy(fn (User $user) => (string) $user->id);
+
+            if ($subjects->count() !== $ids->count()) {
+                $missing = $ids->reject(fn ($id) => $subjects->has((string) $id))->values()->all();
+                throw ValidationException::withMessages(['user_ids' => ['Ada user yang tidak ditemukan: '.implode(', ', $missing)]]);
+            }
+
+            $plans = [];
+            $targetRoleIds = collect();
+            $targetLevelIds = collect();
+
+            foreach ($ids as $id) {
+                /** @var User $subject */
+                $subject = $subjects->get((string) $id);
+                $assignment = $subject->accessAssignment ?: $this->ensureAccessAssignment($subject);
+                $beforeRoleId = $assignment->access_role_id ? (string) $assignment->access_role_id : null;
+                $beforeLevelId = $assignment->access_level_id ? (string) $assignment->access_level_id : null;
+                $targetRoleId = $accessRoleId ?: $beforeRoleId;
+                $targetLevelId = match ($mode) {
+                    'CLEAR' => null,
+                    'SET' => $accessLevelId,
+                    default => $beforeLevelId,
+                };
+
+                if (! $targetRoleId) {
+                    throw ValidationException::withMessages(['access_role_id' => ['User '.$subject->name.' tidak memiliki Access Role yang valid.']]);
+                }
+
+                $plans[(string) $id] = [
+                    'subject' => $subject,
+                    'assignment' => $assignment,
+                    'before_role_id' => $beforeRoleId,
+                    'before_level_id' => $beforeLevelId,
+                    'target_role_id' => (string) $targetRoleId,
+                    'target_level_id' => $targetLevelId ? (string) $targetLevelId : null,
+                ];
+                $targetRoleIds->push((string) $targetRoleId);
+                if ($targetLevelId) {
+                    $targetLevelIds->push((string) $targetLevelId);
+                }
+            }
+
+            $roles = AccessRole::query()->with('userType')->whereIn('id', $targetRoleIds->unique()->all())->get()->keyBy(fn ($role) => (string) $role->id);
+            $levels = $targetLevelIds->isNotEmpty()
+                ? AccessLevel::query()->whereIn('id', $targetLevelIds->unique()->all())->get()->keyBy(fn ($level) => (string) $level->id)
+                : collect();
+
+            $comboKeys = collect($plans)->map(fn ($plan) => $plan['target_role_id'].'|'.($plan['target_level_id'] ?: '__NULL__'))->unique()->values();
+            $permissionCounts = [];
+            foreach ($comboKeys as $comboKey) {
+                [$roleId, $levelKey] = explode('|', $comboKey, 2);
+                $levelId = $levelKey === '__NULL__' ? null : $levelKey;
+                $this->assertActorCanAssignAccess($actor, $roleId, $levelId);
+                $permissionCounts[$comboKey] = $this->effectivePermissionNamesForAccess($roleId, $levelId)->count();
+            }
+
+            $syncGroups = [];
+            $auditRows = [];
+            $changed = [];
+            $now = now();
+            $hasAuditTable = Schema::hasTable('user_access_assignment_audits');
+
+            foreach ($ids as $id) {
+                $plan = $plans[(string) $id];
+                /** @var User $subject */
+                $subject = $plan['subject'];
+                /** @var UserAccessAssignment $assignment */
+                $assignment = $plan['assignment'];
+                $targetRole = $roles->get($plan['target_role_id']);
+                $targetLevel = $plan['target_level_id'] ? $levels->get($plan['target_level_id']) : null;
+
+                if (! $targetRole) {
+                    throw ValidationException::withMessages(['access_role_id' => ['Access Role target tidak ditemukan.']]);
+                }
+                if ($plan['target_level_id'] && ! $targetLevel) {
+                    throw ValidationException::withMessages(['access_level_id' => ['Access Level target tidak ditemukan.']]);
+                }
+
+                $roleCode = strtoupper(trim((string) $targetRole->code));
+                if (! in_array($roleCode, ['STAKEHOLDER', 'OBSERVER'], true) && trim((string) ($subject->nisj ?? '')) === '') {
+                    throw ValidationException::withMessages([
+                        'user_ids' => ['User '.$subject->name.' belum memiliki NISJ dan tidak dapat dipindah ke role operasional.'],
+                    ]);
+                }
+
+                $beforeSnapshot = [
+                    'role_id' => $plan['before_role_id'],
+                    'role_code' => (string) ($assignment->role?->code ?? ''),
+                    'role_name' => (string) ($assignment->role?->name ?? ''),
+                    'level_id' => $plan['before_level_id'],
+                    'level_code' => (string) ($assignment->level?->code ?? ''),
+                    'level_name' => (string) ($assignment->level?->name ?? ''),
+                ];
+
+                $assignment->forceFill([
+                    'access_role_id' => $plan['target_role_id'],
+                    'access_level_id' => $plan['target_level_id'],
+                    'assigned_by_user_id' => $actor->id,
+                ])->save();
+
+                $comboKey = $plan['target_role_id'].'|'.($plan['target_level_id'] ?: '__NULL__');
+                $syncGroups[$comboKey] ??= [
+                    'role_id' => $plan['target_role_id'],
+                    'level_id' => $plan['target_level_id'],
+                    'user_ids' => [],
+                ];
+                $syncGroups[$comboKey]['user_ids'][] = (string) $subject->id;
+
+                $afterSnapshot = [
+                    'role_id' => $plan['target_role_id'],
+                    'role_code' => (string) $targetRole->code,
+                    'role_name' => (string) $targetRole->name,
+                    'level_id' => $plan['target_level_id'],
+                    'level_code' => (string) ($targetLevel?->code ?? ''),
+                    'level_name' => (string) ($targetLevel?->name ?? ''),
+                    'permission_count' => (int) ($permissionCounts[$comboKey] ?? 0),
+                ];
+
+                if ($hasAuditTable) {
+                    $auditRows[] = [
+                        'id' => (string) Str::ulid(),
+                        'batch_id' => $batchId,
+                        'actor_user_id' => $actor->id,
+                        'subject_user_id' => $subject->id,
+                        'event' => 'BULK_ACCESS_UPDATE',
+                        'before_access_role_id' => $plan['before_role_id'],
+                        'before_access_level_id' => $plan['before_level_id'],
+                        'after_access_role_id' => $plan['target_role_id'],
+                        'after_access_level_id' => $plan['target_level_id'],
+                        'before_snapshot' => json_encode($beforeSnapshot, JSON_UNESCAPED_SLASHES),
+                        'after_snapshot' => json_encode($afterSnapshot, JSON_UNESCAPED_SLASHES),
+                        'ip_address' => $ipAddress ? mb_substr($ipAddress, 0, 64) : null,
+                        'user_agent' => $userAgent ? mb_substr($userAgent, 0, 500) : null,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
+                }
+
+                $changed[] = [
+                    'id' => (string) $subject->id,
+                    'name' => (string) $subject->name,
+                    'access_role_id' => $plan['target_role_id'],
+                    'access_level_id' => $plan['target_level_id'],
+                    'access_role' => [
+                        'id' => (string) $targetRole->id,
+                        'code' => (string) $targetRole->code,
+                        'name' => (string) $targetRole->name,
+                    ],
+                    'user_type' => $targetRole->userType ? [
+                        'id' => (string) $targetRole->userType->id,
+                        'code' => (string) $targetRole->userType->code,
+                        'name' => (string) $targetRole->userType->name,
+                    ] : null,
+                    'access_level' => $targetLevel ? [
+                        'id' => (string) $targetLevel->id,
+                        'code' => (string) $targetLevel->code,
+                        'name' => (string) $targetLevel->name,
+                    ] : null,
+                ];
+            }
+
+            if (! empty($auditRows)) {
+                DB::table('user_access_assignment_audits')->insert($auditRows);
+            }
+
+            // Synchronize permissions once per unique target combination, not once per user.
+            foreach ($syncGroups as $group) {
+                $this->syncUserIdsForAccessPlan($group['user_ids'], $group['role_id'], $group['level_id'], false);
+            }
+
+            return [
+                'batch_id' => $batchId,
+                'updated_count' => count($changed),
+                'users' => $changed,
+            ];
+        });
+
+        app(PermissionRegistrar::class)->forgetCachedPermissions();
+        $freshActor = User::query()->with(['roles', 'permissions'])->find($actor->id) ?: $actor;
+        $result['current_actor_session'] = $this->currentSessionSnapshot($freshActor);
+
+        return $result;
+    }
+
+    /**
+     * Prevent privilege escalation by requiring the actor to already possess every
+     * concrete Spatie permission granted by the target Access Matrix combination.
+     */
+    public function assertActorCanAssignAccess(User $actor, string $accessRoleId, ?string $accessLevelId): void
+    {
+        $actorAssignment = $this->ensureAccessAssignment($actor);
+        $actorRoleCode = strtoupper(trim((string) ($actorAssignment->role?->code ?? '')));
+        $targetRole = AccessRole::query()->find($accessRoleId);
+
+        if (! $targetRole) {
+            throw ValidationException::withMessages(['access_role_id' => ['Access Role tidak ditemukan.']]);
+        }
+
+        $targetRoleCode = strtoupper(trim((string) $targetRole->code));
+        if ($targetRoleCode === 'ADMIN' && $actorRoleCode !== 'ADMIN') {
+            throw ValidationException::withMessages(['access_role_id' => ['Hanya Administrator yang dapat memberikan Access Role Administrator.']]);
+        }
+
+        if ($actorRoleCode === 'ADMIN') {
+            return;
+        }
+
+        $actor->loadMissing(['permissions', 'roles']);
+        $actorPermissionNames = $actor->getAllPermissions()->pluck('name')->map(fn ($name) => (string) $name)->flip();
+        $targetPermissionNames = $this->effectivePermissionNamesForAccess($accessRoleId, $accessLevelId);
+        $missing = $targetPermissionNames->reject(fn ($name) => $actorPermissionNames->has((string) $name))->values();
+
+        if ($missing->isNotEmpty()) {
+            throw ValidationException::withMessages([
+                'access_role_id' => ['Target Access Role/Level memiliki hak di luar akses actor: '.$missing->take(8)->implode(', ').($missing->count() > 8 ? ', ...' : '')],
+            ]);
+        }
+    }
+
+    private function effectivePermissionNamesForAccess(string $roleId, ?string $levelId): \Illuminate\Support\Collection
+    {
+        $menus = AccessMenu::query()->where('is_active', true)->get();
+        $baseRows = AccessRoleMenuPermission::query()->where('access_role_id', $roleId)->whereNull('access_level_id')->get()->keyBy('menu_id');
+        $exactRows = $levelId
+            ? AccessRoleMenuPermission::query()->where('access_role_id', $roleId)->where('access_level_id', $levelId)->get()->keyBy('menu_id')
+            : collect();
+
+        $names = collect();
+        foreach ($menus as $menu) {
+            $row = $exactRows->get($menu->id) ?: $baseRows->get($menu->id);
+            if (! $row) continue;
+            if ($row->can_view && $menu->permission_view) $names->push((string) $menu->permission_view);
+            if ($row->can_create && $menu->permission_create) $names->push((string) $menu->permission_create);
+            if ($row->can_edit && $menu->permission_update) $names->push((string) $menu->permission_update);
+            if ($row->can_delete && $menu->permission_delete) $names->push((string) $menu->permission_delete);
+        }
+
+        $accessRole = AccessRole::query()->find($roleId);
+        if ($accessRole?->spatie_role_name) {
+            $guard = config('auth.defaults.guard', 'web');
+            $spatieRole = SpatieRole::query()
+                ->where('name', $accessRole->spatie_role_name)
+                ->where('guard_name', $guard)
+                ->first();
+            if ($spatieRole) {
+                $spatieRole->permissions->pluck('name')->each(fn ($name) => $names->push((string) $name));
+            }
+        }
+
+        return $names->filter()->unique()->values();
     }
 
     public function upsertPortalPermissions(string $roleId, ?string $levelId, array $rows): int
     {
-        foreach ($rows as $row) {
-            AccessRolePortalPermission::query()->updateOrCreate(
-                [
-                    'access_role_id' => $roleId,
-                    'access_level_id' => $levelId,
-                    'portal_id' => $row['portal_id'],
-                ],
-                [
-                    'can_view' => (bool) ($row['can_view'] ?? false),
-                ]
-            );
+        if (empty($rows)) {
+            return 0;
         }
+
+        $portalIds = collect($rows)->pluck('portal_id')->filter()->unique()->values();
+        $existing = AccessRolePortalPermission::query()
+            ->where('access_role_id', $roleId)
+            ->when($levelId === null || $levelId === '', fn ($query) => $query->whereNull('access_level_id'), fn ($query) => $query->where('access_level_id', $levelId))
+            ->whereIn('portal_id', $portalIds->all())
+            ->get()
+            ->keyBy('portal_id');
+        $now = now();
+
+        $payload = collect($rows)->map(function (array $row) use ($roleId, $levelId, $existing, $now) {
+            $current = $existing->get($row['portal_id']);
+            return [
+                'id' => $current?->id ?: (string) Str::ulid(),
+                'access_role_id' => $roleId,
+                'access_level_id' => $levelId ?: null,
+                'portal_id' => $row['portal_id'],
+                'can_view' => (bool) ($row['can_view'] ?? false),
+                'created_at' => $current?->created_at ?: $now,
+                'updated_at' => $now,
+            ];
+        })->values()->all();
+
+        DB::table('access_role_portal_permissions')->upsert(
+            $payload,
+            ['id'],
+            ['can_view', 'updated_at']
+        );
 
         return $this->syncUsersForAccessScope($roleId, $levelId);
     }
 
     public function upsertMenuPermissions(string $roleId, ?string $levelId, array $rows): int
     {
-        foreach ($rows as $row) {
-            AccessRoleMenuPermission::query()->updateOrCreate(
-                [
-                    'access_role_id' => $roleId,
-                    'access_level_id' => $levelId,
-                    'menu_id' => $row['menu_id'],
-                ],
-                [
-                    'can_view' => (bool) ($row['can_view'] ?? false),
-                    'can_create' => (bool) ($row['can_create'] ?? false),
-                    'can_edit' => (bool) ($row['can_edit'] ?? false),
-                    'can_delete' => (bool) ($row['can_delete'] ?? false),
-                ]
-            );
+        if (empty($rows)) {
+            return 0;
         }
+
+        $menuIds = collect($rows)->pluck('menu_id')->filter()->unique()->values();
+        $existing = AccessRoleMenuPermission::query()
+            ->where('access_role_id', $roleId)
+            ->when($levelId === null || $levelId === '', fn ($query) => $query->whereNull('access_level_id'), fn ($query) => $query->where('access_level_id', $levelId))
+            ->whereIn('menu_id', $menuIds->all())
+            ->get()
+            ->keyBy('menu_id');
+        $now = now();
+
+        $payload = collect($rows)->map(function (array $row) use ($roleId, $levelId, $existing, $now) {
+            $current = $existing->get($row['menu_id']);
+            return [
+                'id' => $current?->id ?: (string) Str::ulid(),
+                'access_role_id' => $roleId,
+                'access_level_id' => $levelId ?: null,
+                'menu_id' => $row['menu_id'],
+                'can_view' => (bool) ($row['can_view'] ?? false),
+                'can_create' => (bool) ($row['can_create'] ?? false),
+                'can_edit' => (bool) ($row['can_edit'] ?? false),
+                'can_delete' => (bool) ($row['can_delete'] ?? false),
+                'created_at' => $current?->created_at ?: $now,
+                'updated_at' => $now,
+            ];
+        })->values()->all();
+
+        DB::table('access_role_menu_permissions')->upsert(
+            $payload,
+            ['id'],
+            ['can_view', 'can_create', 'can_edit', 'can_delete', 'updated_at']
+        );
 
         return $this->syncUsersForAccessScope($roleId, $levelId);
     }
 
+    /**
+     * HOTFIX I11.01: synchronize Spatie pivots set-based per Access Matrix scope.
+     * A base-role edit can affect level users through inheritance, therefore base
+     * edits are synchronized per actual level group instead of only NULL-level users.
+     */
     public function syncUsersForAccessScope(string $roleId, ?string $levelId): int
     {
-        $query = User::query()
-            ->whereHas('accessAssignment', function ($assignmentQuery) use ($roleId, $levelId) {
-                $assignmentQuery->where('access_role_id', $roleId);
+        $assignments = UserAccessAssignment::query()
+            ->where('access_role_id', $roleId)
+            ->when($levelId !== null && $levelId !== '', fn ($query) => $query->where('access_level_id', $levelId))
+            ->get(['user_id', 'access_level_id']);
 
-                if ($levelId === null || $levelId === '') {
-                    $assignmentQuery->whereNull('access_level_id');
-                } else {
-                    $assignmentQuery->where('access_level_id', $levelId);
+        if ($assignments->isEmpty()) {
+            return 0;
+        }
+
+        $groups = $assignments->groupBy(fn ($assignment) => $assignment->access_level_id ? (string) $assignment->access_level_id : '__NULL__');
+        foreach ($groups as $levelKey => $group) {
+            $actualLevelId = $levelKey === '__NULL__' ? null : $levelKey;
+            $this->syncUserIdsForAccessPlan(
+                $group->pluck('user_id')->map(fn ($id) => (string) $id)->values()->all(),
+                $roleId,
+                $actualLevelId,
+                false,
+            );
+        }
+
+        app(PermissionRegistrar::class)->forgetCachedPermissions();
+
+        return $assignments->count();
+    }
+
+    private function syncUserIdsForAccessPlan(array $userIds, string $roleId, ?string $levelId, bool $forgetPermissionCache = true): int
+    {
+        $ids = collect($userIds)->map(fn ($id) => (string) $id)->filter()->unique()->values();
+        if ($ids->isEmpty()) {
+            return 0;
+        }
+
+        // Build the effective Access Matrix once for this role+level combination.
+        $probeUserId = $ids->first();
+        $probeUser = User::query()->find($probeUserId);
+        if (! $probeUser) {
+            return 0;
+        }
+        $assignment = $this->ensureAccessAssignment($probeUser);
+        $access = $this->buildSessionAccess($probeUser);
+        $permissionNames = $this->permissionNamesFromAccessSnapshot($access, $assignment);
+        $guard = config('auth.defaults.guard', 'web');
+        $permissionIds = Permission::query()
+            ->where('guard_name', $guard)
+            ->whereIn('name', $permissionNames->all())
+            ->pluck('id')
+            ->all();
+
+        $accessRole = AccessRole::query()->find($roleId);
+        $spatieRoleId = null;
+        if ($accessRole?->spatie_role_name) {
+            $spatieRoleId = SpatieRole::query()
+                ->where('guard_name', $guard)
+                ->where('name', $accessRole->spatie_role_name)
+                ->value('id');
+            if ($spatieRoleId === null) {
+                throw ValidationException::withMessages([
+                    'access_role_id' => ['Spatie role '.$accessRole->spatie_role_name.' belum tersedia untuk Access Role ini.'],
+                ]);
+            }
+        }
+
+        if ((bool) config('permission.teams', false)) {
+            // Preserve compatibility with installations that enable Spatie Teams.
+            User::query()->whereIn('id', $ids->all())->chunkById(100, function ($users) use ($accessRole, $permissionNames) {
+                foreach ($users as $user) {
+                    $user->syncRoles($accessRole?->spatie_role_name ? [$accessRole->spatie_role_name] : []);
+                    $user->syncPermissions($permissionNames->all());
                 }
             });
+        } else {
+            $modelType = (new User())->getMorphClass();
+            $permissionPivot = config('permission.table_names.model_has_permissions', 'model_has_permissions');
+            $rolePivot = config('permission.table_names.model_has_roles', 'model_has_roles');
 
-        $synced = 0;
-        $query->chunkById(100, function ($users) use (&$synced) {
-            foreach ($users as $user) {
-                $this->syncUserPermissions($user);
-                $synced++;
-            }
-        });
+            DB::transaction(function () use ($ids, $modelType, $permissionPivot, $rolePivot, $permissionIds, $spatieRoleId) {
+                foreach ($ids->chunk(250) as $chunk) {
+                    $chunkIds = $chunk->values()->all();
 
-        return $synced;
+                    DB::table($permissionPivot)
+                        ->where('model_type', $modelType)
+                        ->whereIn('model_id', $chunkIds)
+                        ->delete();
+
+                    if (! empty($permissionIds)) {
+                        $permissionRows = [];
+                        foreach ($chunkIds as $userId) {
+                            foreach ($permissionIds as $permissionId) {
+                                $permissionRows[] = [
+                                    'permission_id' => $permissionId,
+                                    'model_type' => $modelType,
+                                    'model_id' => $userId,
+                                ];
+                            }
+                        }
+                        foreach (array_chunk($permissionRows, 5000) as $insertRows) {
+                            DB::table($permissionPivot)->insertOrIgnore($insertRows);
+                        }
+                    }
+
+                    DB::table($rolePivot)
+                        ->where('model_type', $modelType)
+                        ->whereIn('model_id', $chunkIds)
+                        ->delete();
+
+                    if ($spatieRoleId !== null) {
+                        DB::table($rolePivot)->insertOrIgnore(array_map(fn ($userId) => [
+                            'role_id' => $spatieRoleId,
+                            'model_type' => $modelType,
+                            'model_id' => $userId,
+                        ], $chunkIds));
+                    }
+                }
+            });
+        }
+
+        if ($forgetPermissionCache) {
+            app(PermissionRegistrar::class)->forgetCachedPermissions();
+        }
+
+        return $ids->count();
     }
 
 
@@ -506,6 +982,7 @@ class UserManagementService
                 'user' => $subject,
                 'subject_access' => $sync['access'] ?? null,
                 'subject_permissions' => $sync['permissions'] ?? [],
+                'hr_squad' => $sync['hr_squad'] ?? null,
                 'current_actor_session' => $this->currentSessionSnapshot($actor),
             ];
         });
@@ -576,8 +1053,11 @@ class UserManagementService
                 'accessAssignment.level',
             ]);
 
+            $hrSquad = $this->hrSquadWiring->ensureForUser($subject, true);
+
             return [
                 'user' => $subject,
+                'hr_squad' => $hrSquad,
                 'current_actor_session' => $this->currentSessionSnapshot($actor),
             ];
         });
@@ -843,6 +1323,39 @@ class UserManagementService
         ];
     }
 
+    public function ensureMastersReady(): void
+    {
+        static $ready = false;
+        if ($ready) {
+            return;
+        }
+
+        $guard = (string) config('auth.defaults.guard', 'web');
+        $mappedSpatieRoles = AccessRole::query()
+            ->whereNotNull('spatie_role_name')
+            ->where('spatie_role_name', '!=', '')
+            ->pluck('spatie_role_name')
+            ->map(fn ($name) => strtolower(trim((string) $name)))
+            ->filter()
+            ->unique()
+            ->values();
+        $availableSpatieRoleCount = $mappedSpatieRoles->isEmpty()
+            ? 0
+            : SpatieRole::query()->where('guard_name', $guard)->whereIn('name', $mappedSpatieRoles->all())->count();
+        $spatieRolesReady = $mappedSpatieRoles->isEmpty() || $availableSpatieRoleCount === $mappedSpatieRoles->count();
+
+        $ready = AccessRole::query()->where('code', 'ADMIN')->exists()
+            && AccessLevel::query()->exists()
+            && AccessPortal::query()->exists()
+            && AccessMenu::query()->exists()
+            && $spatieRolesReady;
+
+        if (! $ready) {
+            $this->ensureMasters();
+            $ready = true;
+        }
+    }
+
     public function ensureMasters(): void
     {
         AccessUserType::query()->firstOrCreate(['code' => 'BACKOFFICE'], ['name' => 'Backoffice', 'description' => 'Portal backoffice', 'is_active' => true]);
@@ -870,6 +1383,22 @@ class UserManagementService
                 ]
             );
         }
+
+        // ERP POS FINAL I07-HF02: Access Matrix can only synchronize an
+        // Access Role when its referenced Spatie role exists. Production
+        // databases that were migrated without re-running AuthSeeder could
+        // otherwise fail with "Spatie role cashier belum tersedia". Keep the
+        // role identity self-healing; concrete permissions remain governed by
+        // the Access Matrix and direct permission synchronization below.
+        $guard = (string) config('auth.defaults.guard', 'web');
+        AccessRole::query()
+            ->whereNotNull('spatie_role_name')
+            ->where('spatie_role_name', '!=', '')
+            ->pluck('spatie_role_name')
+            ->map(fn ($name) => strtolower(trim((string) $name)))
+            ->filter()
+            ->unique()
+            ->each(fn ($name) => SpatieRole::findOrCreate((string) $name, $guard));
 
         foreach ([
             ['code' => 'HQ', 'name' => 'Head Office'],

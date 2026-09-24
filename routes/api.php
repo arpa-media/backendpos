@@ -315,6 +315,7 @@ Route::put('/outlet', [OutletController::class, 'update'])
                 Route::put('/levels/{id}', [UserManagementController::class, 'updateLevel']);
                 Route::post('/users', [UserManagementController::class, 'storeUser']);
                 Route::put('/users/{userId}/access', [UserManagementController::class, 'updateUserAccess']);
+                Route::put('/users/bulk-access', [UserManagementController::class, 'bulkUpdateUserAccess']);
                 Route::put('/users/{userId}/stakeholder-observer-scope', [UserManagementController::class, 'updateStakeholderObserverScope']);
                 Route::put('/users/{userId}/profile', [UserManagementController::class, 'updateUserProfile']);
                 Route::put('/users/{userId}/provision-control', [UserManagementController::class, 'updateUserProvisionControl']);

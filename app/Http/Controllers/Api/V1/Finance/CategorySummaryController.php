@@ -22,9 +22,6 @@ class CategorySummaryController extends Controller
 
     private function okCached($request, string $namespace, array $params, callable $callback)
     {
-        @ini_set('max_execution_time', '240');
-        @set_time_limit(240);
-
         return AnalyticsResponseCache::remember(
             $namespace,
             $params,
@@ -38,7 +35,29 @@ class CategorySummaryController extends Controller
     {
         $validated = $request->validated();
 
-        return ApiResponse::ok($this->okCached($request, 'finance-category-summary.index', $validated, function () use ($request, $validated) {
+        $reportingSource = null;
+        if (! $request->boolean('filters_only')) {
+            $readFilter = FinanceOutletFilter::resolve((string) ($validated['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
+            $readOutletIds = array_values(array_unique(array_map('strval', $readFilter['outlet_ids'] ?? [])));
+            $reportingSource = $this->dailySummaryService->readContractStatus(
+                $readOutletIds,
+                $validated['date_from'] ?? null,
+                $validated['date_to'] ?? null,
+                (string) ($readFilter['timezone'] ?? TransactionDate::appTimezone())
+            );
+
+            if (! ($reportingSource['ready'] ?? false)) {
+                return ApiResponse::error(
+                    'Data Category Summary untuk rentang tanggal ini belum selesai dimaterialisasi. Proses warm berjalan melalui scheduler; coba lagi setelah coverage siap.',
+                    'REPORT_DAILY_SUMMARY_NOT_READY',
+                    409,
+                    [],
+                    ['reporting_source' => $reportingSource]
+                );
+            }
+        }
+
+        return ApiResponse::ok($this->okCached($request, 'finance-category-summary.v8i03.index', $validated, function () use ($request, $validated, $reportingSource) {
             $v = $validated;
             $sort = (string) ($v['sort'] ?? 'category_name');
             $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
@@ -84,6 +103,7 @@ class CategorySummaryController extends Controller
                         'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                         'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                         'generated_at' => null,
+                        'reporting_source' => $reportingSource,
                         'category_segment_active' => $categorySegment,
                         'category_segment_label' => FinanceCategorySegment::label($categorySegment),
                         'bar_category_names' => FinanceCategorySegment::barCategoryNames(),
@@ -91,10 +111,6 @@ class CategorySummaryController extends Controller
                         'cogs_source' => 'not_available',
                     ],
                 ];
-            }
-
-            if ($outletIds !== []) {
-                $this->dailySummaryService->ensureCoverage($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
             }
 
             $rows = $this->buildRows($outletIds, $v, $sort, $dir, $categorySegment)->get();
@@ -152,6 +168,7 @@ class CategorySummaryController extends Controller
                     'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                     'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                     'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                    'reporting_source' => $reportingSource,
                     'category_segment_active' => $categorySegment,
                     'category_segment_label' => FinanceCategorySegment::label($categorySegment),
                     'bar_category_names' => FinanceCategorySegment::barCategoryNames(),

@@ -37,13 +37,21 @@ class OwnerOverviewService
         }
 
         $timezone = $this->resolveTimezone($scope['selected_outlet_id'] ?? null);
-        $this->dailySummaryService->ensureCoverage(
+        $reportingSource = $this->dailySummaryService->readContractStatus(
             $scope['allowed_outlet_ids'],
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
-            $timezone,
-            ['outlet_chunk' => 4, 'date_chunk_days' => 2]
+            $timezone
         );
+        if (! ($reportingSource['ready'] ?? false)) {
+            return [
+                'ok' => false,
+                'status' => 409,
+                'message' => 'Data Owner Overview untuk rentang tanggal ini belum selesai dimaterialisasi. Proses warm berjalan melalui scheduler; coba lagi setelah coverage siap.',
+                'error_code' => 'REPORT_DAILY_SUMMARY_NOT_READY',
+                'data' => ['reporting_source' => $reportingSource],
+            ];
+        }
 
         $visible = $this->saleExistsWithinBusinessDateCoverage(
             $scope['allowed_outlet_ids'],
@@ -118,7 +126,21 @@ class OwnerOverviewService
         ];
     }
 
-    public function overview(array $params): array
+    public function overviewReadContract(array $params): array
+    {
+        $outletFilter = $this->resolveOutletFilter($params);
+        $timezone = (string) ($outletFilter['timezone'] ?? config('app.timezone', 'Asia/Jakarta'));
+        $outletIds = array_values(array_filter(array_map(fn ($id) => (string) $id, $outletFilter['outlet_ids'] ?? [])));
+
+        return $this->dailySummaryService->readContractStatus(
+            $outletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone
+        );
+    }
+
+    public function overview(array $params, ?array $reportingSource = null): array
     {
         $outletFilter = $this->resolveOutletFilter($params);
         $timezone = (string) ($outletFilter['timezone'] ?? config('app.timezone', 'Asia/Jakarta'));
@@ -132,18 +154,16 @@ class OwnerOverviewService
         $topLimit = max(1, min(10, (int) ($params['top_limit'] ?? 5)));
         $recentLimit = max(1, min(20, (int) ($params['recent_limit'] ?? 10)));
         $allowedOutlets = $this->resolveAllowedOutlets($outletIds);
-
-        if ($outletIds === []) {
-            return $this->emptyOverviewPayload($fromLocal->toDateString(), $toLocal->toDateString(), $outletFilter, $timezone, $allowedOutlets, $recentLimit);
-        }
-
-        $this->dailySummaryService->ensureCoverage(
+        $reportingSource ??= $this->dailySummaryService->readContractStatus(
             $outletIds,
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
-            $timezone,
-            ['outlet_chunk' => 4, 'date_chunk_days' => 2]
+            $timezone
         );
+
+        if ($outletIds === []) {
+            return $this->emptyOverviewPayload($fromLocal->toDateString(), $toLocal->toDateString(), $outletFilter, $timezone, $allowedOutlets, $recentLimit, $reportingSource);
+        }
 
         $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet(
             $outletIds,
@@ -161,7 +181,7 @@ class OwnerOverviewService
             ->first();
 
         if ((int) ($summaryRow->trx_count ?? 0) <= 0) {
-            return $this->emptyOverviewPayload($fromLocal->toDateString(), $toLocal->toDateString(), $outletFilter, $timezone, $allowedOutlets, $recentLimit);
+            return $this->emptyOverviewPayload($fromLocal->toDateString(), $toLocal->toDateString(), $outletFilter, $timezone, $allowedOutlets, $recentLimit, $reportingSource);
         }
 
         $paymentRows = $this->dailySummaryService
@@ -372,6 +392,7 @@ class OwnerOverviewService
                 'timezone' => $timezone,
                 'outlet_scope_name' => (string) ($outletFilter['label'] ?? 'All Outlet'),
                 'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                'reporting_source' => $reportingSource,
             ],
             'metrics' => [
                 'gross_sales' => (int) ($metrics['gross_sales'] ?? 0),
@@ -637,7 +658,7 @@ class OwnerOverviewService
             ->groupBy('si.sale_id');
     }
 
-    private function emptyOverviewPayload(string $dateFrom, string $dateTo, array $outletFilter, string $timezone, array $allowedOutlets, int $recentLimit): array
+    private function emptyOverviewPayload(string $dateFrom, string $dateTo, array $outletFilter, string $timezone, array $allowedOutlets, int $recentLimit, ?array $reportingSource = null): array
     {
         $outletSalesSummary = collect($allowedOutlets)
             ->map(fn (array $outlet) => [
@@ -665,6 +686,7 @@ class OwnerOverviewService
                 'timezone' => $timezone,
                 'outlet_scope_name' => (string) ($outletFilter['label'] ?? 'All Outlet'),
                 'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                'reporting_source' => $reportingSource,
             ],
             'metrics' => [
                 'gross_sales' => 0,

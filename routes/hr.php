@@ -33,11 +33,11 @@ Route::prefix('api/v1')->middleware(['api'])->group(function () {
         Route::prefix('human-resource')->middleware('permission:auth.me')->group(function () {
             Route::get('/dashboard', [HrDashboardController::class, 'index']);
             Route::get('/outlets', [HrOutletController::class, 'index']);
-            Route::post('/outlets', [HrOutletController::class, 'store']);
+            Route::post('/outlets', [HrOutletController::class, 'store'])->middleware('permission_or_snapshot:hr.outlet.create');
             Route::get('/outlets/{id}', [HrOutletController::class, 'show']);
-            Route::put('/outlets/{id}', [HrOutletController::class, 'update']);
-            Route::post('/outlets/{id}', [HrOutletController::class, 'update']);
-            Route::delete('/outlets/{id}', [HrOutletController::class, 'destroy']);
+            Route::put('/outlets/{id}', [HrOutletController::class, 'update'])->middleware('permission_or_snapshot:hr.outlet.update');
+            Route::post('/outlets/{id}', [HrOutletController::class, 'update'])->middleware('permission_or_snapshot:hr.outlet.update');
+            Route::delete('/outlets/{id}', [HrOutletController::class, 'destroy'])->middleware('permission_or_snapshot:hr.outlet.delete');
 
             Route::get('/master-data/options', [HrMasterDataController::class, 'options']);
             Route::get('/master-data', [HrMasterDataController::class, 'index']);
@@ -59,7 +59,16 @@ Route::prefix('api/v1')->middleware(['api'])->group(function () {
             Route::get('/squads/{id}', [HrSquadController::class, 'show']);
             Route::post('/squads/{id}', [HrSquadController::class, 'update']);
             Route::put('/squads/{id}', [HrSquadController::class, 'update']);
-            Route::delete('/squads/{id}', [HrSquadController::class, 'destroy']);
+            Route::delete('/squads/{id}', [HrSquadController::class, 'destroy'])->middleware('permission_or_snapshot:hr.squad.delete');
+
+
+            // HR ITERATION 01: modular extension point.
+            // Future HR iterations only add files under routes/hr_modules/*.php.
+            $hrModuleFiles = glob(base_path('routes/hr_modules/*.php')) ?: [];
+            sort($hrModuleFiles, SORT_NATURAL | SORT_FLAG_CASE);
+            foreach ($hrModuleFiles as $hrModuleFile) {
+                require $hrModuleFile;
+            }
         });
     });
 });

@@ -1,0 +1,5 @@
+<?php
+use App\Http\Controllers\Api\V1\Purchasing\ExecutionWorkflowController; use Illuminate\Support\Facades\Route;
+Route::prefix('api/v1/purchasing/execution/{kind}')->where(['kind'=>'goods-receipt|service-acceptance|reimburse-payment'])->middleware(['api','auth:sanctum','permission_or_snapshot:purchasing.goods_receipt.view,purchasing.service_acceptance.view,purchasing.reimburse_payment.view'])->group(function(){
+ Route::get('/catalogs',[ExecutionWorkflowController::class,'catalogs'])->name('purchasing.execution.catalogs'); Route::get('/',[ExecutionWorkflowController::class,'index'])->name('purchasing.execution.index'); Route::post('/',[ExecutionWorkflowController::class,'store'])->name('purchasing.execution.store'); Route::get('/{id}',[ExecutionWorkflowController::class,'show'])->name('purchasing.execution.show'); Route::put('/{id}',[ExecutionWorkflowController::class,'update'])->name('purchasing.execution.update'); Route::post('/{id}/post',[ExecutionWorkflowController::class,'post'])->name('purchasing.execution.post');
+});

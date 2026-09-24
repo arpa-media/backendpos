@@ -90,6 +90,44 @@ class DiscountSquadService
             ->exists();
     }
 
+    public function findCommittedRetrySale(
+        ?string $nisj,
+        ?string $periodKey,
+        ?string $outletId,
+        ?string $clientSyncId
+    ): ?Sale {
+        $normalizedNisj = $this->normalizeNisj($nisj);
+        $normalizedPeriod = trim((string) $periodKey);
+        $normalizedOutletId = trim((string) $outletId);
+        $normalizedClientSyncId = trim((string) $clientSyncId);
+
+        if ($normalizedNisj === '' || $normalizedPeriod === '' || $normalizedOutletId === '' || $normalizedClientSyncId === '') {
+            return null;
+        }
+
+        // This method is called from the checkout DB transaction only after the quota
+        // appears occupied. A locking read intentionally bypasses an older repeatable-read
+        // snapshot and waits for an overlapping first sync request to commit.
+        $usage = DiscountSquadUsage::query()
+            ->where('nisj', $normalizedNisj)
+            ->where('period_key', $normalizedPeriod)
+            ->lockForUpdate()
+            ->first();
+
+        if (! $usage) {
+            return null;
+        }
+
+        $sale = Sale::query()
+            ->whereKey((string) $usage->sale_id)
+            ->where('outlet_id', $normalizedOutletId)
+            ->where('client_sync_id', $normalizedClientSyncId)
+            ->lockForUpdate()
+            ->first();
+
+        return $sale?->load(['items', 'payments', 'customer', 'outlet']);
+    }
+
     public function quotaPayloadForUser(?User $user, ?string $periodKey = null): array
     {
         $period = $periodKey ?: $this->currentPeriodKey();

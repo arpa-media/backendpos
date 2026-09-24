@@ -19,6 +19,7 @@ final class UserManagementCatalog
             ['code' => 'owner-overview', 'name' => 'Owner Overview', 'description' => 'Portal owner overview', 'sort_order' => 100],
             ['code' => 'omzet-report', 'name' => 'Omzet Report', 'description' => 'Portal report omzet seluruh transaksi POS.', 'sort_order' => 110],
             ['code' => 'sales-report', 'name' => 'Sales Report', 'description' => 'Portal report transaksi dengan marking 1.', 'sort_order' => 120],
+            ['code' => 'report', 'name' => 'Report', 'description' => 'Portal report operasional.', 'sort_order' => 130],
         ];
     }
 
@@ -44,13 +45,28 @@ final class UserManagementCatalog
 
             ['portal_code' => 'operational', 'code' => 'operational-dashboard', 'name' => 'Dashboard', 'path' => '/portal/operational/dashboard', 'sort_order' => 10],
             ['portal_code' => 'operational', 'code' => 'operational-outlet', 'name' => 'Outlet', 'path' => '/settings/outlet', 'sort_order' => 20, 'permission_view' => 'outlet.view', 'permission_update' => 'outlet.update'],
+            ['portal_code' => 'operational', 'code' => 'operational-outlet-pin', 'name' => 'Outlet PIN', 'path' => '/operational/outlet-pin', 'sort_order' => 30, 'permission_view' => 'operational.outlet_pin.view', 'permission_update' => 'operational.outlet_pin.update'],
+            ['portal_code' => 'operational', 'code' => 'operational-sales-analytic-daily', 'name' => 'Daily Analytic', 'path' => '/operational/sales-analytic/daily', 'sort_order' => 40, 'permission_view' => 'operational.sales_analytic.daily.view'],
+            ['portal_code' => 'operational', 'code' => 'operational-sales-analytic-hourly', 'name' => 'Omzet Per Hour', 'path' => '/operational/sales-analytic/hourly', 'sort_order' => 50, 'permission_view' => 'operational.sales_analytic.hourly.view'],
+            ['portal_code' => 'operational', 'code' => 'operational-sales-analytic-hourly-summary', 'name' => 'Summary Per Hour', 'path' => '/operational/sales-analytic/hourly-summary', 'sort_order' => 60, 'permission_view' => 'operational.sales_analytic.hourly_summary.view'],
 
-            ['portal_code' => 'inventory', 'code' => 'inventory-dashboard', 'name' => 'Dashboard', 'path' => '/portal/inventory/dashboard', 'sort_order' => 10],
-            ['portal_code' => 'inventory', 'code' => 'inventory-check-stock', 'name' => 'Cek Stock', 'path' => '/check-stock', 'sort_order' => 20],
-            ['portal_code' => 'inventory', 'code' => 'inventory-request-stock', 'name' => 'Request Stock', 'path' => '/request-stock', 'sort_order' => 30],
+            ['portal_code' => 'inventory', 'code' => 'inventory-dashboard', 'name' => 'Dashboard Stock Inventory', 'path' => '/portal/inventory/dashboard', 'sort_order' => 10, 'permission_view' => 'stock_inventory.dashboard.view', 'permission_create' => 'stock_inventory.dashboard.create', 'permission_update' => 'stock_inventory.dashboard.update', 'permission_delete' => 'stock_inventory.dashboard.delete'],
+            ['portal_code' => 'inventory', 'code' => 'inventory-uom', 'name' => 'Unit of Measure', 'path' => '/stock-inventory/uoms', 'sort_order' => 20, 'permission_view' => 'stock_inventory.uom.view', 'permission_create' => 'stock_inventory.uom.create', 'permission_update' => 'stock_inventory.uom.update', 'permission_delete' => 'stock_inventory.uom.delete'],
+            ['portal_code' => 'inventory', 'code' => 'inventory-stock-category', 'name' => 'Stock Category', 'path' => '/stock-inventory/categories', 'sort_order' => 30, 'permission_view' => 'stock_inventory.category.view', 'permission_create' => 'stock_inventory.category.create', 'permission_update' => 'stock_inventory.category.update', 'permission_delete' => 'stock_inventory.category.delete'],
+            ['portal_code' => 'inventory', 'code' => 'inventory-sku', 'name' => 'Data SKU', 'path' => '/stock-inventory/skus', 'sort_order' => 40, 'permission_view' => 'stock_inventory.sku.view', 'permission_create' => 'stock_inventory.sku.create', 'permission_update' => 'stock_inventory.sku.update', 'permission_delete' => 'stock_inventory.sku.delete'],
+            ['portal_code' => 'inventory', 'code' => 'inventory-par-stock', 'name' => 'Par Stock', 'path' => '/stock-inventory/par-stocks', 'sort_order' => 50, 'permission_view' => 'stock_inventory.par_stock.view', 'permission_create' => 'stock_inventory.par_stock.create', 'permission_update' => 'stock_inventory.par_stock.update', 'permission_delete' => 'stock_inventory.par_stock.delete'],
+            ['portal_code' => 'inventory', 'code' => 'inventory-stock-opname', 'name' => 'Stock Opname', 'path' => '/stock-inventory/stock-opname', 'sort_order' => 60, 'permission_view' => 'stock_inventory.opname.view', 'permission_create' => 'stock_inventory.opname.create', 'permission_update' => 'stock_inventory.opname.update', 'permission_delete' => 'stock_inventory.opname.delete'],
+            ['portal_code' => 'inventory', 'code' => 'inventory-request-stock', 'name' => 'Request Stock', 'path' => '/stock-inventory/request-stock', 'sort_order' => 70, 'permission_view' => 'stock_inventory.request_stock.view', 'permission_create' => 'stock_inventory.request_stock.create', 'permission_update' => 'stock_inventory.request_stock.update', 'permission_delete' => 'stock_inventory.request_stock.delete'],
+            ['portal_code' => 'inventory', 'code' => 'inventory-cancellation-approval', 'name' => 'Cancellation Approval', 'path' => '/stock-inventory/cancellation-approval', 'sort_order' => 75, 'permission_view' => 'stock_inventory.cancellation_approval.view', 'permission_create' => 'stock_inventory.cancellation_approval.create', 'permission_update' => 'stock_inventory.cancellation_approval.update', 'permission_delete' => 'stock_inventory.cancellation_approval.delete'],
 
-            ['portal_code' => 'warehouse', 'code' => 'warehouse-dashboard', 'name' => 'Dashboard', 'path' => '/portal/warehouse/dashboard', 'sort_order' => 10],
-            ['portal_code' => 'warehouse', 'code' => 'warehouse-bill-of-material', 'name' => 'Bill of Material', 'path' => '/bill-of-material', 'sort_order' => 20],
+            ['portal_code' => 'warehouse', 'code' => 'warehouse-dashboard', 'name' => 'Dashboard HPP/COGS', 'path' => '/portal/warehouse/dashboard', 'sort_order' => 10, 'permission_view' => 'cogs.dashboard.view', 'permission_create' => 'cogs.dashboard.create', 'permission_update' => 'cogs.dashboard.update', 'permission_delete' => 'cogs.dashboard.delete'],
+            ['portal_code' => 'warehouse', 'code' => 'cogs-uom-conversion', 'name' => 'UOM Conversion', 'path' => '/cogs/uom-conversions', 'sort_order' => 20, 'permission_view' => 'cogs.uom_conversion.view', 'permission_create' => 'cogs.uom_conversion.create', 'permission_update' => 'cogs.uom_conversion.update', 'permission_delete' => 'cogs.uom_conversion.delete'],
+            ['portal_code' => 'warehouse', 'code' => 'cogs-ingredient-recipes', 'name' => 'Ingredient / Recipe', 'path' => '/cogs/ingredient-recipes', 'sort_order' => 30, 'permission_view' => 'cogs.ingredient.view', 'permission_create' => 'cogs.ingredient.create', 'permission_update' => 'cogs.ingredient.update', 'permission_delete' => 'cogs.ingredient.delete'],
+            ['portal_code' => 'warehouse', 'code' => 'cogs-history-stock', 'name' => 'History Stock', 'path' => '/cogs/history-stock', 'sort_order' => 40, 'permission_view' => 'cogs.history_stock.view', 'permission_create' => 'cogs.history_stock.create', 'permission_update' => 'cogs.history_stock.update', 'permission_delete' => 'cogs.history_stock.delete'],
+            ['portal_code' => 'warehouse', 'code' => 'cogs-item-sold', 'name' => 'Item Sold & Recipe Consumption', 'path' => '/cogs/item-sold', 'sort_order' => 50, 'permission_view' => 'cogs.item_sold.view', 'permission_create' => 'cogs.item_sold.create', 'permission_update' => 'cogs.item_sold.update', 'permission_delete' => 'cogs.item_sold.delete'],
+            ['portal_code' => 'warehouse', 'code' => 'cogs-stock-variance', 'name' => 'Stock Variance', 'path' => '/cogs/stock-variance', 'sort_order' => 60, 'permission_view' => 'cogs.stock_variance.view', 'permission_create' => 'cogs.stock_variance.create', 'permission_update' => 'cogs.stock_variance.update', 'permission_delete' => 'cogs.stock_variance.delete'],
+            ['portal_code' => 'warehouse', 'code' => 'cogs-calculation', 'name' => 'COGS Calculation & Reconciliation', 'path' => '/cogs/calculation', 'sort_order' => 70, 'permission_view' => 'cogs.calculation.view', 'permission_create' => 'cogs.calculation.create', 'permission_update' => 'cogs.calculation.update', 'permission_delete' => 'cogs.calculation.delete'],
+            ['portal_code' => 'warehouse', 'code' => 'cogs-reset', 'name' => 'Reset COGS', 'path' => '/cogs/reset', 'sort_order' => 80, 'permission_view' => 'cogs.reset.view', 'permission_create' => 'cogs.reset.create', 'permission_update' => 'cogs.reset.update', 'permission_delete' => 'cogs.reset.delete'],
 
             ['portal_code' => 'finance', 'code' => 'finance-dashboard', 'name' => 'Dashboard', 'path' => '/portal/finance/dashboard', 'sort_order' => 10],
             ['portal_code' => 'finance', 'code' => 'finance-overview', 'name' => 'Overview Finance', 'path' => '/finance/overview', 'sort_order' => 14, 'permission_view' => 'report.view'],
@@ -61,6 +77,7 @@ final class UserManagementCatalog
             ['portal_code' => 'finance', 'code' => 'sales-list', 'name' => 'Sales', 'path' => '/sales', 'sort_order' => 20, 'permission_view' => 'sale.view'],
             ['portal_code' => 'finance', 'code' => 'sales-report', 'name' => 'Report', 'path' => '/reports', 'sort_order' => 30, 'permission_view' => 'report.view'],
             ['portal_code' => 'finance', 'code' => 'finance-cashier-report', 'name' => 'Cashier Report', 'path' => '/finance/cashier-report', 'sort_order' => 35, 'permission_view' => 'report.view'],
+            ['portal_code' => 'finance', 'code' => 'finance-i08-expense-report', 'name' => 'Expense Report', 'path' => '/finance/expense-report', 'sort_order' => 260, 'permission_view' => 'finance.expense_report.view', 'permission_update' => 'finance.expense_report.post'],
             ['portal_code' => 'finance', 'code' => 'sales-cancel', 'name' => 'Cancel Bill', 'path' => '/cancel-requests', 'sort_order' => 40, 'permission_view' => 'sale.cancel.approve', 'permission_create' => 'sale.cancel.request', 'permission_update' => 'sale.cancel.approve', 'permission_delete' => 'sale.cancel.approve'],
             ['portal_code' => 'bank', 'code' => 'bank-dashboard', 'name' => 'Dashboard', 'path' => '/portal/bank/dashboard', 'sort_order' => 10],
             ['portal_code' => 'purchasing', 'code' => 'purchasing-dashboard', 'name' => 'Dashboard', 'path' => '/portal/purchasing/dashboard', 'sort_order' => 10],
@@ -75,6 +92,11 @@ final class UserManagementCatalog
             ['portal_code' => 'sales-report', 'code' => 'sales-report-dashboard', 'name' => 'Dashboard', 'path' => '/sales-report/dashboard', 'sort_order' => 10, 'permission_view' => 'dashboard.view'],
             ['portal_code' => 'sales-report', 'code' => 'sales-report-sales', 'name' => 'Sales', 'path' => '/sales-report/sales', 'sort_order' => 20, 'permission_view' => 'sale.view'],
             ['portal_code' => 'sales-report', 'code' => 'sales-report-report', 'name' => 'Report', 'path' => '/sales-report/report', 'sort_order' => 30, 'permission_view' => 'report.view'],
+
+            ['portal_code' => 'report', 'code' => 'report-overhandle', 'name' => 'Overhandle', 'path' => '/report/overhandle', 'sort_order' => 10, 'permission_view' => 'report.overhandle.view', 'permission_create' => 'report.overhandle.create', 'permission_update' => 'report.overhandle.update', 'permission_delete' => 'report.overhandle.delete'],
+            ['portal_code' => 'report', 'code' => 'report-kpi-squad', 'name' => 'KPI Squad', 'path' => '/report/kpi-squad', 'sort_order' => 30, 'permission_view' => 'hr.kpi.squad.view', 'permission_create' => 'hr.kpi.squad.input', 'permission_update' => 'hr.kpi.squad.update', 'permission_delete' => 'hr.kpi.squad.reopen'],
+            ['portal_code' => 'report', 'code' => 'report-expense-request', 'name' => 'Petty Cash', 'path' => '/report/expense-request', 'sort_order' => 40, 'permission_view' => 'report.expense_request.view', 'permission_create' => 'report.expense_request.create', 'permission_update' => 'report.expense_request.update', 'permission_delete' => 'report.expense_request.delete'],
+            ['portal_code' => 'report', 'code' => 'report-fund-requests', 'name' => 'Pengajuan Dana', 'path' => '/report/fund-requests', 'sort_order' => 50, 'permission_view' => 'purchasing.fund_request.view', 'permission_create' => 'purchasing.fund_request.create', 'permission_update' => 'purchasing.fund_request.update', 'permission_delete' => 'purchasing.fund_request.delete'],
         ];
     }
 
@@ -99,6 +121,13 @@ final class UserManagementCatalog
         $permissions[] = 'sale.cancel.request';
         $permissions[] = 'sale.cancel.view';
         $permissions[] = 'sale.cancel.approve';
+        $permissions[] = 'finance.expense_report.view';
+        $permissions[] = 'finance.expense_report.post';
+        $permissions[] = 'operational.outlet_pin.view';
+        $permissions[] = 'operational.outlet_pin.update';
+        $permissions[] = 'operational.sales_analytic.daily.view';
+        $permissions[] = 'operational.sales_analytic.hourly.view';
+        $permissions[] = 'operational.sales_analytic.hourly_summary.view';
 
         return array_values(array_unique($permissions));
     }

@@ -1,0 +1,7 @@
+<?php
+use App\Http\Controllers\Api\V1\Warehouse\Logistics\WarehouseSalesLogisticsController as C; use App\Http\Middleware\ResolveWarehouseScope; use Illuminate\Support\Facades\Route;
+Route::prefix('api/v1/warehouse/logistics')->middleware(['api','auth:sanctum',ResolveWarehouseScope::class])->group(function():void{
+ Route::get('/sales-deliveries',[C::class,'index'])->middleware('permission_or_snapshot:warehouse.logistics.delivery.view'); Route::get('/sales-deliveries/{id}',[C::class,'show'])->middleware('permission_or_snapshot:warehouse.logistics.delivery.view');
+ Route::post('/sales-deliveries',[C::class,'createDelivery'])->middleware('permission_or_snapshot:warehouse.logistics.delivery.create'); Route::post('/sales-deliveries/{id}/dispatch',[C::class,'dispatch'])->middleware('permission_or_snapshot:warehouse.logistics.delivery.dispatch'); Route::post('/sales-deliveries/{id}/goods-receipt',[C::class,'createReceipt'])->middleware('permission_or_snapshot:warehouse.logistics.delivery.receive'); Route::post('/sales-goods-receipts/{id}/complete',[C::class,'completeReceipt'])->middleware('permission_or_snapshot:warehouse.logistics.delivery.receive');
+ Route::get('/sales-returns',[C::class,'returns'])->middleware('permission_or_snapshot:warehouse.logistics.return.view'); Route::post('/sales-goods-receipts/{id}/returns',[C::class,'createReturn'])->middleware('permission_or_snapshot:warehouse.logistics.return.create');
+});

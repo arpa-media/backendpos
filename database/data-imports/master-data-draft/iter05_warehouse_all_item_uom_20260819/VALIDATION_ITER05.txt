@@ -1,0 +1,20 @@
+ITERATION 05 VALIDATION REPORT
+Generated: 2026-08-19
+
+Source SKU rows: 884
+Unique SKU: 884
+Generated mapping rows: 1768
+Purchase rows: 884
+Base rows: 884
+Duplicate sku_code+uom_code: 0
+Invalid purchase-default counts: 0
+Validation errors: 0
+Formula errors: 0
+
+Base distribution:
+GR=840
+ML=29
+PCS=15
+
+Expected import sheet: SKU UOM
+Expected columns: sku_code, sku_name, base_uom_code, uom_code, uom_name, conversion_factor_hpp, conversion_path, adopt, is_purchase_default, is_request_enabled, is_active

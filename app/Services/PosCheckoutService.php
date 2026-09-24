@@ -976,6 +976,19 @@ class PosCheckoutService
 
                 $selectedSquadPeriodKey = $discountSquadService->periodKeyForMoment($transactionAtTz, $outletTimezone);
                 if (!$discountSquadService->isAvailableForNisj((string) $selectedSquadUser->nisj, $selectedSquadPeriodKey)) {
+                    $retrySale = $discountSquadService->findCommittedRetrySale(
+                        (string) $selectedSquadUser->nisj,
+                        $selectedSquadPeriodKey,
+                        $outletId,
+                        $clientSyncId
+                    );
+
+                    if ($retrySale) {
+                        $checkoutReturnedExisting = true;
+
+                        return $retrySale;
+                    }
+
                     throw ValidationException::withMessages([
                         'discount_squad_nisj' => ['Jatah discount squad untuk NISJ tersebut sudah terpakai hari ini.'],
                     ]);

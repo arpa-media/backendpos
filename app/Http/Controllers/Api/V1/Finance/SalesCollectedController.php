@@ -7,22 +7,22 @@ use App\Http\Requests\Api\V1\Finance\ListSalesCollectedRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Models\Sale;
-use App\Services\CashierAlignedSaleScopeService;
-use App\Services\ReportSaleScopeCacheService;
+use App\Services\ReportDailySummaryService;
 use App\Support\FinanceOutletFilter;
 use App\Support\AnalyticsResponseCache;
 use App\Support\DeliveryNoTaxReadModel;
 use App\Support\TransactionDate;
 use Throwable;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 class SalesCollectedController extends Controller
 {
 
     public function __construct(
-        private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
-        private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
+        private readonly ReportDailySummaryService $dailySummaryService,
     ) {
     }
 
@@ -45,37 +45,20 @@ class SalesCollectedController extends Controller
     public function detail(ListSalesCollectedRequest $request, string $saleId)
     {
         $v = $request->validated();
-        @ini_set('max_execution_time', '240');
-        @set_time_limit(240);
+        @ini_set('max_execution_time', '120');
+        @set_time_limit(120);
 
         $payload = AnalyticsResponseCache::remember(
-            'finance-sales-collected.detail',
+            'finance-sales-collected.detail.v8i02',
             array_merge($v, ['sale_id' => $saleId]),
             function () use ($request, $saleId, $v) {
                 $outletFilter = $this->resolveOutletFilter($v);
                 $timezone = $outletFilter['timezone'];
                 $outletIds = $outletFilter['outlet_ids'];
+                $window = $this->resolveLocalDateRange($v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
 
-                $window = $this->resolveLocalDateRange(
-                    $v['date_from'] ?? null,
-                    $v['date_to'] ?? null,
-                    $timezone
-                );
-
-                $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
-                if (!($saleScope['has_rows'] ?? false)) {
-                    return [
-                        '_error' => true,
-                        'message' => 'Transaksi tidak ditemukan pada filter Sales Collected ini.',
-                        'error_code' => 'SALES_COLLECTED_SALE_NOT_FOUND',
-                        'status' => 404,
-                    ];
-                }
-
-                $visible = DB::table('report_sale_scope_cache as rssc')
-                    ->where('rssc.scope_key', (string) $saleScope['scope_key'])
-                    ->where('rssc.sale_id', $saleId)
-                    ->where('rssc.expires_at', '>', now())
+                $visible = $this->canonicalSalesQuery($outletIds, $v, $timezone)
+                    ->where('s.id', $saleId)
                     ->exists();
 
                 if (!$visible) {
@@ -111,6 +94,7 @@ class SalesCollectedController extends Controller
                         'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                         'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                         'timezone' => $timezone,
+                        'query_strategy' => 'report_sale_business_dates',
                     ],
                 ];
             },
@@ -243,83 +227,62 @@ class SalesCollectedController extends Controller
     {
         $v = $request->validated();
 
-        return $this->okCached($request, 'finance-sales-collected.index', $v, function () use ($request, $v) {
-        $perPage = (int) ($v['per_page'] ?? 15);
-        $page = max(1, (int) ($v['page'] ?? 1));
-        $sort = (string) ($v['sort'] ?? 'date');
-        $dir = strtolower((string) ($v['dir'] ?? 'desc')) === 'asc' ? 'asc' : 'desc';
-        $isExport = $this->toBool($v['export'] ?? false);
-        $includeItems = $isExport || $this->toBool($v['include_items'] ?? false);
-        $includeFilterOptions = $isExport || $this->toBool($v['include_filter_options'] ?? true);
+        return $this->okCached($request, 'finance-sales-collected.index.v8i02', $v, function () use ($v) {
+            $perPage = max(1, min(200, (int) ($v['per_page'] ?? 15)));
+            $page = max(1, (int) ($v['page'] ?? 1));
+            $sort = (string) ($v['sort'] ?? 'date');
+            $dir = strtolower((string) ($v['dir'] ?? 'desc')) === 'asc' ? 'asc' : 'desc';
+            $isExport = $this->toBool($v['export'] ?? false);
+            $includeItems = $this->toBool($v['include_items'] ?? false);
+            $includeFilterOptions = $this->toBool($v['include_filter_options'] ?? true);
 
-        $outletFilter = $this->resolveOutletFilter($v);
-        $timezone = $outletFilter['timezone'];
-        $outletIds = $outletFilter['outlet_ids'];
+            $outletFilter = $this->resolveOutletFilter($v);
+            $timezone = $outletFilter['timezone'];
+            $outletIds = $outletFilter['outlet_ids'];
+            $window = $this->resolveLocalDateRange($v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
+            [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
 
-        $window = $this->resolveLocalDateRange(
-            $v['date_from'] ?? null,
-            $v['date_to'] ?? null,
-            $timezone
-        );
-        [$fromLocal, $toLocal] = [$window['requested_from'], $window['requested_to']];
+            $baseQuery = $this->canonicalSalesQuery($outletIds, $v, $timezone);
+            $summary = $this->resolveSummary($outletIds, $v, $timezone, $baseQuery);
 
-        $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
+            $channelOptions = [];
+            $paymentOptions = [];
+            if ($includeFilterOptions) {
+                $channelOptions = $this->resolveChannelOptions($outletIds, $v, $timezone);
+                $paymentOptions = $this->resolvePaymentMethodOptions($outletIds, $v, $timezone);
+            }
 
-        $summary = ($saleScope['has_rows'] ?? false)
-            ? (clone $this->buildBaseQuery($outletIds, $saleScope, $v, $timezone, true, true, false))
-                ->selectRaw('COALESCE(SUM(s.subtotal), 0) as total_gross_sales')
-                ->selectRaw('COALESCE(SUM(s.discount_total), 0) as total_discount')
-                ->selectRaw('COALESCE(SUM(GREATEST(s.subtotal - s.discount_total, 0)), 0) as total_net_sales')
-                ->selectRaw('COALESCE(SUM(COALESCE(s.tax_total, 0)), 0) as total_tax')
-                ->selectRaw('COALESCE(SUM(COALESCE(s.grand_total, 0)), 0) as total_collected')
-                ->first()
-            : (object) [
-                'total_gross_sales' => 0,
-                'total_discount' => 0,
-                'total_net_sales' => 0,
-                'total_tax' => 0,
-                'total_collected' => 0,
-            ];
+            $rowsQuery = clone $baseQuery;
+            $rowsQuery
+                ->join('outlets as o', 'o.id', '=', 's.outlet_id')
+                ->select([
+                    's.id',
+                    's.sale_number',
+                    's.outlet_id',
+                    'o.name as outlet_name',
+                    'o.timezone as outlet_timezone',
+                    's.created_at',
+                    's.subtotal',
+                    's.discount_total',
+                    's.payment_method_type',
+                    's.payment_method_name',
+                    's.channel',
+                    's.online_order_source',
+                    's.tax_total',
+                    's.rounding_total',
+                    's.grand_total',
+                    's.paid_total',
+                    's.cashier_name',
+                ])
+                ->selectRaw('GREATEST(COALESCE(s.subtotal, 0) - COALESCE(s.discount_total, 0), 0) as net_sales');
 
-        $channelOptions = [];
-        $paymentOptions = [];
-        if ($includeFilterOptions && ($saleScope['has_rows'] ?? false)) {
-            $channelOptions = $this->resolveChannelOptions($outletIds, $saleScope, $v, $timezone);
-            $paymentOptions = $this->resolvePaymentMethodOptions($outletIds, $saleScope, $v, $timezone);
-        }
+            $this->applySorting($rowsQuery, $sort, $dir);
 
-        $rowsQuery = $this->buildBaseQuery($outletIds, $saleScope, $v, $timezone, true, true, true)
-            ->select([
-                's.id',
-                's.sale_number',
-                's.outlet_id',
-                'o.name as outlet_name',
-                'o.timezone as outlet_timezone',
-                's.created_at',
-                's.subtotal',
-                's.discount_total',
-                's.payment_method_type',
-                's.tax_total',
-                's.rounding_total',
-                's.grand_total',
-                's.paid_total',
-                's.cashier_name',
-            ])
-            ->selectRaw('GREATEST(COALESCE(s.subtotal, 0) - COALESCE(s.discount_total, 0), 0) as net_sales')
-            ->selectRaw('COALESCE(s.tax_total, 0) as tax_total_cashier')
-            ->selectRaw('COALESCE(s.rounding_total, 0) as rounding_total_cashier')
-            ->selectRaw('COALESCE(s.grand_total, 0) as grand_total_cashier')
-            ->selectRaw('COALESCE(s.grand_total, 0) as total_collected')
-            ->selectRaw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel")
-            ->selectRaw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display");
-
-        $this->applySorting($rowsQuery, $sort, $dir);
-
-        $paginationPayload = null;
-        if ($isExport) {
-            $rows = $rowsQuery->get();
-        } else {
-            $paginator = $rowsQuery->paginate($perPage, ['*'], 'page', $page)->withQueryString();
+            // V8 I02 contract: even export reads are paged. The frontend iterates
+            // pages, so a 1-year export never hydrates the whole period in one PHP request.
+            $knownTotal = max(0, (int) ($summary->transaction_count ?? 0));
+            $pageRows = (clone $rowsQuery)->forPage($page, $perPage)->get();
+            $paginator = new LengthAwarePaginator($pageRows, $knownTotal, $perPage, $page);
             $rows = collect($paginator->items());
             $paginationPayload = [
                 'current_page' => $paginator->currentPage(),
@@ -329,112 +292,108 @@ class SalesCollectedController extends Controller
                 'from' => $paginator->firstItem(),
                 'to' => $paginator->lastItem(),
             ];
-        }
 
-        $saleIds = $rows->pluck('id')->filter()->map(fn ($id) => (string) $id)->values()->all();
-        $itemsMap = $includeItems ? $this->resolveItemsTextBySaleIds($saleIds) : [];
+            $saleIds = $rows->pluck('id')->filter()->map(fn ($id) => (string) $id)->values()->all();
+            $paymentMap = $this->resolvePaymentDisplayBySaleIds($saleIds);
+            $mixedChannelMap = $this->resolveMixedChannelDisplayBySaleIds($saleIds);
+            $itemsMap = $includeItems ? $this->resolveItemsTextBySaleIds($saleIds) : [];
 
-        $items = $rows->map(function ($row) use ($itemsMap, $includeItems) {
-            $transactionTimezone = $row->outlet_timezone ?: config('app.timezone', 'Asia/Jakarta');
-            $saleNumber = (string) ($row->sale_number ?? '');
-            $date = TransactionDate::formatSaleLocal($row->created_at, $transactionTimezone, $saleNumber, 'Y-m-d');
-            $time = TransactionDate::formatSaleLocal($row->created_at, $transactionTimezone, $saleNumber, 'H:i:s');
-            $createdAt = TransactionDate::toSaleIso($row->created_at, $transactionTimezone, $saleNumber);
+            $items = $rows->map(function ($row) use ($paymentMap, $mixedChannelMap, $itemsMap, $includeItems) {
+                $transactionTimezone = $row->outlet_timezone ?: config('app.timezone', 'Asia/Jakarta');
+                $saleNumber = (string) ($row->sale_number ?? '');
+                $date = TransactionDate::formatSaleLocal($row->created_at, $transactionTimezone, $saleNumber, 'Y-m-d');
+                $time = TransactionDate::formatSaleLocal($row->created_at, $transactionTimezone, $saleNumber, 'H:i:s');
+                $createdAt = TransactionDate::toSaleIso($row->created_at, $transactionTimezone, $saleNumber);
+                $saleId = (string) $row->id;
 
-            return [
-                'id' => (string) $row->id,
-                'sale_id' => (string) $row->id,
-                'sale_number' => $saleNumber,
-                'sale_number_short' => mb_substr($saleNumber, -8),
-                'outlet' => (string) ($row->outlet_name ?? '-'),
-                'date' => $date,
-                'time' => $time,
-                'created_at' => $createdAt,
-                'gross_sales' => (int) ($row->subtotal ?? 0),
-                'discount' => (int) ($row->discount_total ?? 0),
-                'net_sales' => (int) ($row->net_sales ?? 0),
-                'tax' => (int) ($row->tax_total_cashier ?? $row->tax_total ?? 0),
-                'total_collected' => (int) ($row->total_collected ?? $row->grand_total_cashier ?? $row->grand_total ?? 0),
-                'rounding_total' => (int) ($row->rounding_total_cashier ?? $row->rounding_total ?? 0),
-                'grand_total' => (int) ($row->grand_total_cashier ?? $row->grand_total ?? 0),
-                'paid_total' => (int) ($row->paid_total ?? $row->grand_total_cashier ?? $row->grand_total ?? 0),
-                'collected_by' => (string) ($row->cashier_name ?? '-'),
-                'items' => $includeItems ? ($itemsMap[(string) $row->id] ?? '-') : '',
-                'channel' => (string) ($row->display_channel ?? '-'),
-                'payment_method' => (string) ($row->payment_method_display ?? '-'),
+                $displayChannel = $this->displayChannelForRow($row, $mixedChannelMap[$saleId] ?? null);
+                $paymentDisplay = $paymentMap[$saleId]
+                    ?? (trim((string) ($row->payment_method_name ?? '')) !== '' ? (string) $row->payment_method_name : '-');
+
+                return [
+                    'id' => $saleId,
+                    'sale_id' => $saleId,
+                    'sale_number' => $saleNumber,
+                    'sale_number_short' => mb_substr($saleNumber, -8),
+                    'outlet' => (string) ($row->outlet_name ?? '-'),
+                    'date' => $date,
+                    'time' => $time,
+                    'created_at' => $createdAt,
+                    'gross_sales' => (int) ($row->subtotal ?? 0),
+                    'discount' => (int) ($row->discount_total ?? 0),
+                    'net_sales' => (int) ($row->net_sales ?? 0),
+                    'tax' => (int) ($row->tax_total ?? 0),
+                    'total_collected' => (int) ($row->grand_total ?? 0),
+                    'rounding_total' => (int) ($row->rounding_total ?? 0),
+                    'grand_total' => (int) ($row->grand_total ?? 0),
+                    'paid_total' => (int) ($row->paid_total ?? $row->grand_total ?? 0),
+                    'collected_by' => (string) ($row->cashier_name ?? '-'),
+                    'items' => $includeItems ? ($itemsMap[$saleId] ?? '-') : '',
+                    'channel' => $displayChannel,
+                    'payment_method' => $paymentDisplay,
+                ];
+            })->values();
+
+            $summaryPayload = [
+                'transaction_count' => (int) ($summary->transaction_count ?? 0),
+                'gross_sales' => (int) ($summary->total_gross_sales ?? 0),
+                'discount' => (int) ($summary->total_discount ?? 0),
+                'net_sales' => (int) ($summary->total_net_sales ?? 0),
+                'tax' => (int) ($summary->total_tax ?? 0),
+                'total_collected' => (int) ($summary->total_collected ?? 0),
             ];
-        })->values();
 
-        $summaryPayload = [
-            'gross_sales' => (int) ($summary->total_gross_sales ?? 0),
-            'discount' => (int) ($summary->total_discount ?? 0),
-            'net_sales' => (int) ($summary->total_net_sales ?? 0),
-            'tax' => (int) ($summary->total_tax ?? 0),
-            'total_collected' => (int) ($summary->total_collected ?? 0),
-        ];
+            $filterPayload = [
+                'date_from' => $fromLocal->format('Y-m-d'),
+                'date_to' => $toLocal->format('Y-m-d'),
+                'channels' => $channelOptions,
+                'payment_methods' => $paymentOptions,
+                'selected_channel' => (string) ($v['channel'] ?? ''),
+                'selected_payment_method' => (string) ($v['payment_method_name'] ?? ''),
+                'search' => (string) ($v['q'] ?? ''),
+                'outlet_filter' => (string) $outletFilter['value'],
+            ];
 
-        $filterPayload = [
-            'date_from' => $fromLocal->format('Y-m-d'),
-            'date_to' => $toLocal->format('Y-m-d'),
-            'channels' => $channelOptions,
-            'payment_methods' => $paymentOptions,
-            'selected_channel' => (string) ($v['channel'] ?? ''),
-            'selected_payment_method' => (string) ($v['payment_method_name'] ?? ''),
-            'search' => (string) ($v['q'] ?? ''),
-            'outlet_filter' => (string) $outletFilter['value'],
-        ];
-
-        $metaPayload = [
-            'timezone' => $timezone,
-            'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
-            'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
-            'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
-            'outlet_scope_id' => $outletFilter['value'],
-            'outlet_scope_name' => $outletFilter['label'],
-            'sort' => $sort,
-            'dir' => $dir,
-            'items_loaded' => $includeItems,
-            'filter_options_loaded' => $includeFilterOptions,
-            'performance_notes' => [
-                'list_mode' => $includeItems ? 'full' : 'lite',
-                'filter_options' => $includeFilterOptions ? 'loaded' : 'deferred',
-                'items_endpoint' => '/finance/sales-collected/items',
-                'scope_cache_strategy' => 'exact_cashier_sale_ids_materialized',
-            ],
-        ];
-
-        $payload = [
-            'items' => $items,
-            'summary' => $summaryPayload,
-            'filters' => $filterPayload,
-            'meta' => $metaPayload,
-        ];
-
-        if (!$isExport) {
-            $payload['pagination'] = $paginationPayload;
-        } else {
-            $payload['export'] = [
-                'filename' => $this->buildExportFilename($metaPayload['outlet_scope_name'], $filterPayload['date_from'], $filterPayload['date_to']),
-                'columns' => [
-                    'Sale Number (8 digit terakhir)',
-                    'Outlet',
-                    'Date',
-                    'Time',
-                    'Gross Sales',
-                    'Discount',
-                    'Net Sales',
-                    'Tax',
-                    'Total Collected',
-                    'Collected by',
-                    'Items',
-                    'Channel',
-                    'Payment Method',
+            $metaPayload = [
+                'timezone' => $timezone,
+                'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
+                'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
+                'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                'outlet_scope_id' => $outletFilter['value'],
+                'outlet_scope_name' => $outletFilter['label'],
+                'sort' => $sort,
+                'dir' => $dir,
+                'items_loaded' => $includeItems,
+                'filter_options_loaded' => $includeFilterOptions,
+                'performance_notes' => [
+                    'range_scope' => 'report_sale_business_dates_direct',
+                    'summary_source' => $this->canUseMaterializedSummary($v) && $this->hasCompleteDailySummaryCoverage($outletIds, $v, $timezone)
+                        ? 'report_daily_sales_summaries'
+                        : 'canonical_filtered_sales',
+                    'row_decoration_scope' => 'current_page_sale_ids_only',
+                    'filter_options_source' => 'report_daily_channel/payment_summaries',
+                    'export_mode' => 'paged_200_rows_max_per_request',
                 ],
-                'total_rows' => $items->count(),
             ];
-        }
 
-        return $payload;
+            $payload = [
+                'items' => $items,
+                'summary' => $summaryPayload,
+                'filters' => $filterPayload,
+                'meta' => $metaPayload,
+                'pagination' => $paginationPayload,
+            ];
+
+            if ($isExport) {
+                $payload['export'] = [
+                    'filename' => $this->buildExportFilename($metaPayload['outlet_scope_name'], $filterPayload['date_from'], $filterPayload['date_to']),
+                    'paged' => true,
+                    'total_rows' => $paginationPayload['total'],
+                    'current_page_rows' => $items->count(),
+                ];
+            }
+
+            return $payload;
         });
     }
 
@@ -450,17 +409,8 @@ class SalesCollectedController extends Controller
         $timezone = $outletFilter['timezone'];
         $outletIds = $outletFilter['outlet_ids'];
 
-        $saleScope = $this->resolveEligibleSalesScope($outletIds, $v, $timezone);
-
-        if (!($saleScope['has_rows'] ?? false)) {
-            return ApiResponse::ok([
-                'items_map' => [],
-            ], 'OK');
-        }
-
-        $visibleSaleIds = $this->buildBaseQuery($outletIds, $saleScope, $v, $timezone, true, true, false)
+        $visibleSaleIds = $this->canonicalSalesQuery($outletIds, $v, $timezone)
             ->whereIn('s.id', $saleIds)
-            ->select('s.id')
             ->pluck('s.id')
             ->map(fn ($id) => (string) $id)
             ->values()
@@ -486,83 +436,104 @@ class SalesCollectedController extends Controller
         return filter_var($value, FILTER_VALIDATE_BOOLEAN);
     }
 
-    private function resolveEligibleSalesScope(array $outletIds, array $filters, string $timezone): array
+    private function canonicalSalesQuery(array $outletIds, array $filters, string $timezone): Builder
     {
-        return $this->reportSaleScopeCache->remember(
-            'sales_collected_cashier_aligned',
-            [
-                'outlet_ids' => array_values(array_unique(array_map('strval', $outletIds))),
-                'date_from' => $filters['date_from'] ?? null,
-                'date_to' => $filters['date_to'] ?? null,
-                'timezone' => $timezone,
-            ],
-            fn () => $this->cashierAlignedSaleScope->eligibleSaleIds(
-                $outletIds,
-                $filters['date_from'] ?? null,
-                $filters['date_to'] ?? null,
-                $timezone
-            )
+        $window = $this->resolveLocalDateRange(
+            $filters['date_from'] ?? null,
+            $filters['date_to'] ?? null,
+            $timezone
         );
-    }
 
-    private function scopeSalesSubquery(string $scopeKey): Builder
-    {
-        return $this->reportSaleScopeCache->subquery($scopeKey);
-    }
-
-    private function buildBaseQuery(array $outletIds, array $saleScope, array $filters, string $timezone, bool $applyChannelFilter = true, bool $applyPaymentFilter = true, bool $includeDecorations = true): Builder
-    {
-        $needsChannelJoin = $includeDecorations || ($applyChannelFilter && !empty($filters['channel']));
-        $needsPaymentJoin = $includeDecorations;
-
-        $query = DB::table('sales as s')
-            ->join('report_sale_scope_cache as rssc', function ($join) use ($saleScope) {
-                $join->on('rssc.sale_id', '=', 's.id')
-                    ->where('rssc.scope_key', '=', (string) ($saleScope['scope_key'] ?? ''))
-                    ->where('rssc.expires_at', '>', now());
-            })
-            ->join('outlets as o', 'o.id', '=', 's.outlet_id')
+        $query = DB::table('report_sale_business_dates as rsbd')
+            ->join('sales as s', 's.id', '=', 'rsbd.sale_id')
+            ->whereBetween('rsbd.business_date', [
+                $window['requested_from']->format('Y-m-d'),
+                $window['requested_to']->format('Y-m-d'),
+            ])
             ->whereNull('s.deleted_at')
             ->where('s.status', 'PAID')
-            ->when(!empty($outletIds), fn ($q) => $q->whereIn('s.outlet_id', $outletIds));
-
-        if ($needsPaymentJoin) {
-            $query->leftJoinSub($this->paymentSummarySubquery((string) ($saleScope['scope_key'] ?? '')), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'));
-        }
-
-        if ($needsChannelJoin) {
-            $query->leftJoinSub($this->channelMapSubquery((string) ($saleScope['scope_key'] ?? '')), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'));
-        }
+            ->when(!empty($outletIds), fn ($q) => $q->whereIn('rsbd.outlet_id', $outletIds));
 
         $this->applySaleNumberFilter($query, (string) ($filters['q'] ?? ''));
 
-        if ($applyChannelFilter && !empty($filters['channel'])) {
-            $channel = trim((string) $filters['channel']);
-            $this->applyChannelFilter($query, $channel);
+        if (!empty($filters['channel'])) {
+            $this->applyChannelFilter($query, trim((string) $filters['channel']));
         }
 
-        if ($applyPaymentFilter && !empty($filters['payment_method_name'])) {
-            $paymentMethod = trim((string) ($filters['payment_method_name'] ?? ''));
-            $query->where(function ($inner) use ($paymentMethod) {
-                $inner->where('s.payment_method_name', $paymentMethod)
-                    ->orWhereExists(function ($exists) use ($paymentMethod) {
-                        $exists->selectRaw('1')
-                            ->from('sale_payments as sp')
-                            ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
-                            ->whereColumn('sp.sale_id', 's.id')
-                            ->where('pm.name', $paymentMethod);
-                    });
-            });
+        if (!empty($filters['payment_method_name'])) {
+            $this->applyPaymentMethodFilter($query, trim((string) $filters['payment_method_name']));
         }
 
         return $query;
     }
 
-    private function buildFilteredSalesIdSubquery(array $outletIds, array $saleScope, array $filters, string $timezone, bool $applyChannelFilter = true, bool $applyPaymentFilter = true): Builder
+    private function hasCompleteDailySummaryCoverage(array $outletIds, array $filters, string $timezone): bool
     {
-        return $this->buildBaseQuery($outletIds, $saleScope, $filters, $timezone, $applyChannelFilter, $applyPaymentFilter, false)
-            ->select('s.id')
-            ->distinct();
+        $outletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        if ($outletIds === []) {
+            return false;
+        }
+
+        $window = $this->resolveLocalDateRange($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
+        $from = $window['requested_from'];
+        $to = $window['requested_to'];
+        $expectedRows = count($outletIds) * ($from->diffInDays($to) + 1);
+
+        sort($outletIds);
+        $cacheKey = 'sales-collected:daily-coverage-ready:v8i02:' . sha1(json_encode([
+            'outlets' => $outletIds,
+            'date_from' => $from->format('Y-m-d'),
+            'date_to' => $to->format('Y-m-d'),
+        ], JSON_UNESCAPED_SLASHES));
+
+        return (bool) Cache::remember($cacheKey, now()->addSeconds(60), function () use ($outletIds, $from, $to, $expectedRows) {
+            return DB::table('report_daily_summary_coverage')
+                ->whereIn('outlet_id', $outletIds)
+                ->whereBetween('business_date', [$from->format('Y-m-d'), $to->format('Y-m-d')])
+                ->count() >= $expectedRows;
+        });
+    }
+
+    private function canUseMaterializedSummary(array $filters): bool
+    {
+        return trim((string) ($filters['q'] ?? '')) === ''
+            && trim((string) ($filters['channel'] ?? '')) === ''
+            && trim((string) ($filters['payment_method_name'] ?? '')) === '';
+    }
+
+    private function resolveSummary(array $outletIds, array $filters, string $timezone, Builder $filteredBase): object
+    {
+        if ($outletIds !== [] && $this->canUseMaterializedSummary($filters) && $this->hasCompleteDailySummaryCoverage($outletIds, $filters, $timezone)) {
+            // I01 warm/scheduler owns materialization. I02 intentionally only reads
+            // the fact table here so a browser request never becomes a 370-day backfill worker.
+            $window = $this->resolveLocalDateRange($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
+            $row = $this->dailySummaryService
+                ->salesSummaryQuery(
+                    $outletIds,
+                    $window['requested_from']->format('Y-m-d'),
+                    $window['requested_to']->format('Y-m-d')
+                )
+                ->selectRaw('COALESCE(SUM(rdss.trx_count), 0) as transaction_count')
+                ->selectRaw('COALESCE(SUM(rdss.subtotal_sales), 0) as total_gross_sales')
+                ->selectRaw('COALESCE(SUM(rdss.discount_total), 0) as total_discount')
+                ->selectRaw('COALESCE(SUM(GREATEST(rdss.subtotal_sales - rdss.discount_total, 0)), 0) as total_net_sales')
+                ->selectRaw('COALESCE(SUM(rdss.tax_total), 0) as total_tax')
+                ->selectRaw('COALESCE(SUM(rdss.grand_sales), 0) as total_collected')
+                ->first();
+
+            if ($row) {
+                return $row;
+            }
+        }
+
+        return (clone $filteredBase)
+            ->selectRaw('COUNT(*) as transaction_count')
+            ->selectRaw('COALESCE(SUM(COALESCE(s.subtotal, 0)), 0) as total_gross_sales')
+            ->selectRaw('COALESCE(SUM(COALESCE(s.discount_total, 0)), 0) as total_discount')
+            ->selectRaw('COALESCE(SUM(GREATEST(COALESCE(s.subtotal, 0) - COALESCE(s.discount_total, 0), 0)), 0) as total_net_sales')
+            ->selectRaw('COALESCE(SUM(COALESCE(s.tax_total, 0)), 0) as total_tax')
+            ->selectRaw('COALESCE(SUM(COALESCE(s.grand_total, 0)), 0) as total_collected')
+            ->first() ?? (object) [];
     }
 
     private function applySaleNumberFilter(Builder $query, string $rawSearch): void
@@ -582,24 +553,12 @@ class SalesCollectedController extends Controller
         });
     }
 
-    private function resolveChannelOptions(array $outletIds, array $saleScope, array $filters, string $timezone): array
-    {
-        return (clone $this->buildBaseQuery($outletIds, $saleScope, $filters, $timezone, false, true, true))
-            ->selectRaw("TRIM(COALESCE(NULLIF(channel_map.display_channel, ''), '')) as channel_value")
-            ->distinct()
-            ->orderBy('channel_value')
-            ->pluck('channel_value')
-            ->filter(fn ($value) => filled($value))
-            ->values()
-            ->all();
-    }
-
     private function applyChannelFilter(Builder $query, string $channel): void
     {
         $normalized = mb_strtoupper(trim($channel));
         $deliverySource = mb_strtolower(trim($channel));
 
-        if ($normalized === 'DINE_IN' || $normalized === 'TAKEAWAY' || $normalized === 'DELIVERY') {
+        if (in_array($normalized, ['DINE_IN', 'TAKEAWAY', 'DELIVERY'], true)) {
             $query->where(function ($inner) use ($normalized) {
                 $inner->where('s.channel', $normalized)
                     ->orWhere(function ($mixed) use ($normalized) {
@@ -613,7 +572,6 @@ class SalesCollectedController extends Controller
                             });
                     });
             });
-
             return;
         }
 
@@ -623,74 +581,121 @@ class SalesCollectedController extends Controller
         }
 
         $query->where(function ($inner) use ($channel, $deliverySource) {
-            $inner->whereRaw("TRIM(COALESCE(channel_map.display_channel, '')) = ?", [$channel])
-                ->orWhere(function ($delivery) use ($deliverySource) {
-                    $delivery->where('s.channel', 'DELIVERY')
-                        ->whereRaw("LOWER(TRIM(COALESCE(s.online_order_source, ''))) = ?", [$deliverySource]);
+            $inner->where(function ($delivery) use ($deliverySource) {
+                $delivery->where('s.channel', 'DELIVERY')
+                    ->whereRaw("LOWER(TRIM(COALESCE(s.online_order_source, ''))) = ?", [$deliverySource]);
+            })->orWhere(function ($mixed) use ($channel) {
+                $mixed->where('s.channel', 'MIXED')
+                    ->whereRaw("(SELECT GROUP_CONCAT(DISTINCT si_filter.channel ORDER BY FIELD(si_filter.channel, 'DINE_IN', 'TAKEAWAY', 'DELIVERY'), si_filter.channel SEPARATOR ' + ') FROM sale_items si_filter WHERE si_filter.sale_id = s.id AND si_filter.voided_at IS NULL) = ?", [$channel]);
+            });
+        });
+    }
+
+    private function applyPaymentMethodFilter(Builder $query, string $paymentMethod): void
+    {
+        if ($paymentMethod === '') {
+            return;
+        }
+
+        $query->where(function ($inner) use ($paymentMethod) {
+            $inner->where('s.payment_method_name', $paymentMethod)
+                ->orWhereExists(function ($exists) use ($paymentMethod) {
+                    $exists->selectRaw('1')
+                        ->from('sale_payments as sp_filter')
+                        ->join('payment_methods as pm_filter', 'pm_filter.id', '=', 'sp_filter.payment_method_id')
+                        ->whereColumn('sp_filter.sale_id', 's.id')
+                        ->where('pm_filter.name', $paymentMethod);
                 });
         });
     }
 
-    private function paymentSummarySubquery(string $scopeKey): Builder
+    private function resolveChannelOptions(array $outletIds, array $filters, string $timezone): array
     {
-        return DB::table('sale_payments as sp')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 'sp.sale_id'))
-            ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
-            ->selectRaw('sp.sale_id')
-            ->selectRaw("GROUP_CONCAT(DISTINCT NULLIF(TRIM(pm.name), '') ORDER BY pm.name SEPARATOR ', ') as payment_method_names")
-            ->selectRaw("GROUP_CONCAT(CONCAT(COALESCE(NULLIF(TRIM(pm.name), ''), 'Payment'), CASE WHEN COALESCE(sp.amount, 0) > 0 THEN CONCAT(' (', sp.amount, ')') ELSE '' END) ORDER BY sp.created_at, sp.id SEPARATOR ', ') as payment_method_display")
-            ->groupBy('sp.sale_id');
+        if ($outletIds === []) {
+            return [];
+        }
+
+        $window = $this->resolveLocalDateRange($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
+
+        return $this->dailySummaryService
+            ->channelSummaryQuery($outletIds, $window['requested_from']->format('Y-m-d'), $window['requested_to']->format('Y-m-d'))
+            ->selectRaw('TRIM(rdcs.display_channel) as channel_value')
+            ->whereRaw("TRIM(COALESCE(rdcs.display_channel, '')) <> ''")
+            ->distinct()
+            ->orderBy('channel_value')
+            ->pluck('channel_value')
+            ->filter(fn ($value) => filled($value))
+            ->values()
+            ->all();
     }
 
-    private function channelMapSubquery(string $scopeKey): Builder
+    private function resolvePaymentMethodOptions(array $outletIds, array $filters, string $timezone): array
     {
-        return DB::table('sales as s1')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's1.id'))
-            ->leftJoinSub($this->saleItemChannelsSubquery($scopeKey), 'item_channels', fn ($join) => $join->on('item_channels.sale_id', '=', 's1.id'))
-            ->selectRaw('s1.id as sale_id')
-            ->selectRaw("CASE
-                WHEN UPPER(COALESCE(s1.channel, '')) = 'DELIVERY' AND NULLIF(TRIM(COALESCE(s1.online_order_source, '')), '') IS NOT NULL THEN LOWER(TRIM(s1.online_order_source))
-                WHEN UPPER(COALESCE(s1.channel, '')) = 'MIXED' AND NULLIF(TRIM(COALESCE(item_channels.channel_display, '')), '') IS NOT NULL THEN item_channels.channel_display
-                ELSE UPPER(COALESCE(s1.channel, ''))
-            END as display_channel");
-    }
+        if ($outletIds === []) {
+            return [];
+        }
 
-    private function saleItemChannelsSubquery(string $scopeKey): Builder
-    {
-        return DB::table('sale_items as si')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 'si.sale_id'))
-            ->selectRaw('si.sale_id')
-            ->selectRaw("GROUP_CONCAT(DISTINCT si.channel ORDER BY FIELD(si.channel, 'DINE_IN', 'TAKEAWAY', 'DELIVERY'), si.channel SEPARATOR ' + ') as channel_display")
-            ->whereNull('si.voided_at')
-            ->groupBy('si.sale_id');
-    }
+        $window = $this->resolveLocalDateRange($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
 
-    private function resolvePaymentMethodOptions(array $outletIds, array $saleScope, array $filters, string $timezone): array
-    {
-        $filteredSales = $this->buildFilteredSalesIdSubquery($outletIds, $saleScope, $filters, $timezone, true, false);
-
-        $snapshotOptions = DB::query()
-            ->fromSub($filteredSales, 'fs')
-            ->join('sales as s', 's.id', '=', 'fs.id')
-            ->selectRaw('DISTINCT TRIM(s.payment_method_name) as payment_method_name')
-            ->whereNotNull('s.payment_method_name')
-            ->whereRaw("TRIM(s.payment_method_name) <> ''");
-
-        $paymentOptions = DB::query()
-            ->fromSub($filteredSales, 'fs')
-            ->join('sale_payments as sp', 'sp.sale_id', '=', 'fs.id')
-            ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
-            ->selectRaw('DISTINCT TRIM(pm.name) as payment_method_name')
-            ->whereNotNull('pm.name')
-            ->whereRaw("TRIM(pm.name) <> ''");
-
-        return $snapshotOptions
-            ->union($paymentOptions)
+        return $this->dailySummaryService
+            ->paymentSummaryQuery($outletIds, $window['requested_from']->format('Y-m-d'), $window['requested_to']->format('Y-m-d'))
+            ->selectRaw('TRIM(rdps.payment_method_name) as payment_method_name')
+            ->whereRaw("TRIM(COALESCE(rdps.payment_method_name, '')) <> ''")
+            ->distinct()
             ->orderBy('payment_method_name')
             ->pluck('payment_method_name')
             ->filter(fn ($value) => filled($value))
             ->values()
             ->all();
+    }
+
+    private function resolvePaymentDisplayBySaleIds(array $saleIds): array
+    {
+        if ($saleIds === []) {
+            return [];
+        }
+
+        return DB::table('sale_payments as sp')
+            ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
+            ->whereIn('sp.sale_id', $saleIds)
+            ->selectRaw('sp.sale_id')
+            ->selectRaw("GROUP_CONCAT(CONCAT(COALESCE(NULLIF(TRIM(pm.name), ''), 'Payment'), CASE WHEN COALESCE(sp.amount, 0) > 0 THEN CONCAT(' (', sp.amount, ')') ELSE '' END) ORDER BY sp.created_at, sp.id SEPARATOR ', ') as payment_method_display")
+            ->groupBy('sp.sale_id')
+            ->pluck('payment_method_display', 'sale_id')
+            ->mapWithKeys(fn ($value, $key) => [(string) $key => (string) $value])
+            ->all();
+    }
+
+    private function resolveMixedChannelDisplayBySaleIds(array $saleIds): array
+    {
+        if ($saleIds === []) {
+            return [];
+        }
+
+        return DB::table('sale_items as si')
+            ->whereIn('si.sale_id', $saleIds)
+            ->whereNull('si.voided_at')
+            ->selectRaw('si.sale_id')
+            ->selectRaw("GROUP_CONCAT(DISTINCT si.channel ORDER BY FIELD(si.channel, 'DINE_IN', 'TAKEAWAY', 'DELIVERY'), si.channel SEPARATOR ' + ') as channel_display")
+            ->groupBy('si.sale_id')
+            ->pluck('channel_display', 'sale_id')
+            ->mapWithKeys(fn ($value, $key) => [(string) $key => (string) $value])
+            ->all();
+    }
+
+    private function displayChannelForRow(object $row, ?string $mixedChannel): string
+    {
+        $channel = mb_strtoupper(trim((string) ($row->channel ?? '')));
+        $source = mb_strtolower(trim((string) ($row->online_order_source ?? '')));
+
+        if ($channel === 'DELIVERY' && $source !== '') {
+            return $source;
+        }
+        if ($channel === 'MIXED' && trim((string) $mixedChannel) !== '') {
+            return trim((string) $mixedChannel);
+        }
+
+        return $channel !== '' ? $channel : '-';
     }
 
     private function buildExportFilename(string $outletScopeName, string $dateFrom, string $dateTo): string
@@ -700,7 +705,7 @@ class SalesCollectedController extends Controller
             $safeOutlet = 'semua_outlet';
         }
 
-        return sprintf('sales_collected_%s_%s_to_%s.csv', $safeOutlet, $dateFrom, $dateTo);
+        return sprintf('sales_collected_%s_%s_to_%s.xlsx', $safeOutlet, $dateFrom, $dateTo);
     }
 
     private function applySorting(Builder $query, string $sort, string $dir): void
@@ -735,10 +740,15 @@ class SalesCollectedController extends Controller
                 $query->orderBy('s.cashier_name', $dir)->orderBy('s.created_at', 'desc');
                 break;
             case 'channel':
-                $query->orderByRaw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) " . $dir)->orderBy('s.created_at', 'desc');
+                // Sort from sale snapshot fields only. Full MIXED display decoration is
+                // intentionally resolved after pagination to avoid a year-wide item GROUP BY.
+                $query->orderByRaw("CASE WHEN UPPER(COALESCE(s.channel, '')) = 'DELIVERY' AND NULLIF(TRIM(COALESCE(s.online_order_source, '')), '') IS NOT NULL THEN LOWER(TRIM(s.online_order_source)) ELSE UPPER(COALESCE(s.channel, '')) END " . $dir)
+                    ->orderBy('s.created_at', 'desc');
                 break;
             case 'payment_method':
-                $query->orderByRaw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') " . $dir)->orderBy('s.created_at', 'desc');
+                // Primary snapshot is sortable without aggregating every sale_payment row.
+                $query->orderByRaw("COALESCE(NULLIF(TRIM(s.payment_method_name), ''), '-') " . $dir)
+                    ->orderBy('s.created_at', 'desc');
                 break;
             case 'items':
                 $query->orderBy('s.created_at', 'desc');
@@ -747,6 +757,8 @@ class SalesCollectedController extends Controller
                 $query->orderBy('s.created_at', 'desc');
                 break;
         }
+
+        $query->orderBy('s.id', $dir === 'asc' ? 'asc' : 'desc');
     }
 
     private function resolveItemsTextBySaleIds(array $saleIds): array

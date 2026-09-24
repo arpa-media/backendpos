@@ -43,16 +43,44 @@ class HrDashboardController extends Controller
         if (!Schema::hasTable('HR_squads')) return $summary;
 
         $base = DB::table('HR_squads')->whereNull('deleted_at');
-        $summary['active'] = (clone $base)->whereRaw("LOWER(COALESCE(status, 'active')) = 'active'")->count();
-        $summary['inactive'] = (clone $base)->whereRaw("LOWER(COALESCE(status, 'active')) <> 'active'")->count();
+        $operational = clone $base;
+        $this->applyOperationalSquadScope($operational);
+
+        $summary['active'] = (clone $operational)->whereRaw("LOWER(COALESCE(status, 'active')) = 'active'")->count();
+        $summary['inactive'] = (clone $operational)->whereRaw("LOWER(COALESCE(status, 'active')) <> 'active'")->count();
 
         $managementKeywords = ['management', 'headquarter', 'hq', 'office', 'backoffice', 'manajemen'];
         $warehouseKeywords = ['warehouse', 'gudang'];
 
-        $summary['management'] = $this->countByKeywords($base, $managementKeywords);
-        $summary['warehouse'] = $this->countByKeywords($base, $warehouseKeywords);
+        $summary['management'] = $this->countByKeywords($operational, $managementKeywords);
+        $summary['warehouse'] = $this->countByKeywords($operational, $warehouseKeywords);
 
         return array_map('intval', $summary);
+    }
+
+    private function applyOperationalSquadScope($query): void
+    {
+        foreach (['role_name', 'access_role'] as $roleColumn) {
+            if (! Schema::hasColumn('HR_squads', $roleColumn)) continue;
+            $query->where(function ($roleScope) use ($roleColumn) {
+                $roleScope->whereNull($roleColumn)
+                    ->orWhereRaw("UPPER(TRIM(COALESCE(`{$roleColumn}`, ''))) NOT IN ('STAKEHOLDER', 'OBSERVER')");
+            });
+        }
+
+        if (
+            Schema::hasColumn('HR_squads', 'user_id')
+            && Schema::hasTable('user_access_assignments')
+            && Schema::hasTable('access_roles')
+        ) {
+            $query->whereNotExists(function ($subquery) {
+                $subquery->selectRaw('1')
+                    ->from('user_access_assignments as hr_i09_dash_uaa')
+                    ->join('access_roles as hr_i09_dash_ar', 'hr_i09_dash_ar.id', '=', 'hr_i09_dash_uaa.access_role_id')
+                    ->whereColumn('hr_i09_dash_uaa.user_id', 'HR_squads.user_id')
+                    ->whereIn('hr_i09_dash_ar.code', ['STAKEHOLDER', 'OBSERVER']);
+            });
+        }
     }
 
     private function countByKeywords($base, array $keywords): int

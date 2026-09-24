@@ -102,20 +102,54 @@ class CashierAlignedSaleScopeService
         });
     }
 
-    public function rememberScope(ReportSaleScopeCacheService $reportSaleScopeCache, string $namespace, array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null, bool $markedOnly = false, int $ttlMinutes = 360): array
+    /**
+     * V8 I04 read-only canonical scope.
+     *
+     * Returns the already-built report_sale_business_dates sale-id subquery when
+     * the requested outlet/date coverage is fresh. It deliberately does NOT call
+     * ensureCoverage(), so an HTTP request can never become a historical backfill
+     * worker. A null result means callers must use the existing exact Cashier
+     * resolver as their fallback.
+     */
+    public function coveredSaleIdsSubquery(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null, bool $markedOnly = false): ?Builder
+    {
+        $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        sort($normalizedOutletIds);
+
+        if ($normalizedOutletIds === []) {
+            return $this->emptyCoveredSaleIdSubquery();
+        }
+
+        return $this->businessDateIndex->saleIdsCoveredSubquery(
+            $normalizedOutletIds,
+            $dateFrom,
+            $dateTo,
+            $markedOnly,
+            $fallbackTimezone,
+        );
+    }
+
+    private function emptyCoveredSaleIdSubquery(): Builder
+    {
+        return DB::table('report_sale_business_dates as rsbd')
+            ->selectRaw('rsbd.sale_id as id')
+            ->whereRaw('1 = 0');
+    }
+
+    public function rememberScope(ReportSaleScopeCacheService $reportSaleScopeCache, string $namespace, array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null, bool $markedOnly = false, int $ttlMinutes = 360, array $fingerprintExtra = []): array
     {
         $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
         sort($normalizedOutletIds);
 
         return $reportSaleScopeCache->rememberSubquery(
             $namespace,
-            [
+            array_merge([
                 'outlet_ids' => $normalizedOutletIds,
                 'date_from' => $dateFrom,
                 'date_to' => $dateTo,
                 'timezone' => TransactionDate::normalizeTimezone($fallbackTimezone, TransactionDate::appTimezone()),
                 'marked_only' => $markedOnly,
-            ],
+            ], $fingerprintExtra),
             $this->businessDateIndex->saleIdsSubquery(
                 $normalizedOutletIds,
                 $dateFrom,
@@ -240,33 +274,16 @@ class CashierAlignedSaleScopeService
 
     private function applyCashierCandidateScope(object $query, ?string $saleNumberColumn, string $createdAtColumn, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): void
     {
-        [, , $fromUtc, $toUtc] = TransactionDate::dateRange(
+        // I05 PERFORMANCE: use the indexed created_at coarse window first and
+        // preserve the exact cashier/business-date resolver for UTC-vs-local
+        // historical rows. Avoid N leading-wildcard sale_number LIKE predicates.
+        TransactionDate::applyExactBusinessDateScope(
+            $query,
+            $createdAtColumn,
             $dateFrom,
             $dateTo,
-            $timezone ?: TransactionDate::appTimezone()
+            $timezone ?: TransactionDate::appTimezone(),
+            $saleNumberColumn
         );
-
-        $tokens = TransactionDate::dateTokens($dateFrom, $dateTo, $timezone ?: TransactionDate::appTimezone());
-        if (! $saleNumberColumn || empty($tokens)) {
-            $query->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
-            return;
-        }
-
-        $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $tokens, $fromUtc, $toUtc) {
-            $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
-                foreach ($tokens as $index => $token) {
-                    $method = $index === 0 ? 'where' : 'orWhere';
-                    $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
-                }
-            })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromUtc, $toUtc) {
-                $fallbackScope
-                    ->where(function ($legacyScope) use ($saleNumberColumn) {
-                        $legacyScope
-                            ->whereNull($saleNumberColumn)
-                            ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
-                    })
-                    ->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
-            });
-        });
     }
 }

@@ -108,51 +108,25 @@ class ReportPortalAnalyticsService
             ];
         }
 
-        $fingerprint = [
-            'portal_code' => (string) ($scope['portal_code'] ?? ''),
-            'marked_only' => (bool) ($scope['marked_only'] ?? false),
-            'outlets' => $outletIds,
-            'date_from' => (string) ($params['date_from'] ?? ''),
-            'date_to' => (string) ($params['date_to'] ?? ''),
-            'timezone' => $timezone,
-        ];
-
-        if (!empty($scope['marked_only'])) {
-            $fingerprint['marked_scope_version'] = ReportPortalMarkedScopeVersion::current();
+        $markedOnly = !empty($scope['marked_only']);
+        $extraFingerprint = [];
+        if ($markedOnly) {
+            $extraFingerprint['marked_scope_version'] = ReportPortalMarkedScopeVersion::current();
         }
 
-        return $this->reportSaleScopeCache->remember(
+        // I05: insert the exact cashier-aligned sale scope directly from SQL into
+        // report_sale_scope_cache. Previous code hydrated every sale id in PHP and
+        // performed a second chunked marking pass, which was costly for 30+ days.
+        return $this->cashierAlignedSaleScope->rememberScope(
+            $this->reportSaleScopeCache,
             'report-portal.sales-scope',
-            $fingerprint,
-            function () use ($outletIds, $params, $timezone, $scope) {
-                $eligibleIds = $this->cashierAlignedSaleScope->eligibleSaleIds(
-                    $outletIds,
-                    $params['date_from'] ?? null,
-                    $params['date_to'] ?? null,
-                    $timezone,
-                );
-
-                if (empty($scope['marked_only']) || $eligibleIds === []) {
-                    return $eligibleIds;
-                }
-
-                $filtered = [];
-                foreach (array_chunk($eligibleIds, 1000) as $chunk) {
-                    $rows = DB::table('sales')
-                        ->whereIn('id', $chunk)
-                        ->whereRaw('COALESCE(CAST(marking AS SIGNED), 0) = 1')
-                        ->pluck('id')
-                        ->map(fn ($id) => (string) $id)
-                        ->all();
-                    $filtered = array_merge($filtered, $rows);
-                }
-
-                $filtered = array_values(array_unique(array_filter(array_map('strval', $filtered))));
-                sort($filtered);
-
-                return $filtered;
-            },
+            $outletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+            $markedOnly,
             20,
+            $extraFingerprint
         );
     }
 

@@ -16,14 +16,22 @@ class OwnerOverviewController extends Controller
 
     public function index(OwnerOverviewQueryRequest $request)
     {
-        @ini_set('max_execution_time', '240');
-        @set_time_limit(240);
-
         $params = $request->validated();
+        $reportingSource = $this->service->overviewReadContract($params);
+        if (! ($reportingSource['ready'] ?? false)) {
+            return ApiResponse::error(
+                'Data Owner Overview untuk rentang tanggal ini belum selesai dimaterialisasi. Proses warm berjalan melalui scheduler; coba lagi setelah coverage siap.',
+                'REPORT_DAILY_SUMMARY_NOT_READY',
+                409,
+                [],
+                ['reporting_source' => $reportingSource]
+            );
+        }
+
         $payload = AnalyticsResponseCache::remember(
-            'owner-overview.index',
+            'owner-overview.v8i03.index',
             $params,
-            fn () => $this->service->overview($params),
+            fn () => $this->service->overview($params, $reportingSource),
             300,
             (string) ($request->user()?->getAuthIdentifier() ?? '')
         );

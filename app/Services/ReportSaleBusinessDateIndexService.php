@@ -24,6 +24,7 @@ class ReportSaleBusinessDateIndexService
 
         $outletChunkSize = $this->normalizeOutletChunkSize($options['outlet_chunk'] ?? null);
         $dateChunkDays = $this->normalizeDateChunkDays($options['date_chunk_days'] ?? $options['date_chunk'] ?? null);
+        $progressCallback = is_callable($options['progress_callback'] ?? null) ? $options['progress_callback'] : null;
 
         $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
         $groupedOutletIds = [];
@@ -33,13 +34,44 @@ class ReportSaleBusinessDateIndexService
             $groupedOutletIds[$timezone][] = $outletId;
         }
 
+        $workItems = [];
         foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
             [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $timezone);
             foreach (array_chunk($tzOutletIds, $outletChunkSize) as $outletChunk) {
-                foreach ($this->splitWindowsByDays($this->refreshWindows($outletChunk, $fromDate, $toDate, $timezone), $timezone, $dateChunkDays) as [$windowFrom, $windowTo]) {
-                    $this->rebuildCoverageWindow($outletChunk, $windowFrom, $windowTo, $timezone);
+                $windows = $this->splitWindowsByDays(
+                    $this->refreshWindows($outletChunk, $fromDate, $toDate, $timezone),
+                    $timezone,
+                    $dateChunkDays
+                );
+                foreach ($windows as [$windowFrom, $windowTo]) {
+                    $workItems[] = [$outletChunk, $windowFrom, $windowTo, $timezone];
                 }
             }
+        }
+
+        $this->emitProgress($progressCallback, [
+            'phase' => 'business_index',
+            'event' => 'plan',
+            'total' => count($workItems),
+        ]);
+
+        foreach ($workItems as $index => [$outletChunk, $windowFrom, $windowTo, $timezone]) {
+            $payload = [
+                'phase' => 'business_index',
+                'current' => $index + 1,
+                'total' => count($workItems),
+                'date_from' => $windowFrom,
+                'date_to' => $windowTo,
+                'timezone' => $timezone,
+                'outlet_count' => count($outletChunk),
+            ];
+            $this->emitProgress($progressCallback, array_merge($payload, ['event' => 'start']));
+            $startedAt = microtime(true);
+            $this->rebuildCoverageWindow($outletChunk, $windowFrom, $windowTo, $timezone);
+            $this->emitProgress($progressCallback, array_merge($payload, [
+                'event' => 'complete',
+                'duration_ms' => (int) round((microtime(true) - $startedAt) * 1000),
+            ]));
         }
     }
 
@@ -418,6 +450,19 @@ class ReportSaleBusinessDateIndexService
         return $map;
     }
 
+    private function emitProgress(?callable $callback, array $payload): void
+    {
+        if ($callback === null) {
+            return;
+        }
+
+        try {
+            $callback($payload);
+        } catch (\Throwable $e) {
+            // Progress reporting is observability-only and must never break materialization.
+        }
+    }
+
     private function normalizeOutletChunkSize(mixed $value): int
     {
         $size = (int) $value;
@@ -480,33 +525,16 @@ class ReportSaleBusinessDateIndexService
 
     private function applyCashierCandidateScope(object $query, ?string $saleNumberColumn, string $createdAtColumn, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): void
     {
-        [, , $fromUtc, $toUtc] = TransactionDate::dateRange(
+        // I05 PERFORMANCE: use the indexed created_at coarse window first and
+        // preserve the exact cashier/business-date resolver for UTC-vs-local
+        // historical rows. Avoid N leading-wildcard sale_number LIKE predicates.
+        TransactionDate::applyExactBusinessDateScope(
+            $query,
+            $createdAtColumn,
             $dateFrom,
             $dateTo,
-            $timezone ?: TransactionDate::appTimezone()
+            $timezone ?: TransactionDate::appTimezone(),
+            $saleNumberColumn
         );
-
-        $tokens = TransactionDate::dateTokens($dateFrom, $dateTo, $timezone ?: TransactionDate::appTimezone());
-        if (! $saleNumberColumn || empty($tokens)) {
-            $query->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
-            return;
-        }
-
-        $query->where(function ($outer) use ($saleNumberColumn, $createdAtColumn, $tokens, $fromUtc, $toUtc) {
-            $outer->where(function ($saleNumberScope) use ($saleNumberColumn, $tokens) {
-                foreach ($tokens as $index => $token) {
-                    $method = $index === 0 ? 'where' : 'orWhere';
-                    $saleNumberScope->{$method}($saleNumberColumn, 'like', '%-' . $token . '-%');
-                }
-            })->orWhere(function ($fallbackScope) use ($saleNumberColumn, $createdAtColumn, $fromUtc, $toUtc) {
-                $fallbackScope
-                    ->where(function ($legacyScope) use ($saleNumberColumn) {
-                        $legacyScope
-                            ->whereNull($saleNumberColumn)
-                            ->orWhere($saleNumberColumn, 'not like', 'S.%-%-%');
-                    })
-                    ->whereBetween($createdAtColumn, [$fromUtc->toDateTimeString(), $toUtc->toDateTimeString()]);
-            });
-        });
     }
 }

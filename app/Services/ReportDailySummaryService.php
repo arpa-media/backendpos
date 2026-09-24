@@ -4,22 +4,26 @@ namespace App\Services;
 
 use App\Support\FinanceCategorySegment;
 use App\Support\TransactionDate;
+use App\Services\Reporting\ReportHybridReadPlanner;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
 
 class ReportDailySummaryService
 {
     private const HOT_REFRESH_MINUTES = 5;
-    private const REBUILD_BATCH_DAYS = 3;
-    private const DEFAULT_OUTLET_CHUNK_SIZE = 5;
+    private const REBUILD_BATCH_DAYS = 31;
+    private const DEFAULT_OUTLET_CHUNK_SIZE = 25;
     private const COVERAGE_READY_TTL_SECONDS = 300;
     private const HOT_COVERAGE_READY_TTL_SECONDS = 45;
     private const COVERAGE_LOCK_SECONDS = 120;
 
     public function __construct(
         private readonly ReportSaleBusinessDateIndexService $businessDateIndex,
+        private readonly ReportHybridReadPlanner $hybridReadPlanner,
     ) {
     }
 
@@ -36,6 +40,7 @@ class ReportDailySummaryService
         [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $fallbackTimezone);
         $outletChunkSize = $this->normalizeOutletChunkSize($options['outlet_chunk'] ?? null);
         $dateChunkDays = $this->normalizeDateChunkDays($options['date_chunk_days'] ?? $options['date_chunk'] ?? null);
+        $progressCallback = is_callable($options['progress_callback'] ?? null) ? $options['progress_callback'] : null;
 
         $cacheKey = $this->coverageReadyCacheKey($normalizedOutletIds, $fromDate, $toDate, $fallbackTimezone, $outletChunkSize, $dateChunkDays);
         if (Cache::has($cacheKey)) {
@@ -43,7 +48,7 @@ class ReportDailySummaryService
         }
 
         $lockKey = $this->coverageReadyLockKey($normalizedOutletIds, $fromDate, $toDate, $fallbackTimezone, $outletChunkSize, $dateChunkDays);
-        $this->withCoverageLock($lockKey, function () use ($cacheKey, $normalizedOutletIds, $fromDate, $toDate, $fallbackTimezone, $outletChunkSize, $dateChunkDays) {
+        $this->withCoverageLock($lockKey, function () use ($cacheKey, $normalizedOutletIds, $fromDate, $toDate, $fallbackTimezone, $outletChunkSize, $dateChunkDays, $progressCallback) {
             if (Cache::has($cacheKey)) {
                 return;
             }
@@ -51,6 +56,7 @@ class ReportDailySummaryService
             $this->businessDateIndex->ensureCoverage($normalizedOutletIds, $fromDate, $toDate, $fallbackTimezone, [
                 'outlet_chunk' => $outletChunkSize,
                 'date_chunk_days' => $dateChunkDays,
+                'progress_callback' => $progressCallback,
             ]);
 
             $rows = DB::table('report_daily_summary_coverage')
@@ -95,12 +101,39 @@ class ReportDailySummaryService
                 }
             }
 
+            $workItems = [];
             if ($datesNeedingRefresh !== []) {
                 foreach ($this->batchedWindows($datesNeedingRefresh, $fallbackTimezone, $dateChunkDays) as [$windowFrom, $windowTo]) {
                     foreach (array_chunk($normalizedOutletIds, $outletChunkSize) as $outletChunk) {
-                        $this->rebuildWindow($outletChunk, $windowFrom, $windowTo);
+                        $workItems[] = [$outletChunk, $windowFrom, $windowTo];
                     }
                 }
+            }
+
+            $this->emitProgress($progressCallback, [
+                'phase' => 'daily_summary',
+                'event' => 'plan',
+                'total' => count($workItems),
+                'dates_needing_refresh' => count($datesNeedingRefresh),
+            ]);
+
+            foreach ($workItems as $index => [$outletChunk, $windowFrom, $windowTo]) {
+                $payload = [
+                    'phase' => 'daily_summary',
+                    'current' => $index + 1,
+                    'total' => count($workItems),
+                    'date_from' => $windowFrom,
+                    'date_to' => $windowTo,
+                    'timezone' => $fallbackTimezone,
+                    'outlet_count' => count($outletChunk),
+                ];
+                $this->emitProgress($progressCallback, array_merge($payload, ['event' => 'start']));
+                $startedAt = microtime(true);
+                $this->rebuildWindow($outletChunk, $windowFrom, $windowTo);
+                $this->emitProgress($progressCallback, array_merge($payload, [
+                    'event' => 'complete',
+                    'duration_ms' => (int) round((microtime(true) - $startedAt) * 1000),
+                ]));
             }
 
             $this->rememberCoverageReady($cacheKey, $fromDate, $toDate, $fallbackTimezone);
@@ -146,40 +179,115 @@ class ReportDailySummaryService
         );
     }
 
+    /**
+     * Read-only materialized-report contract used by V8 I03 aggregate endpoints.
+     *
+     * IMPORTANT: this method never builds/backfills coverage. It only reports whether
+     * the requested outlet/date matrix has already been materialized by CLI/scheduler.
+     */
+    public function readContractStatus(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        $normalizedOutletIds = $this->normalizeOutletIds($outletIds);
+        sort($normalizedOutletIds);
+
+        $fallbackTimezone = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
+        [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $fallbackTimezone);
+        $rangeDays = CarbonImmutable::parse($fromDate, $fallbackTimezone)
+            ->diffInDays(CarbonImmutable::parse($toDate, $fallbackTimezone)) + 1;
+        $expectedRows = count($normalizedOutletIds) * $rangeDays;
+
+        $base = [
+            'contract' => 'erp_finance_v8_i03',
+            'source' => 'report_daily_*_summaries',
+            'business_date_source' => 'report_sale_business_dates',
+            'http_backfill' => false,
+            'date_from' => $fromDate,
+            'date_to' => $toDate,
+            'range_days' => $rangeDays,
+            'outlet_count' => count($normalizedOutletIds),
+            'outlet_ids' => $normalizedOutletIds,
+            'timezone' => $fallbackTimezone,
+            'recovery_pipeline' => 'daily',
+            'expected_coverage_rows' => $expectedRows,
+            'covered_rows' => 0,
+            'missing_rows' => $expectedRows,
+            'coverage_percent' => $expectedRows > 0 ? 0.0 : 100.0,
+            'oldest_synced_at' => null,
+            'latest_synced_at' => null,
+            'pending_refresh_rows' => 0,
+            'ready' => $expectedRows === 0,
+            'state' => $expectedRows === 0 ? 'ready' : 'warming_required',
+        ];
+
+        if ($expectedRows === 0) {
+            return $base;
+        }
+
+        if (! Schema::hasTable('report_daily_summary_coverage')) {
+            $base['state'] = 'coverage_table_missing';
+
+            return $base;
+        }
+
+        $coverage = DB::table('report_daily_summary_coverage')
+            ->whereIn('outlet_id', $normalizedOutletIds)
+            ->whereBetween('business_date', [$fromDate, $toDate])
+            ->selectRaw('COUNT(*) as covered_rows')
+            ->selectRaw('MIN(synced_at) as oldest_synced_at')
+            ->selectRaw('MAX(synced_at) as latest_synced_at')
+            ->first();
+
+        $coveredRows = min($expectedRows, max(0, (int) ($coverage->covered_rows ?? 0)));
+        $missingRows = max(0, $expectedRows - $coveredRows);
+        $ready = $missingRows === 0;
+        $pendingRefreshRows = 0;
+
+        if (Schema::hasTable('report_daily_summary_refresh_queue')) {
+            $pendingRefreshRows = DB::table('report_daily_summary_refresh_queue')
+                ->whereIn('outlet_id', $normalizedOutletIds)
+                ->whereBetween('business_date', [$fromDate, $toDate])
+                ->whereIn('status', ['pending', 'processing'])
+                ->count();
+        }
+
+        return array_merge($base, [
+            'covered_rows' => $coveredRows,
+            'missing_rows' => $missingRows,
+            'coverage_percent' => $expectedRows > 0 ? round(($coveredRows / $expectedRows) * 100, 2) : 100.0,
+            'oldest_synced_at' => $coverage->oldest_synced_at ?? null,
+            'latest_synced_at' => $coverage->latest_synced_at ?? null,
+            'pending_refresh_rows' => $pendingRefreshRows,
+            'ready' => $ready,
+            'state' => $ready ? ($pendingRefreshRows > 0 ? 'ready_refresh_pending' : 'ready') : 'warming_required',
+        ]);
+    }
+
     public function salesSummaryQuery(array $outletIds, ?string $dateFrom, ?string $dateTo): Builder
     {
         [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, TransactionDate::appTimezone());
 
-        return DB::table('report_daily_sales_summaries as rdss')
-            ->whereIn('rdss.outlet_id', $this->normalizeOutletIds($outletIds))
-            ->whereBetween('rdss.business_date', [$fromDate, $toDate]);
+        return $this->hybridReadPlanner->summaryQuery('sales', $this->normalizeOutletIds($outletIds), $fromDate, $toDate);
     }
 
     public function paymentSummaryQuery(array $outletIds, ?string $dateFrom, ?string $dateTo): Builder
     {
         [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, TransactionDate::appTimezone());
 
-        return DB::table('report_daily_payment_summaries as rdps')
-            ->whereIn('rdps.outlet_id', $this->normalizeOutletIds($outletIds))
-            ->whereBetween('rdps.business_date', [$fromDate, $toDate]);
+        return $this->hybridReadPlanner->summaryQuery('payment', $this->normalizeOutletIds($outletIds), $fromDate, $toDate);
     }
 
     public function channelSummaryQuery(array $outletIds, ?string $dateFrom, ?string $dateTo): Builder
     {
         [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, TransactionDate::appTimezone());
 
-        return DB::table('report_daily_channel_summaries as rdcs')
-            ->whereIn('rdcs.outlet_id', $this->normalizeOutletIds($outletIds))
-            ->whereBetween('rdcs.business_date', [$fromDate, $toDate]);
+        return $this->hybridReadPlanner->summaryQuery('channel', $this->normalizeOutletIds($outletIds), $fromDate, $toDate);
     }
 
     public function categorySummaryQuery(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $categorySegment = null): Builder
     {
         [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, TransactionDate::appTimezone());
 
-        $query = DB::table('report_daily_category_summaries as rdcat')
-            ->whereIn('rdcat.outlet_id', $this->normalizeOutletIds($outletIds))
-            ->whereBetween('rdcat.business_date', [$fromDate, $toDate]);
+        $query = $this->hybridReadPlanner->summaryQuery('category', $this->normalizeOutletIds($outletIds), $fromDate, $toDate);
 
         FinanceCategorySegment::apply($query, 'rdcat.category_name', $categorySegment);
 
@@ -190,9 +298,7 @@ class ReportDailySummaryService
     {
         [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, TransactionDate::appTimezone());
 
-        $query = DB::table('report_daily_product_summaries as rdprod')
-            ->whereIn('rdprod.outlet_id', $this->normalizeOutletIds($outletIds))
-            ->whereBetween('rdprod.business_date', [$fromDate, $toDate]);
+        $query = $this->hybridReadPlanner->summaryQuery('product', $this->normalizeOutletIds($outletIds), $fromDate, $toDate);
 
         FinanceCategorySegment::apply($query, 'rdprod.category_name', $categorySegment);
 
@@ -203,9 +309,7 @@ class ReportDailySummaryService
     {
         [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, TransactionDate::appTimezone());
 
-        $query = DB::table('report_daily_variant_summaries as rdvar')
-            ->whereIn('rdvar.outlet_id', $this->normalizeOutletIds($outletIds))
-            ->whereBetween('rdvar.business_date', [$fromDate, $toDate]);
+        $query = $this->hybridReadPlanner->summaryQuery('variant', $this->normalizeOutletIds($outletIds), $fromDate, $toDate);
 
         FinanceCategorySegment::apply($query, 'rdvar.category_name', $categorySegment);
 
@@ -215,8 +319,9 @@ class ReportDailySummaryService
     private function rebuildWindow(array $outletIds, string $fromDate, string $toDate): void
     {
         $timestamp = now()->format('Y-m-d H:i:s');
+        $generationUlid = (string) Str::ulid();
 
-        DB::transaction(function () use ($outletIds, $fromDate, $toDate, $timestamp) {
+        DB::transaction(function () use ($outletIds, $fromDate, $toDate, $timestamp, $generationUlid) {
             foreach ([
                 'report_daily_sales_summaries',
                 'report_daily_payment_summaries',
@@ -242,7 +347,7 @@ class ReportDailySummaryService
             $this->insertCategoryDailySummary($outletIds, $fromDate, $toDate, $timestamp);
             $this->insertProductDailySummary($outletIds, $fromDate, $toDate, $timestamp);
             $this->insertVariantDailySummary($outletIds, $fromDate, $toDate, $timestamp);
-            $this->insertCoverageRows($outletIds, $fromDate, $toDate, $timestamp);
+            $this->insertCoverageRows($outletIds, $fromDate, $toDate, $timestamp, $generationUlid);
         }, 3);
     }
 
@@ -268,7 +373,11 @@ class ReportDailySummaryService
             ->selectRaw('scope_sales.business_date')
             ->selectRaw('scope_sales.business_timezone')
             ->selectRaw('COUNT(*) as trx_count')
+            ->selectRaw('SUM(CASE WHEN COALESCE(s.discount_total, 0) > 0 THEN 1 ELSE 0 END) as discounted_trx_count')
+            ->selectRaw('SUM(CASE WHEN COALESCE(s.rounding_total, 0) <> 0 THEN 1 ELSE 0 END) as rounding_trx_count')
             ->selectRaw('SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 THEN 1 ELSE 0 END) as marked_trx_count')
+            ->selectRaw('SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 AND COALESCE(s.discount_total, 0) > 0 THEN 1 ELSE 0 END) as marked_discounted_trx_count')
+            ->selectRaw('SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 AND COALESCE(s.rounding_total, 0) <> 0 THEN 1 ELSE 0 END) as marked_rounding_trx_count')
             ->selectRaw('COALESCE(SUM(COALESCE(s.subtotal, 0)), 0) as subtotal_sales')
             ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 THEN COALESCE(s.subtotal, 0) ELSE 0 END), 0) as marked_subtotal_sales')
             ->selectRaw('COALESCE(SUM(COALESCE(s.grand_total, 0)), 0) as grand_sales')
@@ -280,7 +389,11 @@ class ReportDailySummaryService
             ->selectRaw('COALESCE(SUM(COALESCE(s.service_charge_total, 0)), 0) as service_charge_total')
             ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 THEN COALESCE(s.service_charge_total, 0) ELSE 0 END), 0) as marked_service_charge_total')
             ->selectRaw('COALESCE(SUM(COALESCE(s.rounding_total, 0)), 0) as rounding_total')
+            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(s.rounding_total, 0) > 0 THEN COALESCE(s.rounding_total, 0) ELSE 0 END), 0) as rounding_up_total')
+            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(s.rounding_total, 0) < 0 THEN ABS(COALESCE(s.rounding_total, 0)) ELSE 0 END), 0) as rounding_down_total')
             ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 THEN COALESCE(s.rounding_total, 0) ELSE 0 END), 0) as marked_rounding_total')
+            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 AND COALESCE(s.rounding_total, 0) > 0 THEN COALESCE(s.rounding_total, 0) ELSE 0 END), 0) as marked_rounding_up_total')
+            ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 AND COALESCE(s.rounding_total, 0) < 0 THEN ABS(COALESCE(s.rounding_total, 0)) ELSE 0 END), 0) as marked_rounding_down_total')
             ->selectRaw('COALESCE(SUM(COALESCE(items_per_sale.item_qty_sold, 0)), 0) as item_qty_sold')
             ->selectRaw('COALESCE(SUM(CASE WHEN COALESCE(scope_sales.marking, 0) = 1 THEN COALESCE(items_per_sale.item_qty_sold, 0) ELSE 0 END), 0) as marked_item_qty_sold')
             ->selectRaw('? as created_at', [$timestamp])
@@ -288,13 +401,15 @@ class ReportDailySummaryService
 
         DB::table('report_daily_sales_summaries')->insertUsing([
             'outlet_id', 'business_date', 'business_timezone',
-            'trx_count', 'marked_trx_count',
+            'trx_count', 'discounted_trx_count', 'rounding_trx_count',
+            'marked_trx_count', 'marked_discounted_trx_count', 'marked_rounding_trx_count',
             'subtotal_sales', 'marked_subtotal_sales',
             'grand_sales', 'marked_grand_sales',
             'discount_total', 'marked_discount_total',
             'tax_total', 'marked_tax_total',
             'service_charge_total', 'marked_service_charge_total',
-            'rounding_total', 'marked_rounding_total',
+            'rounding_total', 'rounding_up_total', 'rounding_down_total',
+            'marked_rounding_total', 'marked_rounding_up_total', 'marked_rounding_down_total',
             'item_qty_sold', 'marked_item_qty_sold',
             'created_at', 'updated_at',
         ], $source);
@@ -315,7 +430,7 @@ class ReportDailySummaryService
             ->selectRaw('scope_sales.business_date')
             ->selectRaw('scope_sales.business_timezone')
             ->selectRaw("COALESCE(NULLIF(TRIM(pm.name), ''), NULLIF(TRIM(s.payment_method_name), ''), '-') as payment_method_name")
-            ->selectRaw("COALESCE(NULLIF(TRIM(s.payment_method_type), ''), '') as payment_method_type")
+            ->selectRaw("COALESCE(NULLIF(TRIM(pm.type), ''), NULLIF(TRIM(s.payment_method_type), ''), '') as payment_method_type")
             ->selectRaw('1 as trx_count')
             ->selectRaw('CASE WHEN COALESCE(scope_sales.marking, 0) = 1 THEN 1 ELSE 0 END as marked_trx_count')
             ->selectRaw("CASE WHEN LOWER(TRIM(COALESCE(pm.name, ''))) IN ('cash', 'tunai') AND COALESCE(sp.amount, 0) > 0 THEN GREATEST(COALESCE(sp.amount, 0) - COALESCE(s.change_total, 0), 0) ELSE COALESCE(sp.amount, 0) END as gross_sales")
@@ -513,22 +628,27 @@ class ReportDailySummaryService
             ]), [$timestamp, $timestamp]);
     }
 
-    private function insertCoverageRows(array $outletIds, string $fromDate, string $toDate, string $timestamp): void
+    private function insertCoverageRows(array $outletIds, string $fromDate, string $toDate, string $timestamp, string $generationUlid): void
     {
         $rows = [];
+        $hasGeneration = Schema::hasColumn('report_daily_summary_coverage', 'generation_ulid');
         $cursor = CarbonImmutable::parse($fromDate, TransactionDate::appTimezone());
         $end = CarbonImmutable::parse($toDate, TransactionDate::appTimezone());
 
         for (; $cursor->lessThanOrEqualTo($end); $cursor = $cursor->addDay()) {
             $businessDate = $cursor->toDateString();
             foreach ($outletIds as $outletId) {
-                $rows[] = [
+                $row = [
                     'outlet_id' => (string) $outletId,
                     'business_date' => $businessDate,
                     'synced_at' => $timestamp,
                     'created_at' => $timestamp,
                     'updated_at' => $timestamp,
                 ];
+                if ($hasGeneration) {
+                    $row['generation_ulid'] = $generationUlid;
+                }
+                $rows[] = $row;
             }
         }
 
@@ -632,6 +752,19 @@ class ReportDailySummaryService
             Cache::lock($lockKey, self::COVERAGE_LOCK_SECONDS)->block(8, $callback);
         } catch (\Throwable $e) {
             $callback();
+        }
+    }
+
+    private function emitProgress(?callable $callback, array $payload): void
+    {
+        if ($callback === null) {
+            return;
+        }
+
+        try {
+            $callback($payload);
+        } catch (\Throwable $e) {
+            // CLI/UI progress is observability-only and must never break reporting.
         }
     }
 

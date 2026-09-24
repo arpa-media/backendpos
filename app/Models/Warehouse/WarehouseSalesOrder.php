@@ -1,0 +1,4 @@
+<?php
+namespace App\Models\Warehouse;
+use Illuminate\Database\Eloquent\Concerns\HasUlids; use Illuminate\Database\Eloquent\Model; use Illuminate\Database\Eloquent\SoftDeletes;
+class WarehouseSalesOrder extends Model { use HasUlids,SoftDeletes; protected $table='wh_sales_orders'; protected $guarded=[]; protected function casts():array{return ['order_date'=>'date','requested_delivery_date'=>'date','submitted_at'=>'datetime','approved_at'=>'datetime','cancelled_at'=>'datetime','subtotal'=>'decimal:4','discount_total'=>'decimal:4','tax_total'=>'decimal:4','grand_total'=>'decimal:4'];} public function items(){return $this->hasMany(WarehouseSalesOrderItem::class,'sales_order_id');} public function customer(){return $this->belongsTo(WarehouseCustomer::class,'customer_id');} public function events(){return $this->hasMany(WarehouseSalesOrderEvent::class,'sales_order_id');} }

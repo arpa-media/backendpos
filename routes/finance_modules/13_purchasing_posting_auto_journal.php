@@ -1,0 +1,29 @@
+<?php
+use App\Http\Controllers\Api\V1\Finance\FinancePurchasingPostingController as C;
+use Illuminate\Support\Facades\Route;
+Route::prefix('api/v1/finance/purchasing-posting')->middleware(['api','auth:sanctum'])->group(function():void{
+    Route::get('/options',[C::class,'options'])->middleware('permission_or_snapshot:finance.purchasing_posting.view')->name('finance.iter10.purchasing.options');
+    Route::get('/outbox',[C::class,'outbox'])->middleware('permission_or_snapshot:finance.purchasing_posting.view')->name('finance.iter10.purchasing.outbox');
+    Route::get('/auto-events',[C::class,'autoEvents'])->middleware('permission_or_snapshot:finance.purchasing_posting.view')->name('finance.iter04.purchasing.auto-events');
+    Route::post('/auto/process-pending',[C::class,'processPending'])->middleware('permission_or_snapshot:finance.purchasing_posting.post,finance.purchasing_posting.retry_auto,finance.purchasing_posting.update')->name('finance.iter04.purchasing.process-pending');
+    Route::post('/auto-events/{id}/retry',[C::class,'retryAuto'])->middleware('permission_or_snapshot:finance.purchasing_posting.post,finance.purchasing_posting.retry_auto,finance.purchasing_posting.update')->name('finance.iter04.purchasing.auto-retry');
+    Route::get('/issue-mappings',[C::class,'issueMappings'])->middleware('permission_or_snapshot:finance.purchasing_posting.view')->name('finance.iter10.purchasing.issue-mappings');
+    Route::post('/issue-mappings',[C::class,'saveIssueMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.update')->name('finance.iter04.purchasing.issue-mapping.store');
+    Route::put('/issue-mappings/{id}',[C::class,'saveIssueMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.update')->name('finance.iter04.purchasing.issue-mapping.update');
+    Route::delete('/issue-mappings/{id}',[C::class,'deleteIssueMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.delete')->name('finance.iter04.purchasing.issue-mapping.delete');
+    Route::get('/payment-mappings',[C::class,'paymentMappings'])->middleware('permission_or_snapshot:finance.purchasing_posting.view')->name('finance.iter10.purchasing.payment-mappings');
+    Route::post('/payment-mappings',[C::class,'savePaymentMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.update')->name('finance.iter04.purchasing.payment-mapping.store');
+    Route::put('/payment-mappings/{id}',[C::class,'savePaymentMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.update')->name('finance.iter04.purchasing.payment-mapping.update');
+    Route::delete('/payment-mappings/{id}',[C::class,'deletePaymentMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.delete')->name('finance.iter04.purchasing.payment-mapping.delete');
+    Route::get('/warehouse-payment-mappings',[C::class,'warehousePaymentMappings'])->middleware('permission_or_snapshot:finance.purchasing_posting.view')->name('finance.iter04.purchasing.wh-pay-mappings');
+    Route::post('/warehouse-payment-mappings',[C::class,'saveWarehousePaymentMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.update')->name('finance.iter04.purchasing.wh-pay-mapping.store');
+    Route::put('/warehouse-payment-mappings/{id}',[C::class,'saveWarehousePaymentMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.update')->name('finance.iter04.purchasing.wh-pay-mapping.update');
+    Route::delete('/warehouse-payment-mappings/{id}',[C::class,'deleteWarehousePaymentMapping'])->middleware('permission_or_snapshot:finance.purchasing_posting.manage_mapping,finance.purchasing_posting.delete')->name('finance.iter04.purchasing.wh-pay-mapping.delete');
+    Route::post('/draft',[C::class,'createDraft'])->middleware('permission_or_snapshot:finance.purchasing_posting.create')->name('finance.iter10.purchasing.draft');
+    Route::get('/{id}',[C::class,'show'])->middleware('permission_or_snapshot:finance.purchasing_posting.view')->name('finance.iter10.purchasing.show');
+    Route::put('/{id}/lines',[C::class,'updateLines'])->middleware('permission_or_snapshot:finance.purchasing_posting.update')->name('finance.iter04.purchasing.lines');
+    Route::post('/{id}/refresh',[C::class,'refresh'])->middleware('permission_or_snapshot:finance.purchasing_posting.update')->name('finance.iter04.purchasing.refresh');
+    Route::post('/{id}/post',[C::class,'post'])->middleware('permission_or_snapshot:finance.purchasing_posting.post,finance.purchasing_posting.update')->name('finance.iter10.purchasing.post');
+    Route::post('/{id}/reopen',[C::class,'reopen'])->middleware('permission_or_snapshot:finance.purchasing_posting.reopen,finance.purchasing_posting.update')->name('finance.iter10.purchasing.reopen');
+    Route::delete('/{id}',[C::class,'destroy'])->middleware('permission_or_snapshot:finance.purchasing_posting.delete')->name('finance.iter04.purchasing.destroy');
+});

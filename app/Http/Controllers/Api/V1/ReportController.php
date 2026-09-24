@@ -99,13 +99,13 @@ class ReportController extends Controller
     public function ledger(LedgerReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return $this->jsonCached($request, 'report.ledger', $params, fn () => $service->ledger($params, OutletScope::id($request)));
+        return $this->jsonCached($request, 'report.ledger.v8i02', $params, fn () => $service->ledger($params, OutletScope::id($request)));
     }
 
     public function marking(MarkingReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return $this->jsonCached($request, 'report.marking', $params, fn () => $service->marking($params, OutletScope::id($request)));
+        return $this->jsonCached($request, 'report.marking.v8i02', $params, fn () => $service->marking($params, OutletScope::id($request)));
     }
 
     public function markingConfig(Request $request, MarkingService $service): JsonResponse
@@ -190,18 +190,18 @@ class ReportController extends Controller
     public function rounding(RoundingReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return $this->jsonCached($request, 'report.rounding', $params, fn () => $service->rounding($params, OutletScope::id($request)));
+        return $this->jsonCached($request, 'report.rounding.v8i02', $params, fn () => $service->rounding($params, OutletScope::id($request)));
     }
 
     public function tax(TaxReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return $this->jsonCached($request, 'report.tax', $params, fn () => $service->tax($params, OutletScope::id($request)));
+        return $this->jsonCached($request, 'report.tax.v8i02', $params, fn () => $service->tax($params, OutletScope::id($request)));
     }
 
     public function discount(DiscountReportRequest $request, ReportService $service): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
-        return $this->jsonCached($request, 'report.discount', $params, fn () => $service->discount($params, OutletScope::id($request)));
+        return $this->jsonCached($request, 'report.discount.v8i02', $params, fn () => $service->discount($params, OutletScope::id($request)));
     }
 }

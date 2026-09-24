@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources\Api\V1\Auth;
 
+use App\Services\HrUserDashboardService;
 use App\Services\ReportPortalAccessService;
 use App\Services\UserManagementService;
 use App\Support\Auth\UserAuthContextResolver;
@@ -17,6 +18,7 @@ class MeResource extends JsonResource
         $resolvedOutlet = $assignment?->outlet ?: $user->outlet;
         $authContext = app(UserAuthContextResolver::class)->resolve($user);
         $snapshot = app(UserManagementService::class)->currentSessionSnapshot($user);
+        $hrDashboard = app(HrUserDashboardService::class)->context($user);
 
         return [
             'id' => (string) $user->id,
@@ -56,6 +58,7 @@ class MeResource extends JsonResource
                 'is_primary' => (bool) $assignment->is_primary,
             ] : null,
             'auth_context' => $authContext,
+            'hr_dashboard' => $hrDashboard,
             'legacy_bridge' => [
                 'user_outlet_id' => $user->outlet_id ? (string) $user->outlet_id : null,
                 'auth_source' => $authContext['auth_source'] ?? 'none',

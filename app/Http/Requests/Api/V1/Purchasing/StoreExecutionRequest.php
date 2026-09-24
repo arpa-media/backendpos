@@ -1,0 +1,2 @@
+<?php
+namespace App\Http\Requests\Api\V1\Purchasing; use Illuminate\Foundation\Http\FormRequest; class StoreExecutionRequest extends FormRequest { public function authorize(): bool{return true;} public function rules(): array{return ['order_id'=>['required','string','max:64'],'document_date'=>['required','date'],'external_reference'=>['nullable','string','max:120'],'notes'=>['nullable','string','max:3000']];}}

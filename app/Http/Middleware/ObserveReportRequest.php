@@ -8,15 +8,23 @@ use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Symfony\Component\HttpFoundation\Response;
 
 class ObserveReportRequest
 {
     public function handle(Request $request, Closure $next): Response
     {
-        if (!config('report_observability.enabled', true)) {
+        if (!config('report_observability.enabled', true) || ! $this->shouldObserve($request)) {
             return $next($request);
         }
+
+        // Safe when an older route already uses the `report_observe` alias: the
+        // global I13 API hook must not double-register DB listeners or metrics.
+        if ($request->attributes->get('_report_observe_active') === true) {
+            return $next($request);
+        }
+        $request->attributes->set('_report_observe_active', true);
 
         $traceQueryParam = (string) config('report_observability.trace_query_param', '__trace');
         $explainQueryParam = (string) config('report_observability.explain_query_param', '__explain');
@@ -70,6 +78,8 @@ class ObserveReportRequest
             }
         }
 
+        $this->persistMetric($request, $response, $durationMs, $summary, $slowRequestMs);
+
         if ($shouldLog) {
             $context = [
                 'trace_id' => $summary['trace_id'] ?? null,
@@ -113,6 +123,83 @@ class ObserveReportRequest
                 return is_scalar($value) || $value === null ? $value : (string) $value;
             })
             ->all();
+    }
+
+    private function shouldObserve(Request $request): bool
+    {
+        $path = ltrim($request->path(), '/');
+        foreach ((array) config('report_observability.observe_path_prefixes', []) as $prefix) {
+            $prefix = ltrim(trim((string) $prefix), '/');
+            if ($prefix !== '' && str_starts_with($path, $prefix)) {
+                return true;
+            }
+        }
+
+        $routeName = strtolower((string) optional($request->route())->getName());
+        if ($routeName === '') {
+            return false;
+        }
+
+        foreach (['report', 'summary', 'overview', 'analytics', 'cashier', 'reconciliation', 'cogs', 'finance'] as $token) {
+            if (str_contains($routeName, $token)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function persistMetric(Request $request, Response $response, float $durationMs, array $summary, int $slowRequestMs): void
+    {
+        if (! config('report_observability.persist_metrics', true)) {
+            return;
+        }
+
+        try {
+            if (! Schema::hasTable('report_request_metrics')) {
+                return;
+            }
+
+            $routeKey = trim((string) optional($request->route())->getName());
+            if ($routeKey === '') {
+                $routeKey = $this->normalizePath($request->path());
+            }
+
+            DB::table('report_request_metrics')->insert([
+                'occurred_at' => now(),
+                'route_key' => mb_substr($routeKey, 0, 191),
+                'method' => mb_substr($request->method(), 0, 12),
+                'status_code' => $response->getStatusCode(),
+                'duration_ms' => round($durationMs, 2),
+                'db_time_ms' => round((float) ($summary['db_time_ms'] ?? 0), 2),
+                'query_count' => (int) ($summary['query_count'] ?? 0),
+                'slowest_query_ms' => round((float) ($summary['slowest_query_ms'] ?? 0), 2),
+                'is_slow' => $durationMs >= $slowRequestMs || (float) ($summary['slowest_query_ms'] ?? 0) >= (float) config('report_observability.slow_query_ms', 250),
+                'trace_id' => isset($summary['trace_id']) ? mb_substr((string) $summary['trace_id'], 0, 64) : null,
+                'user_id' => $request->user() ? mb_substr((string) $request->user()->getAuthIdentifier(), 0, 64) : null,
+            ]);
+        } catch (\Throwable) {
+            // Observability must never break the report request itself.
+        }
+    }
+
+    private function normalizePath(string $path): string
+    {
+        $parts = array_map(function (string $segment): string {
+            if (preg_match('/^\d+$/', $segment)) {
+                return '{id}';
+            }
+            if (preg_match('/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i', $segment)) {
+                return '{id}';
+            }
+            if (preg_match('/^[0-9A-HJKMNP-TV-Z]{26}$/i', $segment)) {
+                return '{id}';
+            }
+
+            return $segment;
+        }, explode('/', trim($path, '/')));
+
+        return implode('/', $parts);
     }
 
     private function truthy(mixed $value): bool

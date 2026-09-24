@@ -44,6 +44,17 @@ return [
             'after_commit' => false,
         ],
 
+        // ERP FINANCE V8 I11: isolated materialization worker.
+        // Keep retry_after greater than the reporting worker timeout (3300s).
+        'reporting' => [
+            'driver' => 'database',
+            'connection' => env('REPORTING_QUEUE_DB_CONNECTION', env('DB_QUEUE_CONNECTION')),
+            'table' => env('DB_QUEUE_TABLE', 'jobs'),
+            'queue' => env('REPORTING_QUEUE_NAME', 'reporting'),
+            'retry_after' => (int) env('REPORTING_QUEUE_RETRY_AFTER', 3600),
+            'after_commit' => true,
+        ],
+
         'beanstalkd' => [
             'driver' => 'beanstalkd',
             'host' => env('BEANSTALKD_QUEUE_HOST', 'localhost'),

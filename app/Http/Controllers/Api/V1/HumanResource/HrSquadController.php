@@ -5,6 +5,9 @@ namespace App\Http\Controllers\Api\V1\HumanResource;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Models\User;
+use App\Services\HrSquadUserWiringService;
+use App\Services\HumanResource\HrSquadLifecycleService;
+use App\Services\Support\SimpleXlsxService;
 use App\Services\UserManagementService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -24,8 +27,12 @@ class HrSquadController extends Controller
 
     private ?array $outletLookup = null;
 
-    public function __construct(private readonly UserManagementService $userManagement)
-    {
+    public function __construct(
+        private readonly UserManagementService $userManagement,
+        private readonly HrSquadUserWiringService $squadWiring,
+        private readonly SimpleXlsxService $xlsx,
+        private readonly HrSquadLifecycleService $lifecycle,
+    ) {
     }
 
     public function index(Request $request)
@@ -36,6 +43,11 @@ class HrSquadController extends Controller
         $custom = trim((string) $request->query('custom', ''));
         $perPageInput = strtolower((string) $request->query('per_page', 20));
         $perPage = $perPageInput === 'all' ? 'all' : min(max((int) $perPageInput, 1), 200);
+
+        // Self-healing untuk legacy user: seluruh user operasional yang memiliki NISJ
+        // dimaterialisasi sebagai Data Squad sebelum daftar Active/Inactive/Non-Squad dibaca.
+        // Stakeholder, Observer, dan user tanpa NISJ tidak dibuatkan Squad otomatis.
+        $this->squadWiring->reconcileOperationalUsers();
 
         if ($status === 'non_squad') {
             return $this->nonSquadIndex($request, $perPage);
@@ -76,6 +88,7 @@ class HrSquadController extends Controller
             $rows = $query->get();
             return ApiResponse::ok([
                 'items' => $rows->map(fn ($item) => $this->formatSquadList($item))->values(),
+                'counts' => $this->statusCounts(),
                 'pagination' => [
                     'current_page' => 1,
                     'per_page' => 'all',
@@ -89,6 +102,7 @@ class HrSquadController extends Controller
 
         return ApiResponse::ok([
             'items' => collect($paginator->items())->map(fn ($item) => $this->formatSquadList($item))->values(),
+            'counts' => $this->statusCounts(),
             'pagination' => [
                 'current_page' => $paginator->currentPage(),
                 'per_page' => $paginator->perPage(),
@@ -100,40 +114,274 @@ class HrSquadController extends Controller
 
     public function store(Request $request)
     {
-        $validator = $this->validator($request, null);
+        if ($request->filled('source_user_id')) {
+            return $this->completeSquadFromUser($request);
+        }
+
+        $nisj = $this->squadWiring->normalizeNisj($request->input('nisj'));
+        $archived = $nisj !== ''
+            ? DB::table(self::TABLE)->whereNotNull('deleted_at')->whereRaw('LOWER(TRIM(`nisj`)) = ?', [mb_strtolower($nisj)])->first()
+            : null;
+        $validator = $this->validator($request, $archived?->id ? (int) $archived->id : null);
         if ($validator->fails()) {
             return ApiResponse::error('Validasi gagal.', 'VALIDATION_ERROR', 422, $validator->errors()->toArray());
         }
 
-        $payload = $this->payload($request, null, false);
-        if ($request->hasFile('photo')) {
-            $payload['photo_path'] = $request->file('photo')->store('hr/squads', 'public');
+        $createUser = $request->boolean('create_user', true);
+        if ($nisj === '') {
+            return ApiResponse::error('NISJ wajib diisi untuk Data Squad baru.', 'VALIDATION_ERROR', 422, [
+                'nisj' => ['NISJ adalah pivot utama antara Data Squad dan Data User.'],
+            ]);
         }
 
-        $now = Carbon::now();
-        $id = DB::table(self::TABLE)->insertGetId(array_merge($payload, [
-            'created_at' => $now,
-            'updated_at' => $now,
-        ]));
+        $existingUser = $this->squadWiring->findUserByNisj($nisj);
+        if ($createUser && ! $existingUser) {
+            $userValidator = $this->validateProvisionUserInput($request);
+            if ($userValidator->fails()) {
+                return ApiResponse::error('Validasi Data User gagal.', 'VALIDATION_ERROR', 422, $userValidator->errors()->toArray());
+            }
+        }
 
-        $item = DB::table(self::TABLE)->where('id', $id)->first();
-        return ApiResponse::ok($this->formatSquad($item), 'Data squad berhasil dibuat.', 201);
+        $result = DB::transaction(function () use ($request, $createUser, $existingUser, $archived) {
+            $payload = $this->payload($request, null, false);
+            if ($request->hasFile('photo')) {
+                $payload['photo_path'] = $request->file('photo')->store('hr/squads', 'public');
+            }
+
+            $now = Carbon::now();
+            if ($archived) {
+                $id = (int) $archived->id;
+                DB::table(self::TABLE)->where('id', $id)->update(array_merge($payload, [
+                    'deleted_at' => null,
+                    'updated_at' => $now,
+                ]));
+            } else {
+                $id = DB::table(self::TABLE)->insertGetId(array_merge($payload, [
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]));
+            }
+            $squad = DB::table(self::TABLE)->where('id', $id)->first();
+
+            $provisioning = ['status' => 'squad_only', 'user_created' => false, 'user_linked' => false];
+            if ($existingUser) {
+                $this->squadWiring->wireExistingUserToSquad($existingUser, $id);
+                $provisioning = [
+                    'status' => 'existing_user_linked',
+                    'user_created' => false,
+                    'user_linked' => true,
+                    'user_id' => (string) $existingUser->id,
+                    'user_unchanged' => true,
+                ];
+            } elseif ($createUser) {
+                $provisioning = $this->provisionUserForSquad($request->user(), $squad, $request->all());
+            }
+
+            return [
+                'squad' => DB::table(self::TABLE)->where('id', $id)->first(),
+                'provisioning' => $provisioning,
+            ];
+        });
+
+        return ApiResponse::ok([
+            'squad' => $this->formatSquad($result['squad']),
+            'user_provisioning' => $result['provisioning'],
+            'restored_from_soft_delete' => (bool) $archived,
+        ], $archived ? 'Data squad soft-delete berhasil dipulihkan.' : 'Data squad berhasil dibuat.', 201);
     }
 
     public function show(string $id)
     {
+        if (str_starts_with($id, 'user:')) {
+            $userId = substr($id, 5);
+            $user = User::query()
+                ->with(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level'])
+                ->find($userId);
+
+            if (! $user) {
+                return ApiResponse::error('Data user non-squad tidak ditemukan.', 'NOT_FOUND', 404);
+            }
+
+            return ApiResponse::ok($this->formatNonSquadUser($user), 'OK');
+        }
+
         $item = DB::table(self::TABLE)->select($this->detailColumns())->where('id', $id)->whereNull('deleted_at')->first();
-        if (!$item) {
+        if (! $item) {
             return ApiResponse::error('Data squad tidak ditemukan.', 'NOT_FOUND', 404);
         }
 
         return ApiResponse::ok($this->formatSquad($item), 'OK');
     }
 
+    private function completeSquadFromUser(Request $request)
+    {
+        $sourceValidator = Validator::make($request->all(), [
+            'source_user_id' => ['required', 'string', Rule::exists('users', 'id')],
+        ], [], [
+            'source_user_id' => 'Data User sumber',
+        ]);
+
+        if ($sourceValidator->fails()) {
+            return ApiResponse::error(
+                'Data User sumber tidak valid.',
+                'HR_COMPLETE_SQUAD_SOURCE_INVALID',
+                422,
+                $sourceValidator->errors()->toArray()
+            );
+        }
+
+        $user = User::query()
+            ->with(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level'])
+            ->find((string) $request->input('source_user_id'));
+
+        if (! $user) {
+            return ApiResponse::error('Data User sumber tidak ditemukan.', 'NOT_FOUND', 404);
+        }
+
+        $employee = $user->employee;
+        $assignment = $employee?->assignment;
+        $outlet = $assignment?->outlet ?: $user->outlet;
+        $nisj = $this->squadWiring->normalizeNisj($user->nisj ?: $employee?->nisj);
+
+        if ($nisj === '') {
+            return ApiResponse::error(
+                'Data Squad tidak dapat dilengkapi karena Data User belum memiliki NISJ.',
+                'HR_COMPLETE_SQUAD_NISJ_REQUIRED',
+                422,
+                [
+                    'nisj' => ['Isi NISJ pada User Management terlebih dahulu. NISJ adalah pivot utama Data User dan Data Squad.'],
+                    'source_user_id' => ['User ditemukan, tetapi NISJ pada users maupun employees kosong.'],
+                ]
+            );
+        }
+
+        $existingActive = $this->squadWiring->findSquadByNisj($nisj);
+        if ($existingActive) {
+            $this->squadWiring->wireExistingUserToSquad($user, $existingActive->id);
+
+            return ApiResponse::ok([
+                'squad' => $this->formatSquad(DB::table(self::TABLE)->where('id', $existingActive->id)->first()),
+                'already_existed' => true,
+                'warnings' => [],
+            ], 'Data Squad dengan NISJ yang sama sudah ada dan berhasil dihubungkan ke Data User.');
+        }
+
+        $archived = DB::table(self::TABLE)
+            ->whereNotNull('deleted_at')
+            ->whereRaw('LOWER(TRIM(`nisj`)) = ?', [mb_strtolower($nisj)])
+            ->first();
+
+        $roleCode = strtoupper(trim((string) ($user->accessAssignment?->role?->code ?? 'SQUAD')));
+        $levelCode = strtoupper(trim((string) ($user->accessAssignment?->level?->code ?? '')));
+        $defaults = [
+            'full_name' => trim((string) ($employee?->full_name ?: $user->name ?: $nisj)),
+            'nickname' => $employee?->nickname,
+            'email' => $user->email,
+            'status' => (bool) $user->is_active ? 'active' : 'inactive',
+            'nisj' => $nisj,
+            'assignment' => $outlet?->id ? (string) $outlet->id : null,
+            'position_name' => $assignment?->role_title,
+            'contract_start_date' => optional($assignment?->start_date)->toDateString(),
+            'contract_end_date' => optional($assignment?->end_date)->toDateString(),
+            'role_name' => $roleCode !== '' ? $roleCode : 'SQUAD',
+            'access_role' => $roleCode !== '' ? $roleCode : null,
+            'access_level' => $levelCode !== '' ? $levelCode : null,
+            'leave_quota' => 3,
+        ];
+
+        $allowed = array_flip(array_merge($this->detailColumns(), [
+            'full_name', 'nickname', 'nik', 'address', 'birth_place', 'birth_date', 'gender', 'religion',
+            'education', 'marital_status', 'children_count', 'whatsapp', 'email', 'status', 'nisj',
+            'employee_type', 'bank_name', 'bank_account', 'bpjs_number', 'bpjstk_number', 'faskes',
+            'ppi_status', 'contract_type', 'contract_start_date', 'contract_end_date', 'assignment',
+            'chamber_name', 'division_name', 'position_name', 'salary_tier_id', 'salary_tier_name',
+            'basic_salary', 'daily_salary', 'minute_deduction', 'hourly_overtime', 'bonus',
+            'family_allowance', 'position_allowance', 'cashbon', 'other', 'role_name', 'leave_quota',
+        ]));
+
+        $submitted = collect($request->all())
+            ->filter(fn ($value, $key) => isset($allowed[$key]))
+            ->all();
+        $input = array_merge($defaults, $submitted);
+
+        // Identitas pivot tidak boleh diganti dari modal Lengkapi Squad.
+        $input['nisj'] = $nisj;
+        $input['full_name'] = trim((string) ($input['full_name'] ?? '')) ?: $defaults['full_name'];
+        $input['status'] = strtolower((string) ($input['status'] ?? $defaults['status'])) === 'inactive' ? 'inactive' : 'active';
+
+        if (empty($input['salary_tier_id']) || ! DB::table(self::TIER_TABLE)->where('id', $input['salary_tier_id'])->whereNull('deleted_at')->exists()) {
+            $input['salary_tier_id'] = null;
+        }
+
+        $warnings = [];
+        $email = strtolower(trim((string) ($input['email'] ?? '')));
+        if ($email !== '') {
+            $emailUsed = DB::table(self::TABLE)
+                ->whereRaw('LOWER(TRIM(`email`)) = ?', [$email])
+                ->when($archived, fn ($query) => $query->where('id', '<>', $archived->id))
+                ->exists();
+            if ($emailUsed) {
+                $warnings[] = "Email {$email} sudah dipakai Data Squad lain sehingga field email Squad dikosongkan. Data User tidak diubah.";
+                $input['email'] = null;
+            }
+        } else {
+            $input['email'] = null;
+        }
+
+        $normalizedRequest = new Request($input);
+        $validator = $this->validator($normalizedRequest, $archived?->id ? (int) $archived->id : null);
+        if ($validator->fails()) {
+            return ApiResponse::error(
+                'Validasi Lengkapi Data Squad gagal. Periksa detail setiap field.',
+                'HR_COMPLETE_SQUAD_VALIDATION_FAILED',
+                422,
+                array_merge($validator->errors()->toArray(), [
+                    '_context' => [
+                        'source_user_id' => (string) $user->id,
+                        'nisj' => $nisj,
+                        'role_code' => $roleCode,
+                    ],
+                ])
+            );
+        }
+
+        $result = DB::transaction(function () use ($normalizedRequest, $archived, $user) {
+            $payload = $this->payload($normalizedRequest, $archived, false);
+            $now = Carbon::now();
+
+            if ($archived) {
+                $id = (int) $archived->id;
+                DB::table(self::TABLE)->where('id', $id)->update(array_merge($payload, [
+                    'deleted_at' => null,
+                    'updated_at' => $now,
+                ]));
+            } else {
+                $id = DB::table(self::TABLE)->insertGetId(array_merge($payload, [
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]));
+            }
+
+            $wired = $this->squadWiring->wireExistingUserToSquad($user, $id);
+            if (! $wired) {
+                throw new InvalidArgumentException('Data Squad berhasil disimpan tetapi wiring user_id gagal. Pastikan NISJ User dan Squad sama.');
+            }
+
+            return DB::table(self::TABLE)->where('id', $id)->first();
+        });
+
+        return ApiResponse::ok([
+            'squad' => $this->formatSquad($result),
+            'already_existed' => false,
+            'restored_from_soft_delete' => (bool) $archived,
+            'warnings' => $warnings,
+        ], $archived ? 'Data Squad berhasil dipulihkan dan dilengkapi dari Data User.' : 'Data Squad berhasil dilengkapi dari Data User.', 201);
+    }
+
     public function update(Request $request, string $id)
     {
         $item = DB::table(self::TABLE)->where('id', $id)->whereNull('deleted_at')->first();
-        if (!$item) {
+        if (! $item) {
             return ApiResponse::error('Data squad tidak ditemukan.', 'NOT_FOUND', 404);
         }
 
@@ -148,27 +396,35 @@ class HrSquadController extends Controller
             $payload['photo_path'] = $request->file('photo')->store('hr/squads', 'public');
         }
 
-        DB::table(self::TABLE)->where('id', $item->id)->update(array_merge($payload, [
-            'updated_at' => Carbon::now(),
-        ]));
+        DB::transaction(function () use ($item, $payload) {
+            DB::table(self::TABLE)->where('id', $item->id)->update(array_merge($payload, [
+                'updated_at' => Carbon::now(),
+            ]));
+            // Update Squad tidak mengubah Data User. Hanya reference teknis dipasang ulang berdasarkan NISJ.
+            $this->squadWiring->wireSquadByNisj($item->id);
+        });
 
         $fresh = DB::table(self::TABLE)->where('id', $item->id)->first();
-        return ApiResponse::ok($this->formatSquad($fresh), 'Data squad berhasil diperbarui.');
+        return ApiResponse::ok($this->formatSquad($fresh), 'Data squad berhasil diperbarui. Data User existing tidak diubah.');
     }
 
-    public function destroy(string $id)
+    public function destroy(Request $request, string $id)
     {
         $item = DB::table(self::TABLE)->where('id', $id)->whereNull('deleted_at')->first();
-        if (!$item) {
+        if (! $item) {
             return ApiResponse::error('Data squad tidak ditemukan.', 'NOT_FOUND', 404);
         }
 
-        DB::table(self::TABLE)->where('id', $item->id)->update([
-            'deleted_at' => Carbon::now(),
-            'updated_at' => Carbon::now(),
-        ]);
+        $linkedUser = $this->findUserForSquad($item);
+        $result = $this->lifecycle->purge($item, $linkedUser, $request->user());
 
-        return ApiResponse::ok(null, 'Data squad berhasil dihapus.');
+        if (filled($item->photo_path ?? null)) {
+            Storage::disk('public')->delete((string) $item->photo_path);
+        }
+
+        return ApiResponse::ok($result, $result['user_delete_mode'] === 'retired_tombstone_external_fk'
+            ? 'Data Squad dan seluruh data HR terkait berhasil dipurge. Akun User Management dihapus dari data aktif dan dianonimkan karena masih direferensikan transaksi non-HR.'
+            : 'Data Squad, akun User Management, kontrak, history, mapping schedule, dan seluruh data HR terkait berhasil dihapus.');
     }
 
     public function linkUser(Request $request, string $id)
@@ -181,25 +437,27 @@ class HrSquadController extends Controller
         $data = $request->validate([
             'user_id' => ['required', 'string', Rule::exists('users', 'id')],
         ]);
+        $user = User::query()->with(['employee', 'accessAssignment.role'])->findOrFail($data['user_id']);
 
-        $linkedElsewhere = DB::table(self::TABLE)
-            ->where('user_id', $data['user_id'])
-            ->where('id', '<>', $squad->id)
-            ->whereNull('deleted_at')
-            ->exists();
-
-        if ($linkedElsewhere) {
-            return ApiResponse::error('User sudah terhubung ke Data Squad lain.', 'HR_USER_ALREADY_LINKED', 422);
+        $squadNisj = mb_strtolower($this->squadWiring->normalizeNisj($squad->nisj ?? null));
+        $userNisj = mb_strtolower($this->squadWiring->normalizeNisj($user->nisj ?: $user->employee?->nisj));
+        if ($squadNisj === '' || $userNisj === '' || $squadNisj !== $userNisj) {
+            return ApiResponse::error(
+                'User hanya dapat dihubungkan jika NISJ Data User sama persis dengan NISJ Data Squad.',
+                'HR_NISJ_PIVOT_MISMATCH',
+                422,
+                ['nisj' => ['NISJ Data Squad dan Data User harus sama.']]
+            );
         }
 
-        DB::table(self::TABLE)->where('id', $squad->id)->update([
-            'user_id' => $data['user_id'],
-            'updated_at' => Carbon::now(),
-        ]);
+        $wired = $this->squadWiring->wireExistingUserToSquad($user, $squad->id);
+        if (! $wired) {
+            return ApiResponse::error('Wiring NISJ gagal dipasang.', 'HR_NISJ_WIRING_FAILED', 422);
+        }
 
         return ApiResponse::ok(
             $this->formatSquad(DB::table(self::TABLE)->where('id', $squad->id)->first()),
-            'User existing berhasil dihubungkan ke Data Squad.'
+            'User existing berhasil dihubungkan melalui pivot NISJ tanpa mengubah Data User.'
         );
     }
 
@@ -210,51 +468,36 @@ class HrSquadController extends Controller
             return $squad;
         }
 
-        if (! empty($squad->user_id)) {
-            return ApiResponse::error('Data Squad ini sudah memiliki user.', 'HR_SQUAD_USER_EXISTS', 422);
+        $nisj = $this->squadWiring->normalizeNisj($squad->nisj ?? null);
+        if ($nisj === '') {
+            return ApiResponse::error('NISJ Data Squad wajib diisi sebelum membuat Data User.', 'HR_SQUAD_NISJ_REQUIRED', 422);
         }
 
-        $data = $request->validate([
-            'name' => ['nullable', 'string', 'max:255'],
-            'email' => ['required', 'email', 'max:255', Rule::unique('users', 'email')],
-            'username' => ['required', 'string', 'max:100', Rule::unique('users', 'username')],
-            'nisj' => ['nullable', 'string', 'max:100'],
-            'outlet_id' => ['nullable', 'string', Rule::exists('outlets', 'id')],
-            'access_role_id' => ['required', 'string', Rule::exists('access_roles', 'id')],
-            'access_level_id' => ['nullable', 'string', Rule::exists('access_levels', 'id')],
-            'password' => ['required', 'string', 'min:8', 'confirmed'],
-        ]);
+        $existingUser = $this->squadWiring->findUserByNisj($nisj);
+        if ($existingUser) {
+            $this->squadWiring->wireExistingUserToSquad($existingUser, $squad->id);
+            return ApiResponse::ok([
+                'squad' => $this->formatSquad(DB::table(self::TABLE)->where('id', $squad->id)->first()),
+                'user_id' => (string) $existingUser->id,
+                'user_created' => false,
+                'user_unchanged' => true,
+            ], 'Data User dengan NISJ yang sama sudah ada dan berhasil dihubungkan tanpa perubahan.');
+        }
 
-        $result = DB::transaction(function () use ($request, $squad, $data) {
-            $created = $this->userManagement->createUser($request->user(), [
-                ...$data,
-                'name' => trim((string) ($data['name'] ?? '')) ?: (string) $squad->full_name,
-                'nisj' => trim((string) ($data['nisj'] ?? '')) ?: ($squad->nisj ?? null),
-                'assignment_role_title' => $squad->position_name ?? $squad->role_name ?? null,
-                'outlet_id' => $data['outlet_id'] ?? $this->resolveAssignmentOutletId($squad->assignment ?? null),
-                'is_active' => true,
-            ]);
+        $validator = $this->validateProvisionUserInput($request, false);
+        if ($validator->fails()) {
+            return ApiResponse::error('Validasi Data User gagal.', 'VALIDATION_ERROR', 422, $validator->errors()->toArray());
+        }
 
-            $user = $created['user'];
-            $access = $user->accessAssignment()->with(['role', 'level'])->first();
-
-            DB::table(self::TABLE)->where('id', $squad->id)->update([
-                'user_id' => (string) $user->id,
-                'username' => $user->username,
-                'access_role' => $access?->role?->code,
-                'access_level' => $access?->level?->code,
-                'updated_at' => Carbon::now(),
-            ]);
-
-            return $user;
-        });
-
+        $result = DB::transaction(fn () => $this->provisionUserForSquad($request->user(), $squad, $request->all()));
         $fresh = DB::table(self::TABLE)->where('id', $squad->id)->first();
 
         return ApiResponse::ok([
             'squad' => $this->formatSquad($fresh),
-            'user_id' => (string) $result->id,
-        ], 'User baru berhasil dibuat dan dihubungkan ke Data Squad.', 201);
+            'user_id' => $result['user_id'] ?? null,
+            'user_created' => (bool) ($result['user_created'] ?? false),
+            'default_password_used' => (bool) ($result['default_password_used'] ?? false),
+        ], 'User baru berhasil dibuat dan dihubungkan melalui pivot NISJ.', 201);
     }
 
     public function export(Request $request)
@@ -331,6 +574,7 @@ class HrSquadController extends Controller
                 'success' => false,
                 'inserted' => 0,
                 'updated' => 0,
+                'unchanged' => 0,
                 'error_count' => 1,
                 'errors' => [[
                     'line' => '-',
@@ -354,6 +598,7 @@ class HrSquadController extends Controller
                 'success' => false,
                 'inserted' => 0,
                 'updated' => 0,
+                'unchanged' => 0,
                 'error_count' => 1,
                 'errors' => [[
                     'line' => '-',
@@ -375,6 +620,7 @@ class HrSquadController extends Controller
                 'success' => false,
                 'inserted' => 0,
                 'updated' => 0,
+                'unchanged' => 0,
                 'error_count' => 1,
                 'errors' => [[
                     'line' => 2,
@@ -391,24 +637,12 @@ class HrSquadController extends Controller
             ]);
         }
 
-        $expected = $this->headers();
-        $header = array_map(fn ($value) => $this->normalizeHeader((string) $value), array_shift($rows));
-        $expectedNormalized = array_map(fn ($value) => $this->normalizeHeader((string) $value), $expected);
-        $headerMap = array_flip($header);
-        $missing = [];
-        foreach ($expectedNormalized as $index => $expectedName) {
-            if (!array_key_exists($expectedName, $headerMap)) {
-                $missing[] = $expected[$index];
-            }
-        }
-        if ($missing) {
-            return ApiResponse::error('Header import tidak sesuai template.', 'HR_IMPORT_HEADER_MISMATCH', 422, [
-                'success' => false,
-                'inserted' => 0,
-                'updated' => 0,
-                'error_count' => count($missing),
-                'missing_columns' => $missing,
-                'errors' => collect($missing)->map(fn ($column) => [
+        $rawHeader = array_shift($rows);
+        $headerResolution = $this->resolveImportHeaderMap($rawHeader);
+        if ($headerResolution['missing'] || $headerResolution['duplicates']) {
+            $headerErrors = [];
+            foreach ($headerResolution['missing'] as $column) {
+                $headerErrors[] = [
                     'line' => 1,
                     'name' => '-',
                     'nisj' => '-',
@@ -416,19 +650,50 @@ class HrSquadController extends Controller
                         'column' => $column,
                         'field' => $column,
                         'value' => '',
-                        'message' => 'Kolom/header tidak ditemukan di baris pertama.',
+                        'message' => 'Kolom wajib tidak ditemukan. Minimal wajib ada nisj dan full_name.',
                     ]],
-                ])->values()->all(),
-                'note' => 'Download ulang template terbaru, jangan mengganti nama kolom/header.',
+                ];
+            }
+            foreach ($headerResolution['duplicates'] as $duplicate) {
+                $headerErrors[] = [
+                    'line' => 1,
+                    'name' => '-',
+                    'nisj' => '-',
+                    'details' => [[
+                        'column' => $duplicate['canonical'],
+                        'field' => $duplicate['canonical'],
+                        'value' => implode(', ', $duplicate['headers']),
+                        'message' => 'Lebih dari satu header mengarah ke field yang sama. Hapus salah satu kolom duplikat.',
+                    ]],
+                ];
+            }
+
+            return ApiResponse::error('Header import tidak valid.', 'HR_IMPORT_HEADER_MISMATCH', 422, [
+                'success' => false,
+                'inserted' => 0,
+                'updated' => 0,
+                'unchanged' => 0,
+                'error_count' => count($headerErrors),
+                'missing_columns' => $headerResolution['missing'],
+                'duplicate_columns' => $headerResolution['duplicates'],
+                'errors' => $headerErrors,
+                'note' => 'Gunakan template terbaru. File template legacy tetap didukung selama memiliki kolom nisj dan full_name.',
             ]);
         }
 
         $inserted = 0;
         $updated = 0;
+        $unchanged = 0;
+        $restored = 0;
+        $usersCreated = 0;
+        $usersLinked = 0;
         $skipped = 0;
         $errors = [];
+        $rowResults = [];
+        $seenNisj = [];
         $line = 1;
         $totalRows = 0;
+
         foreach ($rows as $row) {
             $line++;
             if (count(array_filter($row, fn ($value) => trim((string) $value) !== '')) === 0) {
@@ -438,58 +703,150 @@ class HrSquadController extends Controller
             $totalRows++;
 
             $data = [];
-            foreach ($expected as $index => $column) {
-                $normalized = $expectedNormalized[$index];
-                $data[$column] = $this->normalizeImportCell($row[$headerMap[$normalized]] ?? '');
+            foreach ($headerResolution['map'] as $canonical => $index) {
+                $data[$canonical] = $this->normalizeImportCell($row[$index] ?? '');
             }
 
+            $mapped = [];
             try {
-                $mapped = $this->mapImportData($data);
-                $existing = $this->findExistingSquadForImport($mapped);
-
-                if ($existing) {
-                    // Field user read-only: jangan sampai validasi import gagal karena nilai template berbeda,
-                    // dan jangan sampai import existing mengubah username/password/access.
-                    $mapped['username'] = $existing->username;
-                    $mapped['password'] = $existing->password;
-                    $mapped['access_role'] = $existing->access_role;
-                    $mapped['access_level'] = $existing->access_level;
-                } else {
-                    foreach (['username', 'password', 'access_role', 'access_level'] as $userField) {
-                        $mapped[$userField] = null;
-                    }
+                $nisj = $this->normalizeImportIdentity($data['nisj'] ?? '');
+                $nisjKey = mb_strtolower($nisj);
+                if ($nisjKey !== '' && isset($seenNisj[$nisjKey])) {
+                    $errors[] = [
+                        'line' => $line,
+                        'row_number' => $line,
+                        'name' => $data['full_name'] ?? '',
+                        'nisj' => $nisj,
+                        'details' => [[
+                            'column' => 'nisj',
+                            'field' => 'nisj',
+                            'value' => $nisj,
+                            'message' => 'NISJ duplikat di file yang sama. Pertama kali ditemukan pada baris '.$seenNisj[$nisjKey].'.',
+                        ]],
+                        'error_text' => 'nisj: NISJ duplikat di file yang sama.',
+                    ];
+                    continue;
+                }
+                if ($nisjKey !== '') {
+                    $seenNisj[$nisjKey] = $line;
                 }
 
-                $fakeRequest = new Request($mapped);
-                $rowValidator = $this->validator($fakeRequest, $existing?->id ? (int) $existing->id : null, true);
+                $existing = $this->findExistingSquadForImport(['nisj' => $nisj]);
+                $mapped = $this->mapImportData($data, $existing !== null);
 
+                $validationPayload = $existing
+                    ? array_merge((array) $existing, $mapped)
+                    : $mapped;
+                foreach (['username', 'password', 'access_role', 'access_level'] as $readOnlyUserField) {
+                    $validationPayload[$readOnlyUserField] = $existing?->{$readOnlyUserField} ?? null;
+                }
+                // Excel menggunakan salary_tier_name; ID tier lama tidak boleh membuat import gagal
+                // bila master tier tersebut sudah dihapus atau berubah.
+                $validationPayload['salary_tier_id'] = null;
+
+                $fakeRequest = new Request($validationPayload);
+                $rowValidator = $this->validator($fakeRequest, $existing?->id ? (int) $existing->id : null, true);
                 if ($rowValidator->fails()) {
-                    $errors[] = $this->formatImportRowError($line, $mapped, $data, $rowValidator->errors()->toArray());
+                    $errors[] = $this->formatImportRowError($line, $validationPayload, $data, $rowValidator->errors()->toArray());
                     continue;
                 }
 
-                $now = Carbon::now();
-                if ($existing) {
-                    // Import Data Squad tidak boleh mengubah username/password/access role/access level existing.
-                    foreach (['username', 'password', 'access_role', 'access_level'] as $readOnlyUserField) {
-                        unset($mapped[$readOnlyUserField]);
+                $rowResult = DB::transaction(function () use ($request, $mapped, $existing) {
+                    $now = Carbon::now();
+                    if ($existing) {
+                        foreach (['id', 'user_id', 'username', 'password', 'access_role', 'access_level', 'created_at', 'updated_at', 'deleted_at'] as $readOnlyField) {
+                            unset($mapped[$readOnlyField]);
+                        }
+
+                        $updatePayload = $this->filterTablePayload($mapped);
+                        $changes = $this->detectImportChanges($existing, $updatePayload);
+                        $wasArchived = ! empty($existing->deleted_at);
+
+                        if ($changes || $wasArchived) {
+                            DB::table(self::TABLE)->where('id', $existing->id)->update(array_merge($updatePayload, [
+                                'deleted_at' => null,
+                                'updated_at' => $now,
+                            ]));
+                        }
+
+                        // Import Data Squad tidak pernah mengubah Data User existing.
+                        $matchingUser = $this->squadWiring->findUserByNisj($existing->nisj ?? ($mapped['nisj'] ?? null));
+                        if ($matchingUser) {
+                            $this->squadWiring->wireExistingUserToSquad($matchingUser, $existing->id);
+                        } else {
+                            $this->squadWiring->wireSquadByNisj($existing->id);
+                        }
+
+                        return [
+                            'kind' => ($changes || $wasArchived) ? 'updated' : 'unchanged',
+                            'restored' => $wasArchived,
+                            'changed_fields' => array_keys($changes),
+                            'user_created' => false,
+                            'user_linked' => $matchingUser !== null,
+                            'squad_id' => (int) $existing->id,
+                        ];
                     }
-                    $updatePayload = $this->filterTablePayload(array_merge($mapped, ['updated_at' => $now]));
-                    DB::table(self::TABLE)->where('id', $existing->id)->update($updatePayload);
-                    $updated++;
-                } else {
-                    $insertPayload = $this->filterTablePayload(array_merge($mapped, ['created_at' => $now, 'updated_at' => $now]));
-                    DB::table(self::TABLE)->insert($insertPayload);
-                    $inserted++;
-                }
+
+                    $insertPayload = $this->filterTablePayload(array_merge($mapped, [
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ]));
+                    $squadId = DB::table(self::TABLE)->insertGetId($insertPayload);
+                    $squad = DB::table(self::TABLE)->where('id', $squadId)->first();
+                    $matchingUser = $this->squadWiring->findUserByNisj($mapped['nisj'] ?? null);
+
+                    if ($matchingUser) {
+                        $this->squadWiring->wireExistingUserToSquad($matchingUser, $squadId);
+                        return [
+                            'kind' => 'inserted',
+                            'restored' => false,
+                            'changed_fields' => array_keys($insertPayload),
+                            'user_created' => false,
+                            'user_linked' => true,
+                            'squad_id' => (int) $squadId,
+                        ];
+                    }
+
+                    $provisioning = $this->provisionUserForSquad($request->user(), $squad, [
+                        'name' => $mapped['full_name'] ?? null,
+                        'email' => $mapped['email'] ?? null,
+                    ]);
+
+                    return [
+                        'kind' => 'inserted',
+                        'restored' => false,
+                        'changed_fields' => array_keys($insertPayload),
+                        'user_created' => (bool) ($provisioning['user_created'] ?? false),
+                        'user_linked' => (bool) ($provisioning['user_linked'] ?? false),
+                        'squad_id' => (int) $squadId,
+                    ];
+                });
+
+                match ($rowResult['kind']) {
+                    'inserted' => $inserted++,
+                    'updated' => $updated++,
+                    default => $unchanged++,
+                };
+                if ($rowResult['restored']) $restored++;
+                if ($rowResult['user_created']) $usersCreated++;
+                if ($rowResult['user_linked']) $usersLinked++;
+
+                $rowResults[] = [
+                    'line' => $line,
+                    'nisj' => $mapped['nisj'] ?? $nisj,
+                    'name' => $mapped['full_name'] ?? ($data['full_name'] ?? ''),
+                    'action' => $rowResult['kind'],
+                    'restored' => (bool) $rowResult['restored'],
+                    'changed_fields' => $rowResult['changed_fields'],
+                    'squad_id' => $rowResult['squad_id'],
+                ];
             } catch (\Throwable $exception) {
-                $errors[] = $this->formatImportExceptionRowError($line, $data, $mapped ?? [], $exception);
-                continue;
+                $errors[] = $this->formatImportExceptionRowError($line, $data, $mapped, $exception);
             }
         }
 
         $errorCount = count($errors);
-        $processed = $inserted + $updated;
+        $processed = $inserted + $updated + $unchanged;
         $success = $errorCount === 0;
         $summary = [
             'success' => $success,
@@ -498,26 +855,83 @@ class HrSquadController extends Controller
             'processed' => $processed,
             'inserted' => $inserted,
             'updated' => $updated,
+            'unchanged' => $unchanged,
+            'restored' => $restored,
+            'users_created' => $usersCreated,
+            'users_linked' => $usersLinked,
             'skipped' => $skipped,
             'errors' => $errors,
             'error_count' => $errorCount,
-            'note' => 'Import XLSX selesai. Data dengan NISJ sama akan diperbarui tanpa mengubah wiring user. Data baru masuk sebagai Data Squad tanpa membuat akun user otomatis.',
+            'row_results' => $rowResults,
+            'ignored_headers' => $headerResolution['unsupported'],
+            'note' => 'Upsert berdasarkan NISJ: data baru ditambah, data existing hanya mengubah field yang tersedia di Excel dan benar-benar berbeda, baris tanpa perubahan tidak ditulis ulang. Data User existing tidak pernah dioverwrite.',
         ];
 
         $message = $success
-            ? "Import sukses. {$inserted} data tambah, {$updated} data update, 0 error."
-            : "Import selesai dengan error. {$inserted} data tambah, {$updated} data update, {$errorCount} baris error.";
+            ? "Import sukses. {$inserted} data baru, {$updated} data berubah, {$unchanged} tanpa perubahan, {$usersCreated} user dibuat, 0 error."
+            : "Import parsial. {$inserted} data baru, {$updated} data berubah, {$unchanged} tanpa perubahan, {$errorCount} baris gagal. Buka detail error untuk melihat baris, kolom, nilai, dan penyebab.";
 
         return ApiResponse::ok($summary, $message);
     }
-
 
 
     private function applyStatusScope($query, string $status): void
     {
         if (in_array($status, ['active', 'inactive'], true)) {
             $query->where('status', $status);
+            $this->applyOperationalSquadScope($query);
         }
+    }
+
+    private function applyOperationalSquadScope($query): void
+    {
+        foreach (['role_name', 'access_role'] as $roleColumn) {
+            if (! Schema::hasColumn(self::TABLE, $roleColumn)) continue;
+            $query->where(function ($roleScope) use ($roleColumn) {
+                $roleScope->whereNull($roleColumn)
+                    ->orWhereRaw("UPPER(TRIM(COALESCE(`{$roleColumn}`, ''))) NOT IN ('STAKEHOLDER', 'OBSERVER')");
+            });
+        }
+
+        if (
+            Schema::hasColumn(self::TABLE, 'user_id')
+            && Schema::hasTable('user_access_assignments')
+            && Schema::hasTable('access_roles')
+        ) {
+            $query->whereNotExists(function ($subquery) {
+                $subquery->selectRaw('1')
+                    ->from('user_access_assignments as hr_i09_uaa')
+                    ->join('access_roles as hr_i09_ar', 'hr_i09_ar.id', '=', 'hr_i09_uaa.access_role_id')
+                    ->whereColumn('hr_i09_uaa.user_id', self::TABLE.'.user_id')
+                    ->whereIn('hr_i09_ar.code', ['STAKEHOLDER', 'OBSERVER']);
+            });
+        }
+    }
+
+    private function statusCounts(): array
+    {
+        if (! Schema::hasTable(self::TABLE)) {
+            return ['active' => 0, 'inactive' => 0, 'non_squad' => 0];
+        }
+
+        $base = DB::table(self::TABLE)->whereNull('deleted_at');
+        $active = clone $base;
+        $active->where('status', 'active');
+        $this->applyOperationalSquadScope($active);
+
+        $inactive = clone $base;
+        $inactive->where('status', 'inactive');
+        $this->applyOperationalSquadScope($inactive);
+
+        $nonSquad = Schema::hasTable('users')
+            ? $this->buildNonSquadUserQuery()->count()
+            : 0;
+
+        return [
+            'active' => (int) $active->count(),
+            'inactive' => (int) $inactive->count(),
+            'non_squad' => (int) $nonSquad,
+        ];
     }
 
     private function applySort($query, Request $request): void
@@ -552,6 +966,18 @@ class HrSquadController extends Controller
             }
         }
 
+        if ($request->boolean('exact_duplicate_name')) {
+            $query->whereNotNull('full_name')
+                ->whereRaw("TRIM(`HR_squads`.`full_name`) <> ''")
+                ->whereExists(function ($duplicate): void {
+                    $duplicate->selectRaw('1')
+                        ->from(self::TABLE.' as exact_duplicate_squad')
+                        ->whereNull('exact_duplicate_squad.deleted_at')
+                        ->whereColumn('exact_duplicate_squad.id', '<>', self::TABLE.'.id')
+                        ->whereRaw('BINARY TRIM(`exact_duplicate_squad`.`full_name`) = BINARY TRIM(`HR_squads`.`full_name`)');
+                });
+        }
+
         $keyword = trim((string) $request->query('keyword', ''));
         if ($keyword !== '') {
             $query->where(function ($q) use ($keyword) {
@@ -567,9 +993,9 @@ class HrSquadController extends Controller
 
     private function validator(Request $request, ?int $ignoreId, bool $importMode = false)
     {
-        $nisjUnique = Rule::unique(self::TABLE, 'nisj')->whereNull('deleted_at');
-        $emailUnique = Rule::unique(self::TABLE, 'email')->whereNull('deleted_at');
-        $usernameUnique = Rule::unique(self::TABLE, 'username')->whereNull('deleted_at');
+        $nisjUnique = Rule::unique(self::TABLE, 'nisj');
+        $emailUnique = Rule::unique(self::TABLE, 'email');
+        $usernameUnique = Rule::unique(self::TABLE, 'username');
         if ($ignoreId) {
             $nisjUnique = $nisjUnique->ignore($ignoreId);
             $emailUnique = $emailUnique->ignore($ignoreId);
@@ -591,7 +1017,7 @@ class HrSquadController extends Controller
             'whatsapp' => ['nullable', 'string', 'max:40'],
             'email' => ['nullable', 'email', 'max:180', $emailUnique],
             'status' => ['required', Rule::in(['active', 'inactive'])],
-            'nisj' => ['nullable', 'string', 'max:80', $nisjUnique],
+            'nisj' => [($importMode || $ignoreId === null) ? 'required' : 'nullable', 'string', 'max:32', $nisjUnique],
             'employee_type' => ['nullable', 'string', 'max:80'],
             'bank_name' => ['nullable', 'string', 'max:100'],
             'bank_account' => ['nullable', 'string', 'max:100'],
@@ -677,8 +1103,8 @@ class HrSquadController extends Controller
             'position_allowance' => $money('position_allowance'),
             'cashbon' => $money('cashbon'),
             'other' => $money('other'),
-            // Data Squad dan user sekarang memiliki lifecycle terpisah.
-            // Record baru tidak otomatis membuat kredensial; wiring dilakukan dari tab Data User.
+            // NISJ adalah pivot utama. Field kredensial di tabel legacy hanya dipertahankan untuk kompatibilitas;
+            // pembuatan/update Data Squad tidak pernah mengubah kredensial Data User existing.
             'username' => $existing?->username,
             'password' => $existing?->password,
             'role_name' => $this->normalizeUserRole($value('role_name')),
@@ -691,7 +1117,7 @@ class HrSquadController extends Controller
     private function listColumns(): array
     {
         $columns = [
-            'id', 'user_id', 'full_name', 'nickname', 'nisj', 'email', 'status', 'employee_type', 'assignment',
+            'id', 'user_id', 'full_name', 'nickname', 'nisj', 'email', 'birth_date', 'status', 'employee_type', 'assignment',
             'division_name', 'position_name', 'role_name', 'access_role', 'access_level', 'photo_path',
             'contract_type', 'contract_start_date', 'contract_end_date', 'leave_quota', 'updated_at',
         ];
@@ -710,9 +1136,12 @@ class HrSquadController extends Controller
         $data['password'] = '';
         $data['password_is_decryptable'] = false;
         $data['assignment_name'] = $this->resolveAssignmentName($item->assignment ?? null);
+        $user = $this->findUserForSquad($item);
         $data['has_squad'] = true;
-        $data['has_user'] = ! empty($item->user_id);
-        return $data;
+        $data['has_user'] = $user !== null;
+        $data['user_id'] = $user ? (string) $user->id : ($item->user_id ?? null);
+        $data['source_kind'] = 'squad';
+        return $this->lifecycle->decorateList($data);
     }
 
     private function formatSquad(object $item): array
@@ -721,113 +1150,119 @@ class HrSquadController extends Controller
         $data['password'] = '';
         $data['password_is_decryptable'] = false;
         $data['assignment_name'] = $this->resolveAssignmentName($item->assignment ?? null);
+        $user = $this->findUserForSquad($item);
         $data['has_squad'] = true;
-        $data['has_user'] = ! empty($item->user_id);
-        $data['user'] = $this->serializeUser($item->user_id ?? null);
-        $data['user_candidate'] = empty($item->user_id) ? $this->findUserCandidate($item) : null;
-        return $data;
+        $data['has_user'] = $user !== null;
+        $data['user_id'] = $user ? (string) $user->id : ($item->user_id ?? null);
+        $data['source_kind'] = 'squad';
+        $data['user'] = $user ? $this->serializeUserModel($user) : null;
+        $data['user_candidate'] = ! $user ? $this->findUserCandidate($item) : null;
+        $data['pivot'] = [
+            'key' => 'nisj',
+            'nisj' => $this->squadWiring->normalizeNisj($item->nisj ?? null),
+            'is_wired' => $user !== null,
+        ];
+        return $this->lifecycle->decorateDetail($data);
+    }
+
+    private function buildNonSquadUserQuery()
+    {
+        $query = User::query()
+            // Non-Squad hanya berisi role eksplisit Stakeholder/Observer atau user tanpa NISJ.
+            // User operasional dengan NISJ dimaterialisasi ke HR_squads oleh reconciliation.
+            ->where(function ($eligible) {
+                $eligible->whereHas('accessAssignment.role', function ($role) {
+                    $role->whereIn('code', ['STAKEHOLDER', 'OBSERVER']);
+                })->orWhere(function ($withoutNisj) {
+                    $withoutNisj->where(function ($userNisj) {
+                        $userNisj->whereNull('users.nisj')
+                            ->orWhereRaw("TRIM(COALESCE(users.nisj, '')) = ''");
+                    })->whereDoesntHave('employee', function ($employee) {
+                        $employee->whereNotNull('nisj')
+                            ->whereRaw("TRIM(COALESCE(nisj, '')) <> ''");
+                    });
+                });
+            })
+            ->whereNotExists(function ($subquery) {
+                $subquery->selectRaw('1')
+                    ->from(self::TABLE.' as pivot_squads')
+                    ->whereNull('pivot_squads.deleted_at')
+                    ->where(function ($match) {
+                        $match->whereColumn('pivot_squads.user_id', 'users.id')
+                            ->orWhere(function ($byNisj) {
+                                $byNisj->whereNotNull('users.nisj')
+                                    ->whereRaw("TRIM(COALESCE(users.nisj, '')) <> ''")
+                                    ->whereRaw('LOWER(TRIM(pivot_squads.nisj)) = LOWER(TRIM(users.nisj))');
+                            });
+                    });
+            });
+
+        if (Schema::hasColumn('users', 'hr_retired_at')) {
+            $query->whereNull('users.hr_retired_at');
+        }
+
+        return $query;
     }
 
     private function nonSquadIndex(Request $request, int|string $perPage)
     {
-        if (! Schema::hasTable('users') || ! Schema::hasColumn(self::TABLE, 'user_id')) {
+        if (! Schema::hasTable('users') || ! Schema::hasTable(self::TABLE)) {
             return ApiResponse::ok([
                 'items' => [],
                 'pagination' => ['current_page' => 1, 'per_page' => $perPage, 'total' => 0, 'last_page' => 1],
             ], 'OK');
         }
 
-        $query = DB::table('users as users')
-            ->leftJoin(self::TABLE.' as squads', function ($join) {
-                $join->on('squads.user_id', '=', 'users.id')->whereNull('squads.deleted_at');
-            })
-            ->leftJoin('outlets as outlets', 'outlets.id', '=', 'users.outlet_id')
-            ->leftJoin('user_access_assignments as user_access', 'user_access.user_id', '=', 'users.id')
-            ->leftJoin('access_roles as access_roles', 'access_roles.id', '=', 'user_access.access_role_id')
-            ->leftJoin('access_levels as access_levels', 'access_levels.id', '=', 'user_access.access_level_id')
-            ->whereNull('squads.id')
-            ->select([
-                'users.id as user_id',
-                'users.name as full_name',
-                'users.nisj',
-                'users.username',
-                'users.email',
-                'users.is_active',
-                'users.outlet_id as assignment',
-                'outlets.name as assignment_name',
-                'outlets.type as assignment_type',
-                'access_roles.code as role_name',
-                'access_roles.code as access_role',
-                'access_levels.code as access_level',
-                'users.updated_at',
-            ]);
+        $query = $this->buildNonSquadUserQuery()
+            ->with(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level']);
 
         $search = trim((string) $request->query('search', ''));
         if ($search !== '') {
             $query->where(function ($inner) use ($search) {
-                $inner->where('users.name', 'like', "%{$search}%")
-                    ->orWhere('users.nisj', 'like', "%{$search}%")
-                    ->orWhere('users.username', 'like', "%{$search}%")
-                    ->orWhere('users.email', 'like', "%{$search}%")
-                    ->orWhere('access_roles.code', 'like', "%{$search}%");
+                $inner->where('name', 'like', "%{$search}%")
+                    ->orWhere('nisj', 'like', "%{$search}%")
+                    ->orWhere('username', 'like', "%{$search}%")
+                    ->orWhere('email', 'like', "%{$search}%")
+                    ->orWhereHas('accessAssignment.role', fn ($role) => $role->where('code', 'like', "%{$search}%"));
             });
         }
 
         $outlet = trim((string) $request->query('outlet', ''));
         if ($outlet !== '') {
             $query->where(function ($inner) use ($outlet) {
-                $inner->where('users.outlet_id', $outlet)
-                    ->orWhere('outlets.name', $outlet)
-                    ->orWhere('outlets.code', $outlet)
-                    ->orWhere('outlets.hr_outlet_id', $outlet);
+                $inner->where('outlet_id', $outlet)
+                    ->orWhereHas('employee.assignment.outlet', function ($outletQuery) use ($outlet) {
+                        $outletQuery->where('id', $outlet)
+                            ->orWhere('name', $outlet)
+                            ->orWhere('code', $outlet)
+                            ->orWhere('hr_outlet_id', $outlet);
+                    });
             });
         }
 
         $direction = strtolower((string) $request->query('sort_direction', 'asc')) === 'desc' ? 'desc' : 'asc';
         $sortColumns = [
-            'full_name' => 'users.name',
-            'nisj' => 'users.nisj',
-            'email' => 'users.email',
-            'role_name' => 'access_roles.code',
-            'assignment' => 'outlets.name',
-            'status' => 'users.is_active',
+            'full_name' => 'name',
+            'nisj' => 'nisj',
+            'email' => 'email',
+            'status' => 'is_active',
         ];
-        $query->orderBy($sortColumns[$request->query('sort_by', 'full_name')] ?? 'users.name', $direction)
-            ->orderBy('users.id');
-
-        $format = fn ($item) => [
-            'id' => 'user:'.(string) $item->user_id,
-            'user_id' => (string) $item->user_id,
-            'full_name' => $item->full_name,
-            'nickname' => null,
-            'nisj' => $item->nisj,
-            'username' => $item->username,
-            'email' => $item->email,
-            'status' => (bool) $item->is_active ? 'active' : 'inactive',
-            'assignment' => $item->assignment,
-            'assignment_name' => $item->assignment_name,
-            'assignment_type' => $item->assignment_type,
-            'role_name' => $item->role_name,
-            'access_role' => $item->access_role,
-            'access_level' => $item->access_level,
-            'updated_at' => $item->updated_at,
-            'has_squad' => false,
-            'has_user' => true,
-            'source_kind' => 'user_without_squad',
-        ];
+        $query->orderBy($sortColumns[$request->query('sort_by', 'full_name')] ?? 'name', $direction)
+            ->orderBy('id');
 
         if ($perPage === 'all') {
             $rows = $query->get();
             return ApiResponse::ok([
-                'items' => $rows->map($format)->values(),
+                'items' => $rows->map(fn (User $user) => $this->formatNonSquadUser($user))->values(),
+                'counts' => $this->statusCounts(),
                 'pagination' => ['current_page' => 1, 'per_page' => 'all', 'total' => $rows->count(), 'last_page' => 1],
             ], 'OK');
         }
 
         $paginator = $query->paginate($perPage);
-
         return ApiResponse::ok([
-            'items' => collect($paginator->items())->map($format)->values(),
+            'items' => collect($paginator->items())->map(fn (User $user) => $this->formatNonSquadUser($user))->values(),
+            'counts' => $this->statusCounts(),
             'pagination' => [
                 'current_page' => $paginator->currentPage(),
                 'per_page' => $paginator->perPage(),
@@ -920,67 +1355,286 @@ class HrSquadController extends Controller
         return $this->outletLookup;
     }
 
-    private function serializeUser($userId): ?array
+    private function serializeUser($userId, mixed $nisj = null): ?array
     {
-        if (! $userId) {
-            return null;
+        $user = $this->squadWiring->findUserByNisj($nisj);
+        if (! $user && $userId) {
+            $user = User::query()
+                ->with(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level'])
+                ->find($userId);
         }
 
-        $user = User::query()
-            ->with(['outlet', 'accessAssignment.role', 'accessAssignment.level'])
-            ->find($userId);
-
-        if (! $user) {
-            return null;
-        }
-
-        return [
-            'id' => (string) $user->id,
-            'name' => $user->name,
-            'nisj' => $user->nisj,
-            'username' => $user->username,
-            'email' => $user->email,
-            'is_active' => (bool) $user->is_active,
-            'outlet' => $user->outlet ? [
-                'id' => (string) $user->outlet->id,
-                'name' => $user->outlet->name,
-                'type' => $user->outlet->type,
-            ] : null,
-            'access_role' => $user->accessAssignment?->role?->code,
-            'access_level' => $user->accessAssignment?->level?->code,
-        ];
+        return $user ? $this->serializeUserModel($user) : null;
     }
 
     private function findUserCandidate(object $squad): ?array
     {
-        $identities = collect([
-            'nisj' => $squad->nisj ?? null,
-            'username' => $squad->username ?? null,
-            'email' => $squad->email ?? null,
-        ])->map(fn ($value) => mb_strtolower(trim((string) $value)))->filter();
-
-        if ($identities->isEmpty()) {
+        $candidate = $this->squadWiring->findUserByNisj($squad->nisj ?? null);
+        if (! $candidate) {
             return null;
         }
 
-        $candidate = User::query()
-            ->where(function ($query) use ($identities) {
-                foreach ($identities as $column => $value) {
-                    if (Schema::hasColumn('users', $column)) {
-                        $query->orWhereRaw("LOWER(TRIM(`{$column}`)) = ?", [$value]);
-                    }
-                }
+        $linkedElsewhere = DB::table(self::TABLE)
+            ->whereNull('deleted_at')
+            ->where('id', '<>', $squad->id)
+            ->where(function ($query) use ($candidate) {
+                $query->where('user_id', (string) $candidate->id)
+                    ->orWhereRaw('LOWER(TRIM(`nisj`)) = ?', [mb_strtolower($this->squadWiring->normalizeNisj($candidate->nisj))]);
             })
-            ->whereNotIn('id', DB::table(self::TABLE)->whereNull('deleted_at')->whereNotNull('user_id')->pluck('user_id'))
-            ->first();
+            ->exists();
 
-        return $candidate ? [
+        if ($linkedElsewhere) {
+            return null;
+        }
+
+        return [
             'id' => (string) $candidate->id,
             'name' => $candidate->name,
             'nisj' => $candidate->nisj,
             'username' => $candidate->username,
             'email' => $candidate->email,
-        ] : null;
+        ];
+    }
+
+    private function findUserForSquad(object $squad): ?User
+    {
+        $user = $this->squadWiring->findUserByNisj($squad->nisj ?? null);
+        if (! $user && ! empty($squad->user_id)) {
+            $user = User::query()
+                ->with(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level'])
+                ->find($squad->user_id);
+        }
+        return $user;
+    }
+
+    private function serializeUserModel(User $user): array
+    {
+        $user->loadMissing(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level']);
+        $employee = $user->employee;
+        $assignment = $employee?->assignment;
+        $outlet = $assignment?->outlet ?: $user->outlet;
+
+        return [
+            'id' => (string) $user->id,
+            'name' => $user->name,
+            'full_name' => $employee?->full_name ?: $user->name,
+            'nickname' => $employee?->nickname,
+            'nisj' => $user->nisj ?: $employee?->nisj,
+            'username' => $user->username,
+            'email' => $user->email,
+            'is_active' => (bool) $user->is_active,
+            'employee' => $employee ? [
+                'id' => (string) $employee->id,
+                'employee_no' => $employee->hr_employee_id,
+                'employment_status' => $employee->employment_status,
+            ] : null,
+            'assignment' => $assignment ? [
+                'id' => (string) $assignment->id,
+                'role_title' => $assignment->role_title,
+                'start_date' => optional($assignment->start_date)->toDateString(),
+                'end_date' => optional($assignment->end_date)->toDateString(),
+                'status' => $assignment->status,
+            ] : null,
+            'outlet' => $outlet ? [
+                'id' => (string) $outlet->id,
+                'name' => $outlet->name,
+                'code' => $outlet->code,
+                'type' => $outlet->type,
+            ] : null,
+            'access_role' => $user->accessAssignment?->role?->code,
+            'access_role_name' => $user->accessAssignment?->role?->name,
+            'access_level' => $user->accessAssignment?->level?->code,
+            'access_level_name' => $user->accessAssignment?->level?->name,
+        ];
+    }
+
+    private function formatNonSquadUser(User $user): array
+    {
+        $user->loadMissing(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level']);
+        $employee = $user->employee;
+        $assignment = $employee?->assignment;
+        $outlet = $assignment?->outlet ?: $user->outlet;
+        $columns = Schema::getColumnListing(self::TABLE);
+        $data = array_fill_keys($columns, null);
+
+        $data = array_merge($data, [
+            'id' => 'user:'.(string) $user->id,
+            'user_id' => (string) $user->id,
+            'full_name' => $employee?->full_name ?: $user->name,
+            'nickname' => $employee?->nickname,
+            'nisj' => $user->nisj ?: $employee?->nisj,
+            'email' => $user->email,
+            'status' => (bool) $user->is_active ? 'active' : 'inactive',
+            'assignment' => $outlet?->id ? (string) $outlet->id : null,
+            'assignment_name' => $outlet?->name,
+            'assignment_type' => $outlet?->type,
+            'position_name' => $assignment?->role_title,
+            'role_name' => $user->accessAssignment?->role?->code,
+            'access_role' => $user->accessAssignment?->role?->code,
+            'access_level' => $user->accessAssignment?->level?->code,
+            'contract_start_date' => optional($assignment?->start_date)->toDateString(),
+            'contract_end_date' => optional($assignment?->end_date)->toDateString(),
+            'username' => $user->username,
+            'updated_at' => $user->updated_at,
+            'password' => '',
+            'password_is_decryptable' => false,
+            'has_squad' => false,
+            'has_user' => true,
+            'source_kind' => 'user_without_squad',
+            'user' => $this->serializeUserModel($user),
+            'user_candidate' => null,
+            'pivot' => [
+                'key' => 'nisj',
+                'nisj' => $this->squadWiring->normalizeNisj($user->nisj ?: $employee?->nisj),
+                'is_wired' => false,
+            ],
+        ]);
+
+        unset($data['deleted_at'], $data['password_plain_encrypted']);
+        return $data;
+    }
+
+    private function validateProvisionUserInput(Request $request, bool $prefixed = true)
+    {
+        $prefix = $prefixed ? 'user_' : '';
+        $password = $prefix.'password';
+        $rules = [
+            $prefix.'name' => ['nullable', 'string', 'max:255'],
+            $prefix.'email' => ['nullable', 'email', 'max:255'],
+            $prefix.'username' => ['nullable', 'string', 'max:100'],
+            $prefix.'outlet_id' => ['nullable', 'string', Rule::exists('outlets', 'id')],
+            $prefix.'access_role_id' => ['nullable', 'string', Rule::exists('access_roles', 'id')],
+            $prefix.'access_level_id' => ['nullable', 'string', Rule::exists('access_levels', 'id')],
+            $password => ['nullable', 'string', 'min:8'],
+            $password.'_confirmation' => ['nullable', 'same:'.$password],
+        ];
+
+        return Validator::make($request->all(), $rules);
+    }
+
+    private function provisionUserForSquad(User $actor, object $squad, array $input = []): array
+    {
+        $nisj = $this->squadWiring->normalizeNisj($squad->nisj ?? null);
+        if ($nisj === '') {
+            throw new InvalidArgumentException('NISJ wajib diisi untuk generate Data User.');
+        }
+
+        $existing = $this->squadWiring->findUserByNisj($nisj);
+        if ($existing) {
+            $this->squadWiring->wireExistingUserToSquad($existing, $squad->id);
+            return [
+                'status' => 'existing_user_linked',
+                'user_created' => false,
+                'user_linked' => true,
+                'user_id' => (string) $existing->id,
+                'user_unchanged' => true,
+                'default_password_used' => false,
+            ];
+        }
+
+        $pick = function (string $key, mixed $fallback = null) use ($input) {
+            $prefixed = 'user_'.$key;
+            return array_key_exists($prefixed, $input) ? $input[$prefixed] : ($input[$key] ?? $fallback);
+        };
+
+        $requestedPassword = trim((string) $pick('password', ''));
+        $password = $requestedPassword !== '' ? $requestedPassword : 'password123';
+        $outletId = trim((string) $pick('outlet_id', '')) ?: $this->resolveAssignmentOutletId($squad->assignment ?? null);
+        $roleId = $this->resolveProvisionAccessRoleId($pick('access_role_id'), $squad);
+        $levelId = $this->resolveProvisionAccessLevelId($pick('access_level_id'), $squad, $outletId);
+
+        $created = $this->userManagement->createUser($actor, [
+            'name' => trim((string) $pick('name', $squad->full_name ?? $nisj)) ?: $nisj,
+            'email' => $this->availableUserEmail($pick('email', $squad->email ?? null), $nisj),
+            'username' => $this->availableUsername($pick('username', $nisj), $nisj),
+            'nisj' => $nisj,
+            'assignment_role_title' => $squad->position_name ?? $squad->role_name ?? null,
+            'outlet_id' => $outletId,
+            'access_role_id' => $roleId,
+            'access_level_id' => $levelId,
+            'password' => $password,
+            'password_confirmation' => $password,
+            'is_active' => strtolower((string) ($squad->status ?? 'active')) !== 'inactive',
+        ]);
+
+        $user = $created['user'];
+        $this->squadWiring->wireExistingUserToSquad($user, $squad->id);
+
+        return [
+            'status' => 'user_created',
+            'user_created' => true,
+            'user_linked' => true,
+            'user_id' => (string) $user->id,
+            'user_unchanged' => false,
+            'default_password_used' => $requestedPassword === '',
+        ];
+    }
+
+    private function resolveProvisionAccessRoleId(mixed $requestedId, object $squad): string
+    {
+        $requestedId = trim((string) $requestedId);
+        if ($requestedId !== '' && DB::table('access_roles')->where('id', $requestedId)->exists()) {
+            return $requestedId;
+        }
+
+        $code = strtoupper(trim((string) ($squad->access_role ?? $squad->role_name ?? 'SQUAD_DEFAULT')));
+        if ($code === '' || $code === 'SQUAD') {
+            $code = 'SQUAD_DEFAULT';
+        }
+
+        $role = DB::table('access_roles')->where('code', $code)->first()
+            ?: DB::table('access_roles')->where('code', 'SQUAD_DEFAULT')->first()
+            ?: DB::table('access_roles')->where('code', 'CASHIER')->first()
+            ?: DB::table('access_roles')->orderBy('name')->first();
+
+        if (! $role) {
+            throw new InvalidArgumentException('Master Access Role belum tersedia.');
+        }
+        return (string) $role->id;
+    }
+
+    private function resolveProvisionAccessLevelId(mixed $requestedId, object $squad, ?string $outletId): ?string
+    {
+        $requestedId = trim((string) $requestedId);
+        if ($requestedId !== '' && DB::table('access_levels')->where('id', $requestedId)->exists()) {
+            return $requestedId;
+        }
+
+        $code = strtoupper(trim((string) ($squad->access_level ?? '')));
+        $level = $code !== '' ? DB::table('access_levels')->where('code', $code)->first() : null;
+        $level = $level
+            ?: ($outletId ? DB::table('access_levels')->where('code', 'OUTLET')->first() : null)
+            ?: DB::table('access_levels')->where('code', 'DEFAULT')->first()
+            ?: DB::table('access_levels')->orderBy('name')->first();
+
+        return $level ? (string) $level->id : null;
+    }
+
+    private function availableUsername(mixed $requested, string $nisj): string
+    {
+        $base = trim((string) $requested) ?: $nisj;
+        $candidate = $base;
+        $suffix = 2;
+        while (User::query()->whereRaw('LOWER(TRIM(`username`)) = ?', [mb_strtolower($candidate)])->exists()) {
+            $candidate = mb_substr($base, 0, 90).'-'.$suffix++;
+        }
+        return $candidate;
+    }
+
+    private function availableUserEmail(mixed $requested, string $nisj): string
+    {
+        $requested = strtolower(trim((string) $requested));
+        if ($requested !== '' && filter_var($requested, FILTER_VALIDATE_EMAIL) && ! User::query()->whereRaw('LOWER(TRIM(`email`)) = ?', [$requested])->exists()) {
+            return $requested;
+        }
+
+        $local = preg_replace('/[^a-z0-9._-]+/i', '-', strtolower($nisj)) ?: 'squad';
+        $candidate = $local.'@hr-squad.local';
+        $suffix = 2;
+        while (User::query()->whereRaw('LOWER(TRIM(`email`)) = ?', [$candidate])->exists()) {
+            $candidate = $local.'-'.$suffix++.'@hr-squad.local';
+        }
+        return $candidate;
     }
 
     private function findSquadOrFail(string $id): object
@@ -996,11 +1650,11 @@ class HrSquadController extends Controller
     private function sampleImportRow(): array
     {
         return [
-            '10012500001', '3573xxxxxxxxxxxx', 'CONTOH SQUAD', 'CONTOH', 'L', 'MALANG', '1998-01-31',
-            'Islam', 'Alamat lengkap', '62812xxxx', 'SMA', 'Belum Menikah', '0',
-            'official', 'active', 'TIER 1', now()->toDateString(), '',
-            'Outlet A', '50000', '104', '6250', '0', '0', '0',
-            '', 'contoh@email.com', 'SQUAD',
+            '10012500001', 'CONTOH SQUAD', 'CONTOH', '3573xxxxxxxxxxxx', 'Alamat lengkap',
+            'MALANG', '1998-01-31', 'Laki-Laki', 'Islam', 'SMA', 'Belum Menikah', '0',
+            '62812xxxx', 'contoh@email.com', 'active', 'OFFICIAL', 'BCA', '1234567890',
+            '', '', '', '0', 'SPT', now()->toDateString(), '', 'Outlet A', '', '', 'BARISTA',
+            'TIER 1', '5000000', '200000', '104', '25000', '0', '0', '0', '0', '0', 'SQUAD', '3',
         ];
     }
 
@@ -1011,65 +1665,13 @@ class HrSquadController extends Controller
 
     private function readXlsxRows(string $path): array
     {
-        $entries = $this->readXlsxPackage($path);
-
-        $sharedStrings = [];
-        $sharedXml = $entries['xl/sharedStrings.xml'] ?? false;
-        if ($sharedXml !== false) {
-            $xml = @simplexml_load_string($sharedXml);
-            if ($xml) {
-                foreach ($xml->si as $si) {
-                    $text = '';
-                    if (isset($si->t)) {
-                        $text = (string) $si->t;
-                    } elseif (isset($si->r)) {
-                        foreach ($si->r as $run) {
-                            $text .= (string) $run->t;
-                        }
-                    }
-                    $sharedStrings[] = $text;
-                }
-            }
-        }
-
-        $sheetXml = $entries['xl/worksheets/sheet1.xml'] ?? false;
-        if ($sheetXml === false) {
-            throw new InvalidArgumentException('Worksheet pertama tidak ditemukan di file XLSX.');
-        }
-
-        $xml = @simplexml_load_string($sheetXml);
-        if (!$xml || !isset($xml->sheetData)) {
-            throw new InvalidArgumentException('Worksheet XLSX tidak dapat dibaca.');
-        }
-
-        $rows = [];
-        foreach ($xml->sheetData->row as $rowNode) {
-            $row = [];
-            foreach ($rowNode->c as $cell) {
-                $cellRef = (string) $cell['r'];
-                $columnIndex = $this->xlsxColumnIndex($cellRef);
-                $type = (string) $cell['t'];
-                $value = '';
-
-                if ($type === 'inlineStr') {
-                    $value = isset($cell->is->t) ? (string) $cell->is->t : '';
-                } elseif ($type === 's') {
-                    $valueIndex = (int) ($cell->v ?? 0);
-                    $value = $sharedStrings[$valueIndex] ?? '';
-                } else {
-                    $value = isset($cell->v) ? (string) $cell->v : '';
-                }
-
-                $row[$columnIndex] = $value;
-            }
-            if ($row) {
-                ksort($row);
-                $max = max(array_keys($row));
-                $rows[] = array_map(fn ($index) => $row[$index] ?? '', range(0, $max));
-            }
-        }
-
-        return $rows;
+        // Use the shared OpenXML reader instead of parsing worksheet XML via
+        // SimpleXML directly. Excel generators are free to emit the SpreadsheetML
+        // namespace using a prefix (for example <x:worksheet>/<x:sheetData>),
+        // while the previous implementation only recognized unprefixed nodes.
+        // SimpleXlsxService reads elements by local name, supports prefixed and
+        // default namespaces, shared strings, inline strings, and the ZIP fallback.
+        return $this->xlsx->read($path);
     }
 
 
@@ -1159,6 +1761,57 @@ class HrSquadController extends Controller
         return trim(preg_replace('/\s+/', ' ', $value) ?? $value);
     }
 
+    private function resolveImportHeaderMap(array $rawHeader): array
+    {
+        $aliasLookup = [];
+        foreach ($this->importHeaderAliases() as $canonical => $aliases) {
+            foreach ($aliases as $alias) {
+                $aliasLookup[mb_strtolower($this->normalizeHeader((string) $alias))] = $canonical;
+            }
+        }
+
+        $map = [];
+        $seenHeaders = [];
+        $duplicates = [];
+        $unsupported = [];
+
+        foreach (array_values($rawHeader) as $index => $headerValue) {
+            $header = $this->normalizeHeader((string) $headerValue);
+            $normalized = mb_strtolower($header);
+            if ($normalized === '') {
+                continue;
+            }
+
+            $canonical = $aliasLookup[$normalized] ?? null;
+            if (! $canonical) {
+                $unsupported[] = $header;
+                continue;
+            }
+
+            if (isset($map[$canonical])) {
+                $duplicates[$canonical] ??= [
+                    'canonical' => $canonical,
+                    'headers' => [$seenHeaders[$canonical]],
+                ];
+                $duplicates[$canonical]['headers'][] = $header;
+                continue;
+            }
+
+            $map[$canonical] = $index;
+            $seenHeaders[$canonical] = $header;
+        }
+
+        $required = ['nisj', 'full_name'];
+        $missing = array_values(array_filter($required, fn ($column) => ! array_key_exists($column, $map)));
+
+        return [
+            'map' => $map,
+            'missing' => $missing,
+            'duplicates' => array_values($duplicates),
+            'unsupported' => array_values(array_unique($unsupported)),
+        ];
+    }
+
     private function xlsxResponse(string $filename, array $rows)
     {
         $binary = $this->buildSimpleXlsx($rows);
@@ -1236,110 +1889,195 @@ class HrSquadController extends Controller
 
     private function headers(): array
     {
-        // Format mengikuti HR.zip / dbHR employees agar file export/template dari HR lama
-        // bisa langsung dipakai sebagai format upload devHR di POS.
+        // Format canonical Iterasi 03. Export dapat langsung diedit lalu di-import kembali.
         return [
-            'nisj', 'nik', 'full_name', 'nickname', 'gender', 'birth_place', 'birth_date',
-            'religion', 'address', 'phone', 'education', 'marital_status', 'anak',
-            'employment_type', 'employment_status', 'tier', 'join_date', 'resign_date',
-            'assignment_id', 'basic_salary', 'basic_cut', 'basic_ovt', 'bonus1', 'bonus2', 'bonus3',
-            'notes', 'email', 'role',
+            'nisj', 'full_name', 'nickname', 'nik', 'address', 'birth_place', 'birth_date',
+            'gender', 'religion', 'education', 'marital_status', 'children_count', 'whatsapp', 'email',
+            'status', 'employee_type', 'bank_name', 'bank_account', 'bpjs_number', 'bpjstk_number',
+            'faskes', 'ppi_status', 'contract_type', 'contract_start_date', 'contract_end_date',
+            'assignment', 'chamber_name', 'division_name', 'position_name', 'salary_tier_name',
+            'basic_salary', 'daily_salary', 'minute_deduction', 'hourly_overtime', 'bonus',
+            'family_allowance', 'position_allowance', 'cashbon', 'other', 'role_name', 'leave_quota',
         ];
+    }
+
+    private function importHeaderAliases(): array
+    {
+        $aliases = [];
+        foreach ($this->headers() as $header) {
+            $aliases[$header] = [$header];
+        }
+
+        return array_merge($aliases, [
+            'children_count' => ['children_count', 'anak'],
+            'whatsapp' => ['whatsapp', 'phone'],
+            'status' => ['status', 'employment_status'],
+            'employee_type' => ['employee_type', 'employment_type'],
+            'salary_tier_name' => ['salary_tier_name', 'tier'],
+            'contract_start_date' => ['contract_start_date', 'join_date'],
+            'contract_end_date' => ['contract_end_date', 'resign_date'],
+            'assignment' => ['assignment', 'assignment_id'],
+            'minute_deduction' => ['minute_deduction', 'basic_cut'],
+            'hourly_overtime' => ['hourly_overtime', 'basic_ovt'],
+            'bonus' => ['bonus', 'bonus1'],
+            'family_allowance' => ['family_allowance', 'bonus2'],
+            'position_allowance' => ['position_allowance', 'bonus3'],
+            'role_name' => ['role_name', 'role'],
+        ]);
     }
 
     private function rowForSpreadsheet(object $row): array
     {
         return [
-            $row->nisj,
-            $row->nik,
-            $row->full_name,
-            $row->nickname,
-            $this->genderToHrLegacy($row->gender ?? ''),
-            $row->birth_place,
-            $row->birth_date,
-            $row->religion,
-            $row->address,
-            $row->whatsapp,
-            $row->education,
-            $row->marital_status,
-            $row->children_count,
-            $this->employeeTypeToHrLegacy($row->employee_type ?? ''),
-            strtolower((string) ($row->status ?? 'active')) === 'active' ? 'active' : 'inactive',
-            $row->salary_tier_name,
-            $row->contract_start_date,
-            $row->contract_end_date,
-            $row->assignment,
-            $row->basic_salary,
-            $row->minute_deduction,
-            $row->hourly_overtime,
-            $row->bonus,
-            $row->family_allowance,
-            $row->position_allowance,
-            '',
-            $row->email,
-            $row->role_name,
+            $row->nisj ?? '',
+            $row->full_name ?? '',
+            $row->nickname ?? '',
+            $row->nik ?? '',
+            $row->address ?? '',
+            $row->birth_place ?? '',
+            $row->birth_date ?? '',
+            $row->gender ?? '',
+            $row->religion ?? '',
+            $row->education ?? '',
+            $row->marital_status ?? '',
+            $row->children_count ?? 0,
+            $row->whatsapp ?? '',
+            $row->email ?? '',
+            strtolower((string) ($row->status ?? 'active')) === 'inactive' ? 'inactive' : 'active',
+            $row->employee_type ?? '',
+            $row->bank_name ?? '',
+            $row->bank_account ?? '',
+            $row->bpjs_number ?? '',
+            $row->bpjstk_number ?? '',
+            $row->faskes ?? '',
+            ! empty($row->ppi_status) ? '1' : '0',
+            $row->contract_type ?? '',
+            $row->contract_start_date ?? '',
+            $row->contract_end_date ?? '',
+            $row->assignment ?? '',
+            $row->chamber_name ?? '',
+            $row->division_name ?? '',
+            $row->position_name ?? '',
+            $row->salary_tier_name ?? '',
+            $row->basic_salary ?? 0,
+            $row->daily_salary ?? 0,
+            $row->minute_deduction ?? 0,
+            $row->hourly_overtime ?? 0,
+            $row->bonus ?? 0,
+            $row->family_allowance ?? 0,
+            $row->position_allowance ?? 0,
+            $row->cashbon ?? 0,
+            $row->other ?? 0,
+            $row->role_name ?? 'SQUAD',
+            $row->leave_quota ?? 3,
         ];
     }
 
-    private function mapImportData(array $data): array
+    private function mapImportData(array $data, bool $existing = false): array
     {
-        $num = fn ($value) => $this->normalizeImportNumber($value);
+        $mapped = [];
+        $has = fn (string $key): bool => array_key_exists($key, $data);
         $text = fn ($value) => $this->normalizeHrLegacyNullableValue($value);
-        $nisj = $this->normalizeImportIdentity($data['nisj'] ?? null);
-        $role = $text($data['role'] ?? null);
-        $resignDate = $this->normalizeImportDate($data['resign_date'] ?? null);
-        if ($resignDate === '1970-01-01') $resignDate = null;
-        $email = strtolower((string) $text($data['email'] ?? null));
+        $number = fn ($value) => $this->normalizeImportNumber($value);
+        $integer = fn ($value) => $this->normalizeImportInteger($value);
+        $put = function (string $key, mixed $value) use (&$mapped): void {
+            $mapped[$key] = $value;
+        };
 
-        return [
-            'full_name' => $text($data['full_name'] ?? null),
-            'nickname' => $text($data['nickname'] ?? null),
-            'nik' => $text($data['nik'] ?? null),
-            'address' => $text($data['address'] ?? null),
-            'birth_place' => $text($data['birth_place'] ?? null),
-            'birth_date' => $this->normalizeImportDate($data['birth_date'] ?? null),
-            'gender' => $this->normalizeHrLegacyGender($data['gender'] ?? null),
-            'religion' => $text($data['religion'] ?? null),
-            'education' => $text($data['education'] ?? null),
-            'marital_status' => $text($data['marital_status'] ?? null),
-            'children_count' => $this->normalizeImportInteger($data['anak'] ?? 0),
-            'whatsapp' => $text($data['phone'] ?? null),
-            'email' => $email !== '' ? $email : null,
-            'status' => $this->normalizeHrLegacyStatus($data['employment_status'] ?? 'active'),
-            'nisj' => $nisj,
-            'employee_type' => $this->normalizeHrLegacyEmployeeType($data['employment_type'] ?? null),
-            'bank_name' => null,
-            'bank_account' => null,
-            'bpjs_number' => null,
-            'bpjstk_number' => null,
-            'faskes' => null,
-            'ppi_status' => false,
-            'contract_type' => 'SPT',
-            'contract_start_date' => $this->normalizeImportDate($data['join_date'] ?? null),
-            'contract_end_date' => $resignDate,
-            'assignment' => $text($data['assignment_id'] ?? null),
-            'chamber_name' => null,
-            'division_name' => null,
-            'position_name' => null,
-            'salary_tier_name' => $text($data['tier'] ?? null),
-            'basic_salary' => $num($data['basic_salary'] ?? 0),
-            'daily_salary' => 0,
-            'minute_deduction' => $num($data['basic_cut'] ?? 0),
-            'hourly_overtime' => $num($data['basic_ovt'] ?? 0),
-            'bonus' => $num($data['bonus1'] ?? 0),
-            'family_allowance' => $num($data['bonus2'] ?? 0),
-            'position_allowance' => $num($data['bonus3'] ?? 0),
-            'cashbon' => 0,
-            'other' => 0,
-            'username' => $this->defaultUsername($nisj, $nisj),
-            'password' => null,
-            'role_name' => $this->normalizeUserRole($role),
-            'access_role' => $this->defaultAccessRole(null, $role),
-            'access_level' => $this->defaultAccessLevel(null, $role),
-            'leave_quota' => 3,
-        ];
+        if ($has('nisj')) $put('nisj', $this->normalizeImportIdentity($data['nisj']));
+        if ($has('full_name')) $put('full_name', $text($data['full_name']));
+        if ($has('nickname')) $put('nickname', $text($data['nickname']));
+        if ($has('nik')) $put('nik', $text($data['nik']));
+        if ($has('address')) $put('address', $text($data['address']));
+        if ($has('birth_place')) $put('birth_place', $text($data['birth_place']));
+        if ($has('birth_date')) $put('birth_date', $this->normalizeImportDate($data['birth_date']));
+        if ($has('gender')) $put('gender', $this->normalizeHrLegacyGender($data['gender']));
+        if ($has('religion')) $put('religion', $text($data['religion']));
+        if ($has('education')) $put('education', $text($data['education']));
+        if ($has('marital_status')) $put('marital_status', $text($data['marital_status']));
+        if ($has('children_count')) $put('children_count', $integer($data['children_count']));
+        if ($has('whatsapp')) $put('whatsapp', $text($data['whatsapp']));
+        if ($has('email')) {
+            $email = strtolower((string) $text($data['email']));
+            $put('email', $email !== '' ? $email : null);
+        }
+        if ($has('status')) $put('status', $this->normalizeHrLegacyStatus($data['status']));
+        if ($has('employee_type')) $put('employee_type', $this->normalizeHrLegacyEmployeeType($data['employee_type']));
+        if ($has('bank_name')) $put('bank_name', $text($data['bank_name']));
+        if ($has('bank_account')) $put('bank_account', $text($data['bank_account']));
+        if ($has('bpjs_number')) $put('bpjs_number', $text($data['bpjs_number']));
+        if ($has('bpjstk_number')) $put('bpjstk_number', $text($data['bpjstk_number']));
+        if ($has('faskes')) $put('faskes', $text($data['faskes']));
+        if ($has('ppi_status')) {
+            $raw = strtolower(trim((string) $data['ppi_status']));
+            $put('ppi_status', in_array($raw, ['1', 'true', 'ya', 'yes', 'y', 'aktif'], true));
+        }
+        if ($has('contract_type')) $put('contract_type', $this->normalizeContractType($data['contract_type']));
+        if ($has('contract_start_date')) $put('contract_start_date', $this->normalizeImportDate($data['contract_start_date']));
+        if ($has('contract_end_date')) {
+            $endDate = $this->normalizeImportDate($data['contract_end_date']);
+            $put('contract_end_date', $endDate === '1970-01-01' ? null : $endDate);
+        }
+        if ($has('assignment')) $put('assignment', $text($data['assignment']));
+        if ($has('chamber_name')) $put('chamber_name', $text($data['chamber_name']));
+        if ($has('division_name')) $put('division_name', $text($data['division_name']));
+        if ($has('position_name')) $put('position_name', $text($data['position_name']));
+        if ($has('salary_tier_name')) $put('salary_tier_name', $text($data['salary_tier_name']));
+        foreach (['basic_salary', 'daily_salary', 'minute_deduction', 'hourly_overtime', 'bonus', 'family_allowance', 'position_allowance', 'cashbon', 'other'] as $moneyField) {
+            if ($has($moneyField)) $put($moneyField, $number($data[$moneyField]));
+        }
+        if ($has('role_name')) $put('role_name', $this->normalizeUserRole($data['role_name']));
+        if ($has('leave_quota')) $put('leave_quota', $integer($data['leave_quota']));
+
+        if (! $existing) {
+            $defaults = [
+                'full_name' => null,
+                'nickname' => null,
+                'nik' => null,
+                'address' => null,
+                'birth_place' => null,
+                'birth_date' => null,
+                'gender' => null,
+                'religion' => null,
+                'education' => null,
+                'marital_status' => null,
+                'children_count' => 0,
+                'whatsapp' => null,
+                'email' => null,
+                'status' => 'active',
+                'nisj' => '',
+                'employee_type' => null,
+                'bank_name' => null,
+                'bank_account' => null,
+                'bpjs_number' => null,
+                'bpjstk_number' => null,
+                'faskes' => null,
+                'ppi_status' => false,
+                'contract_type' => 'SPT',
+                'contract_start_date' => null,
+                'contract_end_date' => null,
+                'assignment' => null,
+                'chamber_name' => null,
+                'division_name' => null,
+                'position_name' => null,
+                'salary_tier_name' => null,
+                'basic_salary' => 0,
+                'daily_salary' => 0,
+                'minute_deduction' => 0,
+                'hourly_overtime' => 0,
+                'bonus' => 0,
+                'family_allowance' => 0,
+                'position_allowance' => 0,
+                'cashbon' => 0,
+                'other' => 0,
+                'role_name' => 'SQUAD',
+                'leave_quota' => 3,
+            ];
+            $mapped = array_merge($defaults, $mapped);
+        }
+
+        return $mapped;
     }
-
 
     private function genderToHrLegacy($value): string
     {
@@ -1475,44 +2213,14 @@ class HrSquadController extends Controller
 
     private function findExistingSquadForImport(array $mapped): ?object
     {
-        $candidates = [];
-        foreach (['nisj', 'username', 'email'] as $field) {
-            $value = $this->normalizeImportIdentity($mapped[$field] ?? '');
-            if ($value !== '') $candidates[$field] = $value;
+        $nisj = $this->normalizeImportIdentity($mapped['nisj'] ?? '');
+        if ($nisj === '') {
+            return null;
         }
 
-        if (!$candidates) return null;
-
-        $select = array_values(array_filter(['id', 'nisj', 'username', 'email', 'password', 'access_role', 'access_level'], fn ($column) => Schema::hasColumn(self::TABLE, $column)));
-        $rows = DB::table(self::TABLE)
-            ->select($select)
-            ->whereNull('deleted_at')
-            ->where(function ($q) use ($candidates) {
-                foreach ($candidates as $field => $value) {
-                    if (!Schema::hasColumn(self::TABLE, $field)) continue;
-                    $q->orWhere($field, $value);
-                    if (in_array($field, ['nisj', 'username'], true)) {
-                        $q->orWhereRaw('REPLACE(REPLACE(TRIM(' . $field . '), " ", ""), "-", "") = ?', [$this->compactIdentity($value)]);
-                    }
-                }
-            })
-            ->limit(10)
-            ->get();
-
-        if ($rows->isEmpty()) return null;
-
-        foreach (['nisj', 'username', 'email'] as $priority) {
-            if (!isset($candidates[$priority])) continue;
-            $needle = $priority === 'email' ? strtolower($candidates[$priority]) : $this->compactIdentity($candidates[$priority]);
-            foreach ($rows as $row) {
-                $haystack = $priority === 'email'
-                    ? strtolower($this->normalizeImportIdentity($row->{$priority} ?? ''))
-                    : $this->compactIdentity($row->{$priority} ?? '');
-                if ($needle !== '' && $needle === $haystack) return $row;
-            }
-        }
-
-        return $rows->first();
+        return DB::table(self::TABLE)
+            ->whereRaw('LOWER(TRIM(`nisj`)) = ?', [mb_strtolower($nisj)])
+            ->first();
     }
 
     private function normalizeImportIdentity($value): string
@@ -1537,6 +2245,46 @@ class HrSquadController extends Controller
         return preg_replace('/[\s\-]+/', '', $value) ?? $value;
     }
 
+    private function detectImportChanges(object $existing, array $payload): array
+    {
+        $changes = [];
+        foreach ($payload as $field => $newValue) {
+            $oldValue = $existing->{$field} ?? null;
+            if ($this->normalizeComparableImportValue($field, $oldValue) === $this->normalizeComparableImportValue($field, $newValue)) {
+                continue;
+            }
+            $changes[$field] = [
+                'from' => $oldValue,
+                'to' => $newValue,
+            ];
+        }
+        return $changes;
+    }
+
+    private function normalizeComparableImportValue(string $field, mixed $value): string
+    {
+        if ($value === null || $value === '') {
+            return '';
+        }
+
+        if ($field === 'ppi_status') {
+            return filter_var($value, FILTER_VALIDATE_BOOLEAN) ? '1' : '0';
+        }
+
+        if (in_array($field, [
+            'children_count', 'leave_quota', 'basic_salary', 'daily_salary', 'minute_deduction',
+            'hourly_overtime', 'bonus', 'family_allowance', 'position_allowance', 'cashbon', 'other',
+        ], true)) {
+            return number_format((float) $value, 4, '.', '');
+        }
+
+        if (in_array($field, ['birth_date', 'contract_start_date', 'contract_end_date'], true)) {
+            return substr((string) $value, 0, 10);
+        }
+
+        return trim((string) $value);
+    }
+
     private function filterTablePayload(array $payload): array
     {
         static $columns = null;
@@ -1550,56 +2298,75 @@ class HrSquadController extends Controller
 
     private function importFieldLabels(): array
     {
+        $labels = array_combine($this->headers(), $this->headers()) ?: [];
+        return array_merge($labels, [
+            'salary_tier_id' => 'salary_tier_name',
+            'photo' => 'photo',
+            'username' => 'Data User / username',
+            'password' => 'Data User / password',
+            'access_role' => 'Data User / access_role',
+            'access_level' => 'Data User / access_level',
+        ]);
+    }
+
+    private function describeImportException(\Throwable $exception): array
+    {
+        $message = $exception->getMessage();
+        $lower = strtolower($message);
+
+        $rules = [
+            ['needle' => 'hr_squads_nisj_unique', 'column' => 'nisj', 'message' => 'NISJ sudah dipakai Data Squad lain. Pastikan satu NISJ hanya muncul satu kali.'],
+            ['needle' => 'hr_squads_email_unique', 'column' => 'email', 'message' => 'Email sudah dipakai Data Squad lain. Kosongkan atau gunakan email berbeda.'],
+            ['needle' => 'hr_squads_username_unique', 'column' => 'username', 'message' => 'Username legacy sudah dipakai Data Squad lain.'],
+            ['needle' => 'hr_squads_user_id_unique', 'column' => 'user_id', 'message' => 'Data User sudah terhubung ke Data Squad lain. Periksa pivot NISJ.'],
+            ['needle' => 'foreign key constraint', 'column' => 'reference', 'message' => 'Referensi master tidak valid atau sudah dihapus. Periksa outlet/tier/relasi terkait.'],
+            ['needle' => 'data too long', 'column' => 'value', 'message' => 'Nilai melebihi panjang maksimum kolom database.'],
+            ['needle' => 'incorrect date', 'column' => 'date', 'message' => 'Format tanggal tidak valid. Gunakan YYYY-MM-DD, contoh 2026-07-26.'],
+            ['needle' => 'incorrect decimal', 'column' => 'salary', 'message' => 'Nilai angka/gaji tidak valid. Gunakan angka tanpa simbol mata uang.'],
+        ];
+
+        foreach ($rules as $rule) {
+            if (str_contains($lower, $rule['needle'])) {
+                return [
+                    'column' => $rule['column'],
+                    'message' => $rule['message'],
+                    'technical_message' => $message,
+                ];
+            }
+        }
+
         return [
-            'full_name' => 'full_name',
-            'nickname' => 'nickname',
-            'nik' => 'nik',
-            'address' => 'address',
-            'birth_place' => 'birth_place',
-            'birth_date' => 'birth_date',
-            'gender' => 'gender',
-            'religion' => 'religion',
-            'education' => 'education',
-            'marital_status' => 'marital_status',
-            'children_count' => 'anak',
-            'whatsapp' => 'phone',
-            'email' => 'email',
-            'status' => 'employment_status',
-            'nisj' => 'nisj',
-            'employee_type' => 'employment_type',
-            'contract_start_date' => 'join_date',
-            'contract_end_date' => 'resign_date',
-            'assignment' => 'assignment_id',
-            'salary_tier_name' => 'tier',
-            'basic_salary' => 'basic_salary',
-            'minute_deduction' => 'basic_cut',
-            'hourly_overtime' => 'basic_ovt',
-            'bonus' => 'bonus1',
-            'family_allowance' => 'bonus2',
-            'position_allowance' => 'bonus3',
-            'role_name' => 'role',
+            'column' => 'System',
+            'message' => $message,
+            'technical_message' => $message,
         ];
     }
 
     private function formatImportExceptionRowError(int $line, array $rawData, array $mapped, \Throwable $exception): array
     {
+        $description = $this->describeImportException($exception);
         return [
             'line' => $line,
             'row_number' => $line,
             'name' => $mapped['full_name'] ?? ($rawData['full_name'] ?? ''),
             'nisj' => $mapped['nisj'] ?? ($rawData['nisj'] ?? ''),
             'details' => [[
-                'column' => 'System',
+                'column' => $description['column'],
                 'field' => 'exception',
-                'value' => '',
-                'message' => $exception->getMessage(),
+                'value' => $rawData[$description['column']] ?? '',
+                'message' => $description['message'],
             ], [
                 'column' => 'Baris XLSX',
                 'field' => 'row',
                 'value' => collect($rawData)->map(fn ($value, $key) => $key . '=' . (is_scalar($value) ? (string) $value : ''))->implode('; '),
                 'message' => 'Baris ini gagal diproses, tetapi import dilanjutkan ke baris berikutnya.',
+            ], [
+                'column' => 'Technical',
+                'field' => 'technical_message',
+                'value' => '',
+                'message' => $description['technical_message'],
             ]],
-            'error_text' => 'System: ' . $exception->getMessage(),
+            'error_text' => $description['column'].': '.$description['message'],
         ];
     }
 

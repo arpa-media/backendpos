@@ -23,9 +23,6 @@ class SalesSummaryController extends Controller
 
     private function okCached($request, string $namespace, array $params, callable $callback)
     {
-        @ini_set('max_execution_time', '240');
-        @set_time_limit(240);
-
         $payload = AnalyticsResponseCache::remember(
             $namespace,
             $params,
@@ -41,7 +38,29 @@ class SalesSummaryController extends Controller
     {
         $validated = $request->validated();
 
-        return $this->okCached($request, 'finance-sales-summary.index', $validated, function () use ($request, $validated) {
+        $reportingSource = null;
+        if (! $request->boolean('filters_only')) {
+            $readFilter = FinanceOutletFilter::resolve((string) ($validated['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
+            $readOutletIds = array_values(array_unique(array_map('strval', $readFilter['outlet_ids'] ?? [])));
+            $reportingSource = $this->dailySummaryService->readContractStatus(
+                $readOutletIds,
+                $validated['date_from'] ?? null,
+                $validated['date_to'] ?? null,
+                (string) ($readFilter['timezone'] ?? TransactionDate::appTimezone())
+            );
+
+            if (! ($reportingSource['ready'] ?? false)) {
+                return ApiResponse::error(
+                    'Data Sales Summary untuk rentang tanggal ini belum selesai dimaterialisasi. Proses warm berjalan melalui scheduler; coba lagi setelah coverage siap.',
+                    'REPORT_DAILY_SUMMARY_NOT_READY',
+                    409,
+                    [],
+                    ['reporting_source' => $reportingSource]
+                );
+            }
+        }
+
+        return $this->okCached($request, 'finance-sales-summary.v8i03.index', $validated, function () use ($request, $validated, $reportingSource) {
             $v = $validated;
             $sort = (string) ($v['sort'] ?? 'outlet_name');
             $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
@@ -86,6 +105,7 @@ class SalesSummaryController extends Controller
                         'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                         'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                         'generated_at' => null,
+                        'reporting_source' => $reportingSource,
                     ],
                 ];
             }
@@ -118,11 +138,11 @@ class SalesSummaryController extends Controller
                         'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                         'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                         'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                        'reporting_source' => $reportingSource,
                     ],
                 ];
             }
 
-            $this->dailySummaryService->ensureCoverage($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
             $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
             $rows = $this->buildRows($outletIds, $v, $sort, $dir)->get();
 
@@ -179,6 +199,7 @@ class SalesSummaryController extends Controller
                     'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                     'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                     'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                    'reporting_source' => $reportingSource,
                     'net_read' => $this->financeNetReadService->adjustmentMeta($netAdjustments),
                 ],
             ];

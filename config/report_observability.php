@@ -14,4 +14,6 @@ return [
     'header_prefix' => env('REPORT_OBSERVABILITY_HEADER_PREFIX', 'X-Report-'),
     'response_header_limit' => (int) env('REPORT_OBSERVABILITY_RESPONSE_HEADER_LIMIT', 5),
     'log_channel' => env('REPORT_OBSERVABILITY_LOG_CHANNEL', 'report_observability'),
+    'persist_metrics' => env('REPORT_OBSERVABILITY_PERSIST_METRICS', true),
+    'observe_path_prefixes' => array_values(array_filter(array_map('trim', explode(',', (string) env('REPORT_OBSERVABILITY_PATH_PREFIXES', 'api/v1/report,api/v1/reports,api/v1/finance,api/v1/owner-overview,api/v1/sales-collected,api/v1/operational/analytics,api/v1/cogs,api/v1/warehouse'))))),
 ];

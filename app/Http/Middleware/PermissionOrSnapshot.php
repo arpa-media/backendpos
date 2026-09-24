@@ -10,16 +10,25 @@ use Symfony\Component\HttpFoundation\Response;
 
 class PermissionOrSnapshot
 {
-    public function handle(Request $request, Closure $next, string $permissions): Response
+    /**
+     * Laravel memecah parameter middleware yang dipisahkan koma menjadi
+     * argumen terpisah. Karena itu parameter permission harus variadic.
+     *
+     * Contoh:
+     * permission_or_snapshot:first.permission,second.permission
+     */
+    public function handle(Request $request, Closure $next, string ...$permissions): Response
     {
         $user = $request->user();
-        if (!$user) {
+        if (! $user) {
             throw UnauthorizedException::notLoggedIn();
         }
 
-        $required = collect(preg_split('/[|,]/', (string) $permissions) ?: [])
+        $required = collect($permissions)
+            ->flatMap(fn ($permission) => preg_split('/[|,]/', (string) $permission) ?: [])
             ->map(fn ($permission) => trim((string) $permission))
             ->filter()
+            ->unique()
             ->values();
 
         if ($required->isEmpty()) {
@@ -56,7 +65,7 @@ class PermissionOrSnapshot
     protected function hasPermissionInMenus($menus, string $permission): bool
     {
         foreach ($menus as $menu) {
-            if (!is_array($menu)) {
+            if (! is_array($menu)) {
                 continue;
             }
 

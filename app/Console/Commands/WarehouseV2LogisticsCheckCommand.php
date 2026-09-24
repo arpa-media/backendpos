@@ -1,0 +1,3 @@
+<?php
+namespace App\Console\Commands; use Illuminate\Console\Command; use Illuminate\Support\Facades\Schema;
+class WarehouseV2LogisticsCheckCommand extends Command { protected $signature='warehouse:v2-logistics-check'; protected $description='Validate Warehouse logistics v2 foundation'; public function handle():int{$tables=['wh_sales_delivery_orders','wh_sales_delivery_order_items','wh_sales_goods_receipts','wh_sales_goods_receipt_items','wh_sales_returns','wh_sales_return_items','wh_logistics_events'];$missing=array_values(array_filter($tables,fn($x)=>!Schema::hasTable($x)));$this->table(['Check','Result'],[['Missing tables',$missing?implode(', ',$missing):'-'],['Status',$missing?'FAILED':'PASSED']]);return $missing?self::FAILURE:self::SUCCESS;}}

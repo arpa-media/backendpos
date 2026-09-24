@@ -14,7 +14,7 @@ use Illuminate\Support\Facades\DB;
 
 class FinanceOverviewController extends Controller
 {
-    private const PAYMENT_BUCKETS = [
+    private const LEGACY_PAYMENT_BUCKETS = [
         'cash' => 'Tunai',
         'qris_bca' => 'Qris BCA',
         'edc_bca' => 'EDC BCA',
@@ -35,9 +35,6 @@ class FinanceOverviewController extends Controller
 
     private function okCached($request, string $namespace, array $params, callable $callback)
     {
-        @ini_set('max_execution_time', '240');
-        @set_time_limit(240);
-
         $payload = AnalyticsResponseCache::remember(
             $namespace,
             $params,
@@ -53,7 +50,29 @@ class FinanceOverviewController extends Controller
     {
         $validated = $request->validated();
 
-        return $this->okCached($request, 'finance-overview.index', $validated, function () use ($request, $validated) {
+        $reportingSource = null;
+        if (! $request->boolean('filters_only')) {
+            $readFilter = FinanceOutletFilter::resolve((string) ($validated['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
+            $readOutletIds = array_values(array_unique(array_map('strval', $readFilter['outlet_ids'] ?? [])));
+            $reportingSource = $this->dailySummaryService->readContractStatus(
+                $readOutletIds,
+                $validated['date_from'] ?? null,
+                $validated['date_to'] ?? null,
+                (string) ($readFilter['timezone'] ?? TransactionDate::appTimezone())
+            );
+
+            if (! ($reportingSource['ready'] ?? false)) {
+                return ApiResponse::error(
+                    'Data report untuk rentang tanggal ini belum selesai dimaterialisasi. Proses warm berjalan melalui scheduler; coba lagi setelah coverage siap.',
+                    'REPORT_DAILY_SUMMARY_NOT_READY',
+                    409,
+                    [],
+                    ['reporting_source' => $reportingSource]
+                );
+            }
+        }
+
+        return $this->okCached($request, 'finance-overview.v8i03.index', $validated, function () use ($request, $validated, $reportingSource) {
             $v = $validated;
             $isExport = filter_var($v['export'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
@@ -85,7 +104,7 @@ class FinanceOverviewController extends Controller
                     ],
                     'filter_options' => [
                         'outlet_filters' => $outletFilter['options'],
-                        'payment_method_columns' => array_map(fn ($key, $label) => ['key' => $key, 'label' => $label], array_keys(self::PAYMENT_BUCKETS), array_values(self::PAYMENT_BUCKETS)),
+                        'payment_method_columns' => $this->paymentColumnDefinitions(),
                     ],
                     'meta' => [
                         'timezone' => $timezone,
@@ -93,6 +112,7 @@ class FinanceOverviewController extends Controller
                         'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                         'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                         'generated_at' => null,
+                        'reporting_source' => $reportingSource,
                     ],
                 ];
             }
@@ -114,7 +134,7 @@ class FinanceOverviewController extends Controller
                     ],
                     'filter_options' => [
                         'outlet_filters' => $outletFilter['options'],
-                        'payment_method_columns' => array_map(fn ($key, $label) => ['key' => $key, 'label' => $label], array_keys(self::PAYMENT_BUCKETS), array_values(self::PAYMENT_BUCKETS)),
+                        'payment_method_columns' => $this->paymentColumnDefinitions(),
                     ],
                     'meta' => [
                         'timezone' => $timezone,
@@ -122,11 +142,11 @@ class FinanceOverviewController extends Controller
                         'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                         'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                         'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                        'reporting_source' => $reportingSource,
                     ],
                 ];
             }
 
-            $this->dailySummaryService->ensureCoverage($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
             $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
 
             $summaryRow = $this->dailySummaryService
@@ -136,6 +156,20 @@ class FinanceOverviewController extends Controller
                 ->selectRaw('COALESCE(SUM(rdss.tax_total), 0) as total_tax')
                 ->selectRaw('COALESCE(SUM(rdss.discount_total), 0) as total_discount')
                 ->first();
+
+            $paymentRows = $this->dailySummaryService
+                ->paymentSummaryQuery($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null)
+                ->selectRaw('rdps.outlet_id')
+                ->selectRaw('rdps.payment_method_name')
+                ->selectRaw('rdps.payment_method_type')
+                ->selectRaw('COALESCE(SUM(rdps.gross_sales), 0) as gross_sales')
+                ->groupBy('rdps.outlet_id', 'rdps.payment_method_name', 'rdps.payment_method_type')
+                ->get();
+
+            // I05: columns are no longer limited to a hard-coded payment list.
+            // Keep legacy keys for compatibility, then add every active/new method
+            // (and historical method found in the summary rows) deterministically.
+            $paymentColumns = $this->paymentColumnDefinitions($paymentRows);
 
             $outletAccumulator = [];
             $outlets = DB::table('outlets')
@@ -149,32 +183,26 @@ class FinanceOverviewController extends Controller
                     'outlet_id' => (string) ($outlet->id ?? ''),
                     'outlet_name' => (string) ($outlet->name ?? '-'),
                 ];
-                foreach (array_keys(self::PAYMENT_BUCKETS) as $bucket) {
-                    $payload[$bucket] = 0;
+                foreach ($paymentColumns as $column) {
+                    $payload[(string) $column['key']] = 0;
                 }
                 $outletAccumulator[(string) ($outlet->id ?? '')] = $payload;
             }
 
-            $paymentRows = $this->dailySummaryService
-                ->paymentSummaryQuery($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null)
-                ->selectRaw('rdps.outlet_id')
-                ->selectRaw('rdps.payment_method_name')
-                ->selectRaw('rdps.payment_method_type')
-                ->selectRaw('COALESCE(SUM(rdps.gross_sales), 0) as gross_sales')
-                ->groupBy('rdps.outlet_id', 'rdps.payment_method_name', 'rdps.payment_method_type')
-                ->get();
-
             foreach ($paymentRows as $row) {
-                $bucket = $this->bucketKeyForPayment((string) ($row->payment_method_name ?? ''), (string) ($row->payment_method_type ?? ''));
-                if ($bucket === null) {
-                    continue;
-                }
+                $bucket = $this->paymentColumnKey(
+                    (string) ($row->payment_method_name ?? ''),
+                    (string) ($row->payment_method_type ?? '')
+                );
 
                 $outletId = (string) ($row->outlet_id ?? '');
                 if (! isset($outletAccumulator[$outletId])) {
                     continue;
                 }
 
+                if (! array_key_exists($bucket, $outletAccumulator[$outletId])) {
+                    $outletAccumulator[$outletId][$bucket] = 0;
+                }
                 $outletAccumulator[$outletId][$bucket] += (int) round((float) ($row->gross_sales ?? 0));
             }
 
@@ -183,10 +211,11 @@ class FinanceOverviewController extends Controller
                 ->values();
 
             $paymentTotals = [];
-            foreach (self::PAYMENT_BUCKETS as $key => $label) {
+            foreach ($paymentColumns as $column) {
+                $key = (string) $column['key'];
                 $paymentTotals[] = [
                     'key' => $key,
-                    'label' => $label,
+                    'label' => (string) $column['label'],
                     'amount' => (int) $rows->sum($key),
                 ];
             }
@@ -207,7 +236,7 @@ class FinanceOverviewController extends Controller
                 ],
                 'filter_options' => [
                     'outlet_filters' => $outletFilter['options'],
-                    'payment_method_columns' => array_map(fn ($key, $label) => ['key' => $key, 'label' => $label], array_keys(self::PAYMENT_BUCKETS), array_values(self::PAYMENT_BUCKETS)),
+                    'payment_method_columns' => $paymentColumns,
                 ],
                 'meta' => [
                     'timezone' => $timezone,
@@ -215,6 +244,7 @@ class FinanceOverviewController extends Controller
                     'range_start_local' => $window['from_local']->format('Y-m-d H:i:s'),
                     'range_end_local' => $window['to_inclusive_local']->format('Y-m-d H:i:s'),
                     'generated_at' => now()->setTimezone($timezone)->format('Y-m-d H:i:s'),
+                    'reporting_source' => $reportingSource,
                     'net_read' => $this->financeNetReadService->adjustmentMeta($netAdjustments),
                 ],
             ];
@@ -225,12 +255,59 @@ class FinanceOverviewController extends Controller
                 $payload['export'] = [
                     'filename' => $this->buildFilename($outletFilter['label'], $fromLocal->format('Y-m-d'), $toLocal->format('Y-m-d')),
                     'total_rows' => $rows->count(),
-                    'columns' => array_merge(['Nama Outlet'], array_values(self::PAYMENT_BUCKETS)),
+                    'columns' => array_merge(['Nama Outlet'], array_values(array_map(fn (array $column) => (string) $column['label'], $paymentColumns))),
                 ];
             }
 
             return $payload;
         });
+    }
+
+    private function paymentColumnDefinitions(iterable $paymentRows = []): array
+    {
+        $columns = [];
+        foreach (self::LEGACY_PAYMENT_BUCKETS as $key => $label) {
+            $columns[$key] = ['key' => $key, 'label' => $label];
+        }
+
+        $masterRows = DB::table('payment_methods')
+            ->whereNull('deleted_at')
+            ->where('is_active', true)
+            ->orderBy('sort_order')
+            ->orderBy('name')
+            ->get(['name', 'type']);
+
+        foreach ([$masterRows, collect($paymentRows)] as $rows) {
+            foreach ($rows as $row) {
+                $name = trim((string) ($row->payment_method_name ?? $row->name ?? ''));
+                $type = trim((string) ($row->payment_method_type ?? $row->type ?? ''));
+                if ($name === '' && $type === '') {
+                    continue;
+                }
+
+                $key = $this->paymentColumnKey($name, $type);
+                if (! isset($columns[$key])) {
+                    $columns[$key] = [
+                        'key' => $key,
+                        'label' => $name !== '' ? $name : ($type !== '' ? $type : 'Payment'),
+                    ];
+                }
+            }
+        }
+
+        return array_values($columns);
+    }
+
+    private function paymentColumnKey(string $name, string $type): string
+    {
+        $legacy = $this->bucketKeyForPayment($name, $type);
+        if ($legacy !== null) {
+            return $legacy;
+        }
+
+        $identity = mb_strtolower(trim($name)) . '|' . mb_strtolower(trim($type));
+
+        return 'pm_' . substr(sha1($identity), 0, 12);
     }
 
     private function bucketKeyForPayment(string $name, string $type): ?string

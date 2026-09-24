@@ -1,6 +1,7 @@
 <?php
 
 use Illuminate\Foundation\Application;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Http\Middleware\HandleCors;
@@ -22,12 +23,71 @@ return Application::configure(basePath: dirname(__DIR__))
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
         then: function (): void {
-            $hrRoutes = __DIR__.'/../routes/hr.php';
-            if (file_exists($hrRoutes)) {
-                require $hrRoutes;
+            $routeFiles = [
+                __DIR__.'/../routes/hr.php',
+                __DIR__.'/../routes/hr_user_dashboard.php',
+                __DIR__.'/../routes/stock_inventory.php',
+            ];
+
+            foreach ($routeFiles as $routeFile) {
+                if (file_exists($routeFile)) {
+                    require $routeFile;
+                }
             }
         },
     )
+    ->withSchedule(function (Schedule $schedule): void {
+        // HR ITERATION 13: detect late/alpha events and build SP recommendations.
+        $schedule->command('hr:punishment-sweep --limit=1000')
+            ->hourly()
+            ->withoutOverlapping();
+
+
+        // ERP FINANCE V8 I01: keep report materialization out of interactive HTTP requests.
+        // Dirty windows are refreshed incrementally; the 370-day rolling window is warmed off-peak.
+        $schedule->command('report-daily-summaries:refresh-dirty --limit=120 --outlet-chunk=6 --date-chunk=2')
+            ->everyFiveMinutes()
+            ->withoutOverlapping(30);
+
+        // ERP FINANCE V8 I08: current-day hourly freshness remains incremental.
+        $schedule->command('report-hourly-summaries:refresh-dirty --limit=120')
+            ->everyFiveMinutes()
+            ->withoutOverlapping(30);
+
+        // ERP FINANCE V8 I11: scheduler only orchestrates/recover state and dispatches work.
+        // Heavy Daily/Hourly/Monthly chunks run on the dedicated database queue connection `reporting`.
+        $schedule->command('reporting-engine:tick --max-dispatch=4')
+            ->everyMinute()
+            ->withoutOverlapping(10);
+
+        // I11 worker liveness probe. It is queued on the same isolated reporting worker.
+        $schedule->job(new \App\Jobs\Reporting\ReportingWorkerHeartbeatJob(), 'reporting', 'reporting')
+            ->everyFiveMinutes()
+            ->withoutOverlapping(10);
+
+
+        // ERP FINANCE V8 I12: keep Settlement source synchronization bounded and
+        // outside interactive HTTP requests. Historical list pages only read the
+        // persisted source table; this recent window keeps new reconciliations fresh.
+        $schedule->command('finance:settlement-sync-recent --days=14')
+            ->everyThirtyMinutes()
+            ->withoutOverlapping(120);
+
+
+        // ERP POS FINAL I04: pending SPV Stock Requests from the previous business day
+        // are auto-approved once at 06:00 WIB. The command is idempotent and uses
+        // a dedicated non-login SYSTEM_AUTO_APPROVAL audit actor.
+        $schedule->command('warehouse:stock-request-auto-approve --limit=500')
+            ->dailyAt('06:00')
+            ->timezone('Asia/Jakarta')
+            ->withoutOverlapping(120);
+
+
+        // ERP FINANCE V8 I13: keep runtime report telemetry bounded.
+        $schedule->command('report-observability:prune')
+            ->dailyAt('03:30')
+            ->withoutOverlapping(30);
+    })
     ->withMiddleware(function (Middleware $middleware): void {
         // ✅ CORS middleware (global) supaya OPTIONS / preflight selalu lolos
         $middleware->use([
@@ -51,6 +111,13 @@ return Application::configure(basePath: dirname(__DIR__))
             ApiRequestId::class,
             ApiSecurityHeaders::class,
             ApiRequestLogging::class,
+        ]);
+
+        // ERP FINANCE V8 I13: lightweight global hook; ObserveReportRequest exits
+        // immediately for non-report paths and persists bounded runtime metrics for
+        // Console > System Health.
+        $middleware->appendToGroup('api', [
+            \App\Http\Middleware\ObserveReportRequest::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

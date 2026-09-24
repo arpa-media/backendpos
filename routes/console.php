@@ -23,3 +23,19 @@ Schedule::command('report-sale-scopes:warm-common --days=30 --per-outlet=1')
 Schedule::command('report-daily-summaries:refresh-dirty --limit=80 --outlet-chunk=4 --date-chunk=2')
     ->everyFiveMinutes()
     ->withoutOverlapping();
+
+// HR ITERATION 10: expire announcements and purge private attachment binaries.
+Schedule::command('hr:announcement-expiry-sweep --limit=200')
+    ->everyTenMinutes()
+    ->withoutOverlapping();
+
+// HR ITERATION 11: effective-dated Contract/SK lifecycle and expiry reminders.
+Schedule::command('hr:contract-lifecycle-sweep --limit=300')
+    ->dailyAt('00:10')
+    ->withoutOverlapping();
+
+// ERP FINANCE V7 I01: submitted Stock Request fallback approval on the next business day at 06:00 WIB.
+Schedule::command('warehouse:stock-request-auto-approve')
+    ->dailyAt('06:00')
+    ->timezone('Asia/Jakarta')
+    ->withoutOverlapping();

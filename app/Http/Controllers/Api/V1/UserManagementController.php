@@ -11,15 +11,19 @@ use App\Models\AccessRole;
 use App\Models\AccessRoleMenuPermission;
 use App\Models\AccessRolePortalPermission;
 use App\Models\AccessUserType;
+use App\Models\Assignment;
 use App\Models\Outlet;
 use App\Models\PosProvisionControl;
 use App\Models\User;
 use App\Services\UserManagementService;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use Spatie\Permission\Models\Permission;
+use Spatie\Permission\Models\Role as SpatieRole;
 
 class UserManagementController extends Controller
 {
@@ -35,6 +39,9 @@ class UserManagementController extends Controller
         $perPage = max(1, min(100, (int) $request->integer('per_page', 10)));
         $page = max(1, (int) $request->integer('page', 1));
         $outletId = trim((string) $request->string('outlet_id', ''));
+        $assignmentRoleTitle = trim((string) $request->string('assignment_role_title', ''));
+        $accessRoleId = trim((string) $request->string('access_role_id', ''));
+        $accessLevelId = trim((string) $request->string('access_level_id', ''));
 
         $usersQuery = User::query()->with([
             'employee.assignment.outlet',
@@ -44,6 +51,12 @@ class UserManagementController extends Controller
             'accessAssignment.level',
             'reportOutletAssignments.outlet',
         ]);
+
+        // HR Iteration 09: akun yang dihapus dari Data Squad tidak ditampilkan
+        // sebagai login user aktif, tetapi row users tetap disimpan untuk FK audit.
+        if (Schema::hasColumn('users', 'hr_retired_at')) {
+            $usersQuery->whereNull('users.hr_retired_at');
+        }
 
         if ($q !== '') {
             $usersQuery->where(function ($inner) use ($q) {
@@ -60,6 +73,28 @@ class UserManagementController extends Controller
                     ->orWhereHas('employee.assignment', function ($assignmentQuery) use ($outletId) {
                         $assignmentQuery->where('outlet_id', $outletId);
                     });
+            });
+        }
+
+        // ERP POS FINAL I07: filters are enforced server-side so pagination,
+        // bulk selection, export-style reads, and direct API calls all share
+        // the same filtered dataset. Assignment means the current HR
+        // assignment referenced by employees.assignment_id.
+        if ($assignmentRoleTitle !== '') {
+            $usersQuery->whereHas('employee.assignment', function ($assignmentQuery) use ($assignmentRoleTitle) {
+                $assignmentQuery->where('role_title', $assignmentRoleTitle);
+            });
+        }
+
+        if ($accessRoleId !== '') {
+            $usersQuery->whereHas('accessAssignment', function ($accessQuery) use ($accessRoleId) {
+                $accessQuery->where('access_role_id', $accessRoleId);
+            });
+        }
+
+        if ($accessLevelId !== '') {
+            $usersQuery->whereHas('accessAssignment', function ($accessQuery) use ($accessLevelId) {
+                $accessQuery->where('access_level_id', $accessLevelId);
             });
         }
 
@@ -162,13 +197,42 @@ class UserManagementController extends Controller
             ];
         })->values()->all();
 
+        $auditLogs = [];
+        if (Schema::hasTable('user_access_assignment_audits')) {
+            $auditLogs = DB::table('user_access_assignment_audits as a')
+                ->leftJoin('users as actor', 'actor.id', '=', 'a.actor_user_id')
+                ->leftJoin('users as target', 'target.id', '=', 'a.subject_user_id')
+                ->orderByDesc('a.created_at')
+                ->limit(30)
+                ->get([
+                    'a.id', 'a.batch_id', 'a.event', 'a.created_at',
+                    'actor.name as actor_name', 'actor.nisj as actor_nisj',
+                    'target.name as target_name', 'target.nisj as target_nisj',
+                ])
+                ->map(fn ($row) => [
+                    'id' => (string) $row->id,
+                    'batch_id' => (string) $row->batch_id,
+                    'action' => (string) $row->event,
+                    'actor_name' => $row->actor_name,
+                    'actor_nisj' => $row->actor_nisj,
+                    'target_name' => $row->target_name,
+                    'target_nisj' => $row->target_nisj,
+                    'created_at' => $row->created_at,
+                ])->all();
+        }
+
         return ApiResponse::ok([
             'active_filters' => [
                 'q' => $q !== '' ? $q : null,
                 'outlet_id' => $outletId !== '' ? $outletId : null,
+                'assignment_role_title' => $assignmentRoleTitle !== '' ? $assignmentRoleTitle : null,
+                'access_role_id' => $accessRoleId !== '' ? $accessRoleId : null,
+                'access_level_id' => $accessLevelId !== '' ? $accessLevelId : null,
             ],
             'summary' => [
-                'users' => User::query()->count(),
+                'users' => User::query()
+                    ->when(Schema::hasColumn('users', 'hr_retired_at'), fn ($query) => $query->whereNull('users.hr_retired_at'))
+                    ->count(),
                 'roles' => count($masters['roles']),
                 'levels' => count($masters['levels']),
                 'portals' => count($masters['portals']),
@@ -186,7 +250,7 @@ class UserManagementController extends Controller
             'masters' => $masters,
             'matrix' => $matrix,
             'users' => $payloadUsers,
-            'audit_logs' => [],
+            'audit_logs' => $auditLogs,
         ], 'OK');
     }
 
@@ -194,25 +258,31 @@ class UserManagementController extends Controller
     {
         $this->userManagement->ensureMasters();
 
+        $guard = (string) config('auth.defaults.guard', 'web');
         $data = $request->validate([
             'user_type_id' => ['nullable', 'string', Rule::exists('access_user_types', 'id')],
             'code' => ['required', 'string', 'max:100', Rule::unique('access_roles', 'code')],
             'name' => ['required', 'string', 'max:255'],
             'description' => ['nullable', 'string'],
+            'spatie_role_name' => ['nullable', 'string', 'max:255', Rule::exists(config('permission.table_names.roles', 'roles'), 'name')->where(fn ($query) => $query->where('guard_name', $guard))],
             'is_active' => ['nullable', 'boolean'],
         ]);
+
+        $spatieRoleName = $this->normalizeSpatieRoleName($data['spatie_role_name'] ?? null);
+        $this->assertActorCanManageSpatieRoleMapping($request->user(), null, $spatieRoleName);
 
         $role = AccessRole::query()->create([
             'user_type_id' => $data['user_type_id'] ?? null,
             'code' => strtoupper(trim((string) $data['code'])),
             'name' => trim((string) $data['name']),
             'description' => $data['description'] ?? null,
+            'spatie_role_name' => $spatieRoleName,
             'is_active' => (bool) ($data['is_active'] ?? true),
         ])->load('userType');
 
         return ApiResponse::ok([
             'role' => $this->serializeRole($role),
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'Role created');
     }
 
@@ -225,23 +295,38 @@ class UserManagementController extends Controller
             return ApiResponse::error('Role tidak ditemukan.', 'ROLE_NOT_FOUND', 404);
         }
 
+        $guard = (string) config('auth.defaults.guard', 'web');
         $data = $request->validate([
             'user_type_id' => ['nullable', 'string', Rule::exists('access_user_types', 'id')],
             'name' => ['required', 'string', 'max:255'],
             'description' => ['nullable', 'string'],
+            'spatie_role_name' => ['sometimes', 'nullable', 'string', 'max:255', Rule::exists(config('permission.table_names.roles', 'roles'), 'name')->where(fn ($query) => $query->where('guard_name', $guard))],
             'is_active' => ['nullable', 'boolean'],
         ]);
+
+        $beforeSpatieRoleName = $this->normalizeSpatieRoleName($role->spatie_role_name);
+        $afterSpatieRoleName = array_key_exists('spatie_role_name', $data)
+            ? $this->normalizeSpatieRoleName($data['spatie_role_name'])
+            : $beforeSpatieRoleName;
+        $this->assertActorCanManageSpatieRoleMapping($request->user(), $beforeSpatieRoleName, $afterSpatieRoleName);
 
         $role->fill([
             'user_type_id' => $data['user_type_id'] ?? null,
             'name' => trim((string) $data['name']),
             'description' => $data['description'] ?? null,
+            'spatie_role_name' => $afterSpatieRoleName,
             'is_active' => (bool) ($data['is_active'] ?? true),
         ])->save();
 
+        $resyncedUsers = 0;
+        if ($beforeSpatieRoleName !== $afterSpatieRoleName) {
+            $resyncedUsers = $this->userManagement->syncUsersForAccessScope((string) $role->id, null);
+        }
+
         return ApiResponse::ok([
             'role' => $this->serializeRole($role->fresh()->load('userType')),
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'resynced_users' => $resyncedUsers,
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'Role updated');
     }
 
@@ -265,7 +350,7 @@ class UserManagementController extends Controller
 
         return ApiResponse::ok([
             'level' => $this->serializeLevel($level),
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'Level created');
     }
 
@@ -292,7 +377,7 @@ class UserManagementController extends Controller
 
         return ApiResponse::ok([
             'level' => $this->serializeLevel($level->fresh()),
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'Level updated');
     }
 
@@ -304,7 +389,7 @@ class UserManagementController extends Controller
             'name' => ['required', 'string', 'max:255'],
             'email' => ['required', 'string', 'email', 'max:255', Rule::unique('users', 'email')],
             'username' => ['required', 'string', 'max:100', Rule::unique('users', 'username')],
-            'nisj' => ['nullable', 'string', 'max:100'],
+            'nisj' => ['nullable', 'string', 'max:32', Rule::unique('users', 'nisj')],
             'assignment_role_title' => ['nullable', 'string', 'max:255'],
             'outlet_id' => ['nullable', 'string', Rule::exists('outlets', 'id')],
             'access_role_id' => ['required', 'string', Rule::exists('access_roles', 'id')],
@@ -312,6 +397,14 @@ class UserManagementController extends Controller
             'password' => ['required', 'string', 'min:8', 'confirmed'],
             'is_active' => ['nullable', 'boolean'],
         ]);
+
+        $selectedRole = AccessRole::query()->find($data['access_role_id']);
+        $roleCode = strtoupper(trim((string) ($selectedRole?->code ?? '')));
+        if (! in_array($roleCode, ['STAKEHOLDER', 'OBSERVER'], true) && trim((string) ($data['nisj'] ?? '')) === '') {
+            throw ValidationException::withMessages([
+                'nisj' => ['NISJ wajib diisi karena Data User ini otomatis membentuk Data Squad.'],
+            ]);
+        }
 
         $result = $this->userManagement->createUser($request->user(), $data);
         $fresh = $result['user'];
@@ -367,6 +460,7 @@ class UserManagementController extends Controller
             ],
             'subject_access' => $result['subject_access'] ?? null,
             'subject_permissions' => $result['subject_permissions'] ?? [],
+            'hr_squad' => $result['hr_squad'] ?? null,
             'current_actor_session' => $result['current_actor_session'] ?? $this->userManagement->currentSessionSnapshot($request->user()),
         ], 'User created');
     }
@@ -374,7 +468,7 @@ class UserManagementController extends Controller
 
     public function updateUserAccess(Request $request, string $userId)
     {
-        $this->userManagement->ensureMasters();
+        $this->userManagement->ensureMastersReady();
 
         $subject = User::query()->find($userId);
         if (!$subject) {
@@ -385,6 +479,14 @@ class UserManagementController extends Controller
             'access_role_id' => ['required', 'string', Rule::exists('access_roles', 'id')],
             'access_level_id' => ['nullable', 'string', Rule::exists('access_levels', 'id')],
         ]);
+
+        $selectedRole = AccessRole::query()->find($data['access_role_id']);
+        $roleCode = strtoupper(trim((string) ($selectedRole?->code ?? '')));
+        if (! in_array($roleCode, ['STAKEHOLDER', 'OBSERVER'], true) && trim((string) ($subject->nisj ?? '')) === '') {
+            throw ValidationException::withMessages([
+                'nisj' => ['Isi NISJ pada profil User sebelum mengubah role ke role operasional, karena Data Squad dibuat melalui pivot NISJ.'],
+            ]);
+        }
 
         $result = $this->userManagement->updateUserAssignment(
             $request->user(),
@@ -400,8 +502,41 @@ class UserManagementController extends Controller
             ],
             'subject_access' => $result['access'] ?? null,
             'subject_permissions' => $result['permissions'] ?? [],
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'hr_squad' => $result['hr_squad'] ?? null,
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'User access updated');
+    }
+
+
+    public function bulkUpdateUserAccess(Request $request)
+    {
+        $this->userManagement->ensureMastersReady();
+
+        $data = $request->validate([
+            'user_ids' => ['required', 'array', 'min:1', 'max:100'],
+            'user_ids.*' => ['required', 'string', Rule::exists('users', 'id')],
+            'access_role_id' => ['nullable', 'string', Rule::exists('access_roles', 'id')],
+            'access_level_mode' => ['required', 'string', Rule::in(['KEEP', 'CLEAR', 'SET'])],
+            'access_level_id' => ['nullable', 'string', Rule::exists('access_levels', 'id')],
+        ]);
+
+        if (($data['access_level_mode'] ?? 'KEEP') === 'SET' && empty($data['access_level_id'])) {
+            throw ValidationException::withMessages([
+                'access_level_id' => ['Access Level wajib dipilih saat mode SET.'],
+            ]);
+        }
+
+        $result = $this->userManagement->bulkUpdateUserAssignments(
+            $request->user(),
+            $data['user_ids'],
+            $data['access_role_id'] ?? null,
+            (string) ($data['access_level_mode'] ?? 'KEEP'),
+            $data['access_level_id'] ?? null,
+            $request->ip(),
+            $request->userAgent(),
+        );
+
+        return ApiResponse::ok($result, 'Bulk user access updated');
     }
 
 
@@ -416,11 +551,18 @@ class UserManagementController extends Controller
 
         $data = $request->validate([
             'username' => ['required', 'string', 'max:100', Rule::unique('users', 'username')->ignore($subject->id)],
-            'nisj' => ['nullable', 'string', 'max:100'],
+            'nisj' => ['nullable', 'string', 'max:32', Rule::unique('users', 'nisj')->ignore($subject->id)],
             'assignment_role_title' => ['nullable', 'string', 'max:255'],
             'outlet_id' => ['nullable', 'string', Rule::exists('outlets', 'id')],
             'password' => ['nullable', 'string', 'min:8', 'confirmed'],
         ]);
+
+        $roleCode = strtoupper(trim((string) ($subject->accessAssignment?->role?->code ?? '')));
+        if (! in_array($roleCode, ['STAKEHOLDER', 'OBSERVER'], true) && trim((string) ($data['nisj'] ?? '')) === '') {
+            throw ValidationException::withMessages([
+                'nisj' => ['NISJ wajib diisi untuk User yang terhubung ke Data Squad.'],
+            ]);
+        }
 
         $result = $this->userManagement->updateUserProfile($request->user(), $subject, $data);
         $fresh = $result['user'];
@@ -474,6 +616,7 @@ class UserManagementController extends Controller
                     ] : null,
                 ],
             ],
+            'hr_squad' => $result['hr_squad'] ?? null,
             'current_actor_session' => $result['current_actor_session'] ?? $this->userManagement->currentSessionSnapshot($request->user()),
         ], 'User profile updated');
     }
@@ -549,7 +692,7 @@ class UserManagementController extends Controller
 
         return ApiResponse::ok([
             'provision_control' => $this->serializeProvisionControl($control->fresh(), $resolvedOutlet),
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], (bool) $control->allow_provision ? 'Provision user diaktifkan.' : 'Provision user diblokir.');
     }
 
@@ -595,7 +738,7 @@ class UserManagementController extends Controller
 
     public function updatePortalPermission(Request $request)
     {
-        $this->userManagement->ensureMasters();
+        $this->userManagement->ensureMastersReady();
 
         $data = $request->validate([
             'access_role_id' => ['required', 'string', Rule::exists('access_roles', 'id')],
@@ -617,13 +760,13 @@ class UserManagementController extends Controller
             'portal_permission' => $this->findPortalMatrixRow($data['access_role_id'], $data['access_level_id'] ?? null, $data['portal_id']),
             'synced_users' => $syncedUsers,
             'sync_summary' => ['synced_users' => $syncedUsers],
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'Portal permission updated');
     }
 
     public function bulkPortalPermissions(Request $request)
     {
-        $this->userManagement->ensureMasters();
+        $this->userManagement->ensureMastersReady();
 
         $data = $request->validate([
             'access_role_id' => ['required', 'string', Rule::exists('access_roles', 'id')],
@@ -648,13 +791,13 @@ class UserManagementController extends Controller
             'portal_permissions' => $this->matrixPortalRowsForScope($data['access_role_id'], $data['access_level_id'] ?? null),
             'synced_users' => $syncedUsers,
             'sync_summary' => ['synced_users' => $syncedUsers],
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'Portal permissions updated');
     }
 
     public function updateMenuPermission(Request $request)
     {
-        $this->userManagement->ensureMasters();
+        $this->userManagement->ensureMastersReady();
 
         $data = $request->validate([
             'access_role_id' => ['required', 'string', Rule::exists('access_roles', 'id')],
@@ -682,13 +825,13 @@ class UserManagementController extends Controller
             'menu_permission' => $this->findMenuMatrixRow($data['access_role_id'], $data['access_level_id'] ?? null, $data['menu_id']),
             'synced_users' => $syncedUsers,
             'sync_summary' => ['synced_users' => $syncedUsers],
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'Menu permission updated');
     }
 
     public function bulkMenuPermissions(Request $request)
     {
-        $this->userManagement->ensureMasters();
+        $this->userManagement->ensureMastersReady();
 
         $data = $request->validate([
             'access_role_id' => ['required', 'string', Rule::exists('access_roles', 'id')],
@@ -719,7 +862,7 @@ class UserManagementController extends Controller
             'menu_permissions' => $this->matrixMenuRowsForScope($data['access_role_id'], $data['access_level_id'] ?? null),
             'synced_users' => $syncedUsers,
             'sync_summary' => ['synced_users' => $syncedUsers],
-            'current_actor_session' => $this->userManagement->currentSessionSnapshot($request->user()),
+            'current_actor_session' => $this->userManagement->currentSessionSnapshot(User::query()->with(['roles', 'permissions'])->find($request->user()->id) ?: $request->user()),
         ], 'Menu permissions updated');
     }
 
@@ -901,9 +1044,43 @@ class UserManagementController extends Controller
         ])->values()->all();
 
         $roles = AccessRole::query()->with('userType')->orderBy('name')->get()->map(fn (AccessRole $item) => $this->serializeRole($item))->values()->all();
+        $guard = (string) config('auth.defaults.guard', 'web');
+        $spatieRoles = SpatieRole::query()
+            ->where('guard_name', $guard)
+            ->withCount('permissions')
+            ->orderBy('name')
+            ->get()
+            ->map(fn (SpatieRole $item) => [
+                'id' => (int) $item->id,
+                'name' => (string) $item->name,
+                'guard_name' => (string) $item->guard_name,
+                'permission_count' => (int) ($item->permissions_count ?? 0),
+            ])
+            ->values()
+            ->all();
         $levels = AccessLevel::query()->orderBy('name')->get()->map(fn (AccessLevel $item) => $this->serializeLevel($item))->values()->all();
         $portals = AccessPortal::query()->orderBy('sort_order')->orderBy('name')->get()->map(fn (AccessPortal $item) => $this->serializePortal($item))->values()->all();
         $menus = AccessMenu::query()->with('portal')->orderBy('sort_order')->orderBy('name')->get()->map(fn (AccessMenu $item) => $this->serializeMenu($item))->values()->all();
+
+        $assignmentRoles = Assignment::query()
+            ->whereNotNull('role_title')
+            ->where('role_title', '!=', '')
+            ->whereIn('assignments.id', function ($query) {
+                $query->select('assignment_id')
+                    ->from('employees')
+                    ->whereNotNull('user_id')
+                    ->whereNotNull('assignment_id');
+            })
+            ->select('role_title')
+            ->distinct()
+            ->orderBy('role_title')
+            ->pluck('role_title')
+            ->map(fn ($roleTitle) => [
+                'value' => (string) $roleTitle,
+                'name' => (string) $roleTitle,
+            ])
+            ->values()
+            ->all();
 
         $outlets = Outlet::query()
             ->where('is_active', true)
@@ -925,7 +1102,9 @@ class UserManagementController extends Controller
         return [
             'user_types' => $userTypes,
             'roles' => $roles,
+            'spatie_roles' => $spatieRoles,
             'levels' => $levels,
+            'assignment_roles' => $assignmentRoles,
             'portals' => $portals,
             'menus' => $menus,
             'outlets' => $outlets,
@@ -1049,6 +1228,30 @@ class UserManagementController extends Controller
         }
 
         return null;
+    }
+
+    private function normalizeSpatieRoleName(mixed $value): ?string
+    {
+        $name = strtolower(trim((string) ($value ?? '')));
+        return $name !== '' ? $name : null;
+    }
+
+    private function assertActorCanManageSpatieRoleMapping(User $actor, ?string $before, ?string $after): void
+    {
+        if ($before === $after) {
+            return;
+        }
+
+        $assignment = $this->userManagement->ensureAccessAssignment($actor);
+        $accessRoleCode = strtoupper(trim((string) ($assignment->role?->code ?? '')));
+        $actor->loadMissing('roles');
+        $isSpatieAdmin = $actor->roles->contains(fn ($role) => strtolower((string) $role->name) === 'admin');
+
+        if ($accessRoleCode !== 'ADMIN' && ! $isSpatieAdmin) {
+            throw ValidationException::withMessages([
+                'spatie_role_name' => ['Hanya Administrator yang dapat mengubah mapping Spatie Role pada Access Role.'],
+            ]);
+        }
     }
 
     private function serializeRole(AccessRole $item): array

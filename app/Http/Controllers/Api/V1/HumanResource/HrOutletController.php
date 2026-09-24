@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api\V1\HumanResource;
 
 use App\Http\Controllers\Controller;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
+use App\Services\HumanResource\HrOutletStaffingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -16,6 +17,10 @@ class HrOutletController extends Controller
 {
     private const TABLE = 'outlets';
     private const TYPES = ['outlet', 'headquarter', 'warehouse'];
+
+    public function __construct(private readonly HrOutletStaffingService $staffing)
+    {
+    }
 
     public function index(Request $request)
     {
@@ -40,17 +45,14 @@ class HrOutletController extends Controller
             ->orderBy('name')
             ->get();
 
-        $countsByOutletId = $this->assignmentCountsByOutletId($rows->pluck('id')->all());
-        $countsByOutletName = $this->assignmentCountsByOutletName($rows);
+        $staffingByOutletId = $this->staffing->summariesForOutlets($rows);
 
-        $items = $rows->map(function ($row) use ($countsByOutletId, $countsByOutletName) {
-            $counts = $countsByOutletId[$row->id] ?? [];
-            if (empty($counts)) {
-                $key = $this->outletNameKey($row);
-                $counts = $countsByOutletName[$key] ?? [];
-            }
-
-            return $this->formatOutlet($row, $counts);
+        $items = $rows->map(function ($row) use ($staffingByOutletId) {
+            $staffing = $staffingByOutletId[(string) $row->id] ?? [];
+            $counts = collect($staffing['rows'] ?? [])->mapWithKeys(fn ($item) => [
+                (string) ($item['role'] ?? 'LAINNYA') => (int) ($item['actual'] ?? 0),
+            ])->all();
+            return $this->formatOutlet($row, $counts, $staffing);
         })->values();
 
         return ApiResponse::ok(['items' => $items], 'OK');
@@ -61,12 +63,13 @@ class HrOutletController extends Controller
         $row = DB::table(self::TABLE)->where('id', $id)->first();
         if (!$row) return ApiResponse::error('Outlet tidak ditemukan.', 'NOT_FOUND', 404);
 
-        $counts = $this->assignmentCountsByOutletId([$row->id])[$row->id] ?? [];
-        if (empty($counts)) {
-            $counts = $this->assignmentCountsByOutletName(collect([$row]))[$this->outletNameKey($row)] ?? [];
-        }
+        $collection = collect([$row]);
+        $staffing = $this->staffing->summariesForOutlets($collection)[(string) $row->id] ?? [];
+        $counts = collect($staffing['rows'] ?? [])->mapWithKeys(fn ($item) => [
+            (string) ($item['role'] ?? 'LAINNYA') => (int) ($item['actual'] ?? 0),
+        ])->all();
 
-        return ApiResponse::ok($this->formatOutlet($row, $counts), 'OK');
+        return ApiResponse::ok($this->formatOutlet($row, $counts, $staffing), 'OK');
     }
 
     public function store(Request $request)
@@ -168,7 +171,7 @@ class HrOutletController extends Controller
         return in_array($normalized, self::TYPES, true) ? $normalized : null;
     }
 
-    private function formatOutlet(object $row, array $roleCounts = []): array
+    private function formatOutlet(object $row, array $roleCounts = [], array $staffing = []): array
     {
         ksort($roleCounts, SORT_NATURAL | SORT_FLAG_CASE);
         $total = array_sum(array_map('intval', $roleCounts));
@@ -186,6 +189,9 @@ class HrOutletController extends Controller
             'radius_m' => $row->radius_m ?? null,
             'role_counts' => $roleCounts,
             'total_squad' => $total,
+            'staffing' => $staffing['rows'] ?? [],
+            'staffing_editor_roles' => $staffing['editor_roles'] ?? [],
+            'staffing_totals' => $staffing['totals'] ?? ['slot' => 0, 'actual' => $total, 'gap' => $total],
             'created_at' => $row->created_at ?? null,
             'updated_at' => $row->updated_at ?? null,
         ];
