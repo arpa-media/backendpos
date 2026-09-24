@@ -437,8 +437,13 @@ return new class extends Migration
             Permission::findOrCreate($permission, $guard);
         }
 
+        if (app()->bound(PermissionRegistrar::class)) {
+            app(PermissionRegistrar::class)->forgetCachedPermissions();
+        }
+
         if (Schema::hasTable('roles')) {
             $adminRoles = Role::query()
+                ->where('guard_name', $guard)
                 ->where(function ($query): void {
                     $query->whereRaw('LOWER(name) = ?', ['admin'])
                         ->orWhereRaw('LOWER(name) = ?', ['administrator'])

@@ -172,8 +172,9 @@ return new class extends Migration
         $guard = (string) config('auth.defaults.guard', 'web');
         if (Schema::hasTable('permissions')) {
             foreach (self::PERMISSIONS as $permission) Permission::findOrCreate($permission, $guard);
+            if (app()->bound(PermissionRegistrar::class)) app(PermissionRegistrar::class)->forgetCachedPermissions();
             if (Schema::hasTable('roles')) {
-                $admins = Role::query()->where(function ($q): void {
+                $admins = Role::query()->where('guard_name', $guard)->where(function ($q): void {
                     $q->whereRaw('LOWER(name) IN (?, ?)', ['admin', 'administrator'])
                       ->orWhereRaw('LOWER(name) LIKE ?', ['%super%admin%']);
                 })->get();
