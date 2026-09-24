@@ -43,27 +43,10 @@ return Application::configure(basePath: dirname(__DIR__))
             ->withoutOverlapping();
 
 
-        // ERP FINANCE V8 I01: keep report materialization out of interactive HTTP requests.
-        // Dirty windows are refreshed incrementally; the 370-day rolling window is warmed off-peak.
-        $schedule->command('report-daily-summaries:refresh-dirty --limit=120 --outlet-chunk=6 --date-chunk=2')
-            ->everyFiveMinutes()
-            ->withoutOverlapping(30);
-
-        // ERP FINANCE V8 I08: current-day hourly freshness remains incremental.
-        $schedule->command('report-hourly-summaries:refresh-dirty --limit=120')
-            ->everyFiveMinutes()
-            ->withoutOverlapping(30);
-
-        // ERP FINANCE V8 I11: scheduler only orchestrates/recover state and dispatches work.
-        // Heavy Daily/Hourly/Monthly chunks run on the dedicated database queue connection `reporting`.
-        $schedule->command('reporting-engine:tick --max-dispatch=4')
-            ->everyMinute()
-            ->withoutOverlapping(10);
-
-        // I11 worker liveness probe. It is queued on the same isolated reporting worker.
-        $schedule->job(new \App\Jobs\Reporting\ReportingWorkerHeartbeatJob(), 'reporting', 'reporting')
-            ->everyFiveMinutes()
-            ->withoutOverlapping(10);
+        // ERP POS Console I03: Reporting scheduler single source of truth.
+        // Daily / Hourly / Monthly maintenance is dispatched to the isolated
+        // reporting queue so schedule:run never performs heavy summary work.
+        \App\Support\Reporting\ReportingScheduleRegistry::register($schedule);
 
 
         // ERP FINANCE V8 I12: keep Settlement source synchronization bounded and

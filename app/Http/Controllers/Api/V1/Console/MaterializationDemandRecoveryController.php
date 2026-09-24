@@ -3,9 +3,12 @@
 namespace App\Http\Controllers\Api\V1\Console;
 
 use App\Http\Controllers\Controller;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Services\Reporting\ReportingMaterializationOrchestrator;
 use App\Services\UserManagementService;
+use App\Support\BackofficeOutletScope;
 use App\Support\FinanceOutletFilter;
+use App\Support\TransactionDate;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -25,6 +28,7 @@ class MaterializationDemandRecoveryController extends Controller
     public function __construct(
         private readonly ReportingMaterializationOrchestrator $orchestrator,
         private readonly UserManagementService $userManagement,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
     ) {
     }
 
@@ -39,77 +43,131 @@ class MaterializationDemandRecoveryController extends Controller
         ]);
 
         $sourcePath = '/'.ltrim(trim((string) $validated['source_path']), '/');
+        $sourcePath = rtrim($sourcePath, '/') ?: '/';
         abort_unless(in_array($sourcePath, self::ALLOWED_PATHS, true), 422, 'Report source tidak didukung untuk demand recovery.');
         $this->authorizeReportPath($request, $sourcePath);
 
         $params = is_array($validated['request_params'] ?? null) ? $validated['request_params'] : [];
         $source = is_array($validated['reporting_source'] ?? null) ? $validated['reporting_source'] : [];
 
-        $outletFilter = FinanceOutletFilter::resolve((string) ($params['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
-        $outletIds = array_values(array_unique(array_filter(array_map('strval', $outletFilter['outlet_ids'] ?? []))));
+        $allowedOutletIds = $this->resolveAllowedOutletIds($request, $sourcePath, $params);
+        $sourceOutletIds = $this->normalizeOutletIds($source['outlet_ids'] ?? []);
 
+        // reporting_source comes from the exact 409 read contract. Intersect it
+        // with the current requester's server-side outlet scope so an operational
+        // user cannot broaden a scoped report into an ALL-outlet demand run.
+        $outletIds = $sourceOutletIds !== []
+            ? array_values(array_intersect($sourceOutletIds, $allowedOutletIds))
+            : $allowedOutletIds;
+        $outletIds = array_values(array_unique($outletIds));
+        sort($outletIds);
+
+        abort_unless($outletIds !== [], 422, 'Scope outlet demand recovery kosong atau tidak lagi diizinkan.');
+
+        // Prefer the backend-generated reporting contract over request params.
+        // This preserves the exact scope which actually returned HTTP 409.
         $dateFrom = $this->firstDate([
-            $params['date_from'] ?? null,
-            $params['date'] ?? null,
             $source['date_from'] ?? null,
             $source['business_date'] ?? null,
+            $params['date_from'] ?? null,
+            $params['date'] ?? null,
         ]);
         $dateTo = $this->firstDate([
-            $params['date_to'] ?? null,
-            $params['date'] ?? null,
             $source['date_to'] ?? null,
             $source['business_date'] ?? null,
+            $params['date_to'] ?? null,
+            $params['date'] ?? null,
             $dateFrom,
         ]);
 
         abort_unless($dateFrom && $dateTo, 422, 'Rentang tanggal demand recovery tidak dapat ditentukan.');
 
         $pipeline = $validated['error_code'] === 'REPORT_HOURLY_SUMMARY_NOT_READY' ? 'hourly' : 'daily';
-        $runParams = [
+
+        // I04: a stale browser/client must never re-introduce the old recovery loop
+        // for the 3-day live window. Daily demand recovery is restricted to the
+        // historical segment only; a live-only request becomes a no-op.
+        if ($pipeline === 'daily') {
+            $timezone = TransactionDate::normalizeTimezone(
+                (string) ($source['timezone'] ?? ''),
+                TransactionDate::appTimezone(),
+            );
+            $plan = $this->hotWindowReadService->readPlan($dateFrom, $dateTo, $timezone);
+
+            if (($plan['mode'] ?? null) === 'live') {
+                return response()->json([
+                    'data' => [
+                        'accepted' => false,
+                        'already_ready' => true,
+                        'live_window' => true,
+                        'source_path' => $sourcePath,
+                        'pipeline' => $pipeline,
+                        'date_from' => $dateFrom,
+                        'date_to' => $dateTo,
+                        'outlet_count' => count($outletIds),
+                        'read_plan' => $plan,
+                    ],
+                    'message' => 'Rentang ini berada di Live Hot-Window 3 hari dan dibaca langsung dari transaksi POS. Material Recovery tidak diperlukan.',
+                ], 200);
+            }
+
+            if (($plan['mode'] ?? null) === 'hybrid') {
+                $dateFrom = (string) ($plan['historical_from'] ?? $dateFrom);
+                $dateTo = (string) ($plan['historical_to'] ?? $dateTo);
+            }
+        }
+
+        $payload = [
+            'pipeline' => $pipeline,
             'date_from' => $dateFrom,
             'date_to' => $dateTo,
             'outlet_ids' => $outletIds,
-            'outlet_chunk' => 1,
-            'date_chunk' => 3,
-            'pipeline' => $pipeline,
-            'mode' => 'missing_only',
         ];
 
         try {
-            $run = $this->orchestrator->startRun(
-                $runParams,
-                (string) ($request->user()?->getAuthIdentifier() ?? ''),
-                'demand'
+            // IMPORTANT: use the canonical V2 recovery path, not startRun().
+            // requestCoverageRecovery() persists/deduplicates the request, skips
+            // already-ready coverage and creates P100 1-outlet × max-3-day chunks.
+            $result = $this->orchestrator->requestCoverageRecovery(
+                $payload,
+                (string) ($request->user()?->getAuthIdentifier() ?? '')
             );
+
+            $ready = ($result['state'] ?? null) === 'ready';
 
             return response()->json([
                 'data' => [
-                    'accepted' => true,
+                    'accepted' => ! $ready,
+                    'already_ready' => $ready,
                     'source_path' => $sourcePath,
                     'pipeline' => $pipeline,
                     'date_from' => $dateFrom,
                     'date_to' => $dateTo,
                     'outlet_count' => count($outletIds),
-                    'run' => $run,
+                    'recovery' => $result,
                 ],
-                'message' => 'Demand recovery diprioritaskan untuk report yang sedang Anda buka.',
-            ], 202);
+                'message' => $ready
+                    ? 'Coverage report sudah siap. Muat ulang halaman untuk mengambil data terbaru.'
+                    : 'Demand recovery diprioritaskan hanya untuk coverage report yang sedang Anda buka.',
+            ], $ready ? 200 : 202);
+        } catch (\InvalidArgumentException $e) {
+            return response()->json(['message' => $e->getMessage()], 422);
         } catch (\RuntimeException $e) {
-            // Legacy orchestrator can still reject a second run. This is not a browser
-            // failure: an existing engine run may already be warming the same data.
-            return response()->json([
-                'data' => [
-                    'accepted' => false,
-                    'attached_to_existing_run' => true,
-                    'source_path' => $sourcePath,
-                    'pipeline' => $pipeline,
-                    'date_from' => $dateFrom,
-                    'date_to' => $dateTo,
-                    'outlet_count' => count($outletIds),
-                ],
-                'message' => $e->getMessage(),
-            ], 202);
+            return response()->json(['message' => $e->getMessage()], 409);
         }
+    }
+
+    private function resolveAllowedOutletIds(Request $request, string $sourcePath, array $params): array
+    {
+        $rawFilter = (string) ($params['outlet_filter'] ?? $params['outlet_id'] ?? FinanceOutletFilter::FILTER_ALL);
+
+        if (str_starts_with($sourcePath, '/operational/')) {
+            $scope = BackofficeOutletScope::resolve($request, $rawFilter, true);
+            return $this->normalizeOutletIds($scope['outlet_ids'] ?? []);
+        }
+
+        $scope = FinanceOutletFilter::resolve($rawFilter);
+        return $this->normalizeOutletIds($scope['outlet_ids'] ?? []);
     }
 
     private function authorizeReportPath(Request $request, string $sourcePath): void
@@ -129,8 +187,6 @@ class MaterializationDemandRecoveryController extends Controller
             }
         }
 
-        // Preserve compatibility for installations where route ability exists in
-        // Spatie but the access snapshot was created before this menu catalog entry.
         $permissionByPath = [
             '/finance/overview' => 'report.view',
             '/finance/sales-summary' => 'sale.view',
@@ -144,6 +200,18 @@ class MaterializationDemandRecoveryController extends Controller
 
         $permission = $permissionByPath[$sourcePath] ?? null;
         abort_unless($permission && $user->can($permission), 403, 'Anda tidak memiliki akses ke report ini.');
+    }
+
+    private function normalizeOutletIds($values): array
+    {
+        if (! is_array($values)) {
+            return [];
+        }
+
+        return array_values(array_unique(array_filter(array_map(
+            fn ($value) => trim((string) $value),
+            $values
+        ), fn ($value) => $value !== '')));
     }
 
     private function firstDate(array $values): ?string

@@ -5,7 +5,7 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListItemSummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
-use App\Services\ReportDailySummaryService;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Support\AnalyticsResponseCache;
 use App\Support\FinanceCategorySegment;
 use App\Support\FinanceOutletFilter;
@@ -17,19 +17,17 @@ use Illuminate\Support\Facades\DB;
 class ItemSummaryController extends Controller
 {
     public function __construct(
-        private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
     ) {
     }
 
-    private function okCached($request, string $namespace, array $params, callable $callback)
+    private function okCached($request, string $namespace, array $params, callable $callback, ?array $reportingSource = null)
     {
-        return AnalyticsResponseCache::remember(
-            $namespace,
-            $params,
-            $callback,
-            300,
-            (string) ($request->user()?->getAuthIdentifier() ?? '')
-        );
+        $userId = (string) ($request->user()?->getAuthIdentifier() ?? '');
+
+        return $reportingSource !== null
+            ? AnalyticsResponseCache::rememberReporting($namespace, $params, $reportingSource, $callback, $userId)
+            : AnalyticsResponseCache::remember($namespace, $params, $callback, 300, $userId);
     }
 
     public function index(ListItemSummaryRequest $request)
@@ -40,7 +38,7 @@ class ItemSummaryController extends Controller
         if (! $request->boolean('filters_only')) {
             $readFilter = FinanceOutletFilter::resolve((string) ($validated['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
             $readOutletIds = array_values(array_unique(array_map('strval', $readFilter['outlet_ids'] ?? [])));
-            $reportingSource = $this->dailySummaryService->readContractStatus(
+            $reportingSource = $this->hotWindowReadService->readContractStatus(
                 $readOutletIds,
                 $validated['date_from'] ?? null,
                 $validated['date_to'] ?? null,
@@ -58,7 +56,7 @@ class ItemSummaryController extends Controller
             }
         }
 
-        return ApiResponse::ok($this->okCached($request, 'finance-item-summary.v8i03.index', $validated, function () use ($request, $validated, $reportingSource) {
+        return ApiResponse::ok($this->okCached($request, 'finance-item-summary.console-i02.index', $validated, function () use ($request, $validated, $reportingSource) {
             $v = $validated;
             $sort = (string) ($v['sort'] ?? 'category_name');
             $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
@@ -113,8 +111,8 @@ class ItemSummaryController extends Controller
                 ];
             }
 
-            $rows = $this->buildRows($outletIds, $v, $sort, $dir, $categorySegment)->get();
-            $modifierMap = $this->buildSelectedModifierMap($rows, $outletIds, $v, $timezone, $categorySegment);
+            $rows = $this->buildRows($outletIds, $v, $sort, $dir, $categorySegment, $timezone)->get();
+            $modifierMap = $this->buildSelectedModifierMap($rows, $outletIds, $v, $timezone, $categorySegment, $reportingSource ?? []);
 
             $items = $rows->map(function ($row) use ($modifierMap) {
                 $grossSales = (int) round((float) ($row->gross_sales ?? 0));
@@ -181,10 +179,10 @@ class ItemSummaryController extends Controller
                     'cogs_source' => 'not_available',
                 ],
             ];
-        }), 'OK');
+        }, $reportingSource), 'OK');
     }
 
-    private function buildSelectedModifierMap($rows, array $outletIds, array $filters, string $timezone, string $categorySegment): array
+    private function buildSelectedModifierMap($rows, array $outletIds, array $filters, string $timezone, string $categorySegment, array $reportingSource): array
     {
         $rowKeys = $rows->pluck('row_key')->filter()->map(fn ($key) => (string) $key)->unique()->sort()->values();
         if ($rowKeys->isEmpty() || $outletIds === []) {
@@ -207,9 +205,14 @@ class ItemSummaryController extends Controller
             'date_to' => $toDate,
             'category_segment' => $categorySegment,
             'row_keys' => $rowKeys->all(),
+            'read_mode' => (string) ($reportingSource['read_mode'] ?? 'materialized'),
+            'hot_window_from' => $reportingSource['hot_window_from'] ?? null,
+            'hot_window_to' => $reportingSource['hot_window_to'] ?? null,
         ]));
 
-        return Cache::remember($cacheKey, now()->addMinutes(5), function () use ($rowKeys, $normalizedOutletIds, $fromDate, $toDate, $categorySegment) {
+        $modifierTtl = AnalyticsResponseCache::reportingTtlSeconds($reportingSource);
+
+        return Cache::remember($cacheKey, now()->addSeconds($modifierTtl), function () use ($rowKeys, $normalizedOutletIds, $fromDate, $toDate, $categorySegment) {
             // Modifier is decorative metadata, not a financial aggregate. Restrict its
             // history scan to the canonical business-date sale IDs and selected rows.
             // This avoids joining the full sales table across a 1-year range.
@@ -291,10 +294,10 @@ class ItemSummaryController extends Controller
         return mb_substr($value, 0, 255);
     }
 
-    private function buildRows(array $outletIds, array $filters, string $sort, string $dir, string $categorySegment): Builder
+    private function buildRows(array $outletIds, array $filters, string $sort, string $dir, string $categorySegment, string $timezone): Builder
     {
-        $query = $this->dailySummaryService
-            ->variantSummaryQuery($outletIds, $filters['date_from'] ?? null, $filters['date_to'] ?? null, $categorySegment)
+        $query = $this->hotWindowReadService
+            ->variantSummaryQuery($outletIds, $filters['date_from'] ?? null, $filters['date_to'] ?? null, $categorySegment, $timezone)
             ->groupBy('rdvar.product_id', 'rdvar.variant_id', 'rdvar.product_name', 'rdvar.variant_name', 'rdvar.category_id', 'rdvar.category_name')
             ->selectRaw("CONCAT(COALESCE(rdvar.product_id, ''), ':', COALESCE(rdvar.variant_id, '')) as row_key")
             ->selectRaw('rdvar.product_id as product_id')

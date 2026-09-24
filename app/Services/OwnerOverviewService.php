@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Models\Sale;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
@@ -18,7 +19,7 @@ class OwnerOverviewService
         private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
         private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
         private readonly ReportSaleBusinessDateIndexService $businessDateIndex,
-        private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
         private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
@@ -37,7 +38,7 @@ class OwnerOverviewService
         }
 
         $timezone = $this->resolveTimezone($scope['selected_outlet_id'] ?? null);
-        $reportingSource = $this->dailySummaryService->readContractStatus(
+        $reportingSource = $this->hotWindowReadService->readContractStatus(
             $scope['allowed_outlet_ids'],
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
@@ -132,7 +133,7 @@ class OwnerOverviewService
         $timezone = (string) ($outletFilter['timezone'] ?? config('app.timezone', 'Asia/Jakarta'));
         $outletIds = array_values(array_filter(array_map(fn ($id) => (string) $id, $outletFilter['outlet_ids'] ?? [])));
 
-        return $this->dailySummaryService->readContractStatus(
+        return $this->hotWindowReadService->readContractStatus(
             $outletIds,
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
@@ -154,7 +155,7 @@ class OwnerOverviewService
         $topLimit = max(1, min(10, (int) ($params['top_limit'] ?? 5)));
         $recentLimit = max(1, min(20, (int) ($params['recent_limit'] ?? 10)));
         $allowedOutlets = $this->resolveAllowedOutlets($outletIds);
-        $reportingSource ??= $this->dailySummaryService->readContractStatus(
+        $reportingSource ??= $this->hotWindowReadService->readContractStatus(
             $outletIds,
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
@@ -172,8 +173,8 @@ class OwnerOverviewService
             $timezone
         );
 
-        $summaryRow = $this->dailySummaryService
-            ->salesSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null)
+        $summaryRow = $this->hotWindowReadService
+            ->salesSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone)
             ->selectRaw('COALESCE(SUM(rdss.trx_count), 0) as trx_count')
             ->selectRaw('COALESCE(SUM(rdss.grand_sales), 0) as gross_sales')
             ->selectRaw('COALESCE(SUM(rdss.marked_grand_sales), 0) as marking_gross_sales')
@@ -184,8 +185,8 @@ class OwnerOverviewService
             return $this->emptyOverviewPayload($fromLocal->toDateString(), $toLocal->toDateString(), $outletFilter, $timezone, $allowedOutlets, $recentLimit, $reportingSource);
         }
 
-        $paymentRows = $this->dailySummaryService
-            ->paymentSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null)
+        $paymentRows = $this->hotWindowReadService
+            ->paymentSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone)
             ->selectRaw('rdps.outlet_id')
             ->selectRaw('rdps.payment_method_name')
             ->selectRaw('rdps.payment_method_type')
@@ -241,8 +242,8 @@ class OwnerOverviewService
             ];
         }
 
-        $outletRows = $this->dailySummaryService
-            ->salesSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null)
+        $outletRows = $this->hotWindowReadService
+            ->salesSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone)
             ->join('outlets as o', 'o.id', '=', 'rdss.outlet_id')
             ->selectRaw('rdss.outlet_id as outlet_id')
             ->selectRaw('o.code as outlet_code')
@@ -279,8 +280,8 @@ class OwnerOverviewService
                 ?: strcmp((string) ($left[$labelKey] ?? ''), (string) ($right[$labelKey] ?? ''));
         };
 
-        $byChannel = $this->dailySummaryService
-            ->channelSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null)
+        $byChannel = $this->hotWindowReadService
+            ->channelSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, $timezone)
             ->selectRaw('rdcs.display_channel as channel')
             ->selectRaw('COALESCE(SUM(rdcs.trx_count), 0) as trx_count')
             ->selectRaw('COALESCE(SUM(rdcs.gross_sales), 0) as gross_sales')
@@ -298,8 +299,8 @@ class OwnerOverviewService
         $byPaymentMethod = array_values($paymentAccumulator);
         usort($byPaymentMethod, fn (array $left, array $right) => $sortGrossThenLabel($left, $right, 'payment_method_name'));
 
-        $categorySummary = $this->dailySummaryService
-            ->categorySummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null)
+        $categorySummary = $this->hotWindowReadService
+            ->categorySummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, null, $timezone)
             ->selectRaw('rdcat.category_name as category_name')
             ->selectRaw('COALESCE(SUM(rdcat.item_sold), 0) as qty_sold')
             ->selectRaw('COALESCE(SUM(rdcat.gross_sales), 0) as gross_sales')
@@ -318,8 +319,8 @@ class OwnerOverviewService
                 ?: strcmp((string) ($left['category_name'] ?? ''), (string) ($right['category_name'] ?? ''));
         });
 
-        $topVariants = $this->dailySummaryService
-            ->variantSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null)
+        $topVariants = $this->hotWindowReadService
+            ->variantSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, null, $timezone)
             ->selectRaw('rdvar.product_name')
             ->selectRaw('rdvar.variant_name')
             ->selectRaw('COALESCE(SUM(rdvar.item_sold), 0) as qty_sold')
@@ -340,8 +341,8 @@ class OwnerOverviewService
             ->values()
             ->all();
 
-        $topProducts = $this->dailySummaryService
-            ->productSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null)
+        $topProducts = $this->hotWindowReadService
+            ->productSummaryQuery($outletIds, $params['date_from'] ?? null, $params['date_to'] ?? null, null, $timezone)
             ->selectRaw('rdprod.product_name')
             ->selectRaw('COALESCE(SUM(rdprod.item_sold), 0) as qty_sold')
             ->selectRaw('COALESCE(SUM(rdprod.gross_sales), 0) as revenue')
@@ -546,13 +547,13 @@ class OwnerOverviewService
             return false;
         }
 
-        [$fromLocal, $toLocal] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
-
-        return DB::table('report_sale_business_dates as rsbd')
-            ->where('rsbd.sale_id', $saleId)
-            ->whereIn('rsbd.outlet_id', $outletIds)
-            ->whereBetween('rsbd.business_date', [$fromLocal->toDateString(), $toLocal->toDateString()])
-            ->exists();
+        return $this->hotWindowReadService->saleExists(
+            $outletIds,
+            $dateFrom,
+            $dateTo,
+            $timezone,
+            $saleId,
+        );
     }
 
     private function resolveRecentSaleIdsFromCoverage(array $outletIds, ?string $dateFrom, ?string $dateTo, string $timezone, int $recentLimit): array
@@ -561,25 +562,13 @@ class OwnerOverviewService
             return [];
         }
 
-        [$fromLocal, $toLocal] = TransactionDate::dateRange($dateFrom, $dateTo, $timezone);
-
-        return DB::table('report_sale_business_dates as rsbd')
-            ->join('sales as s', 's.id', '=', 'rsbd.sale_id')
-            ->whereIn('rsbd.outlet_id', $outletIds)
-            ->whereBetween('rsbd.business_date', [$fromLocal->toDateString(), $toLocal->toDateString()])
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID')
-            ->groupBy('rsbd.sale_id')
-            ->selectRaw('rsbd.sale_id')
-            ->selectRaw('MAX(s.created_at) as latest_created_at')
-            ->orderByDesc('latest_created_at')
-            ->orderByDesc('rsbd.sale_id')
-            ->limit($recentLimit)
-            ->pluck('rsbd.sale_id')
-            ->map(fn ($saleId) => trim((string) $saleId))
-            ->filter()
-            ->values()
-            ->all();
+        return $this->hotWindowReadService->recentSaleIds(
+            $outletIds,
+            $dateFrom,
+            $dateTo,
+            $timezone,
+            $recentLimit,
+        );
     }
 
     private function ownerOverviewRecentSalesByIdsQuery(array $saleIds): Builder

@@ -3,7 +3,7 @@
 namespace App\Services\Operational;
 
 use App\Services\FinanceNetReadService;
-use App\Services\ReportDailySummaryService;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Support\TransactionDate;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -11,16 +11,16 @@ use Illuminate\Support\Facades\Schema;
 class OperationalSalesAnalyticService
 {
     public function __construct(
-        private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
         private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
 
     public function reportingStatus(array $outletIds, string $date, string $timezone): array
     {
-        $status = $this->dailySummaryService->readContractStatus($outletIds, $date, $date, $timezone);
+        $status = $this->hotWindowReadService->readContractStatus($outletIds, $date, $date, $timezone);
         $status['consumer_contract'] = 'erp_finance_v8_i07_daily_analytic';
-        $status['metric_source'] = 'report_daily_sales_summaries';
+        $status['metric_source'] = 'hot_window_read_contract';
         $status['omzet_formula'] = 'grand_sales_after_approved_void_adjustment';
         $status['basket_size_formula'] = 'omzet / trx_count';
 
@@ -43,14 +43,15 @@ class OperationalSalesAnalyticService
 
         $dailyRows = $outletIds === []
             ? collect()
-            : DB::table('report_daily_sales_summaries as rdss')
-                ->whereIn('rdss.outlet_id', $outletIds)
-                ->where('rdss.business_date', $date)
-                ->get([
-                    'rdss.outlet_id', 'rdss.trx_count', 'rdss.grand_sales',
-                    'rdss.marked_trx_count', 'rdss.marked_grand_sales',
-                    'rdss.updated_at',
-                ])
+            : $this->hotWindowReadService
+                ->salesSummaryQuery($outletIds, $date, $date, $timezone)
+                ->selectRaw('rdss.outlet_id')
+                ->selectRaw('COALESCE(SUM(rdss.trx_count), 0) as trx_count')
+                ->selectRaw('COALESCE(SUM(rdss.grand_sales), 0) as grand_sales')
+                ->selectRaw('COALESCE(SUM(rdss.marked_trx_count), 0) as marked_trx_count')
+                ->selectRaw('COALESCE(SUM(rdss.marked_grand_sales), 0) as marked_grand_sales')
+                ->groupBy('rdss.outlet_id')
+                ->get()
                 ->keyBy(fn ($row) => (string) ($row->outlet_id ?? ''));
 
         $voidAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $date, $date, $timezone);
@@ -73,7 +74,7 @@ class OperationalSalesAnalyticService
                 'omzet' => $omzet,
                 'trx_count' => $trxCount,
                 'basket_size' => $basket,
-                'materialized_at' => $fact?->updated_at ? (string) $fact->updated_at : null,
+                'materialized_at' => null,
             ];
         })->values();
 
@@ -134,7 +135,7 @@ class OperationalSalesAnalyticService
                 'reporting_source' => $reportingSource,
                 'net_read' => $this->financeNetReadService->adjustmentMeta($voidAdjustments),
                 'definitions' => [
-                    'omzet' => 'Grand Sales materialized setelah approved VOID adjustment.',
+                    'omzet' => 'Grand Sales dari live hot-window (maksimal 3 hari) atau materialized history setelah approved VOID adjustment.',
                     'basket_size' => 'Omzet dibagi jumlah transaksi. Outlet tanpa transaksi tidak masuk ranking basket size.',
                 ],
             ],

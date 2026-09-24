@@ -6,7 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListSalesSummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\FinanceNetReadService;
-use App\Services\ReportDailySummaryService;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Support\AnalyticsResponseCache;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
@@ -16,20 +16,17 @@ use Illuminate\Support\Facades\DB;
 class SalesSummaryController extends Controller
 {
     public function __construct(
-        private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
         private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
 
-    private function okCached($request, string $namespace, array $params, callable $callback)
+    private function okCached($request, string $namespace, array $params, callable $callback, ?array $reportingSource = null)
     {
-        $payload = AnalyticsResponseCache::remember(
-            $namespace,
-            $params,
-            $callback,
-            300,
-            (string) ($request->user()?->getAuthIdentifier() ?? '')
-        );
+        $userId = (string) ($request->user()?->getAuthIdentifier() ?? '');
+        $payload = $reportingSource !== null
+            ? AnalyticsResponseCache::rememberReporting($namespace, $params, $reportingSource, $callback, $userId)
+            : AnalyticsResponseCache::remember($namespace, $params, $callback, 300, $userId);
 
         return ApiResponse::ok($payload, 'OK');
     }
@@ -42,7 +39,7 @@ class SalesSummaryController extends Controller
         if (! $request->boolean('filters_only')) {
             $readFilter = FinanceOutletFilter::resolve((string) ($validated['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
             $readOutletIds = array_values(array_unique(array_map('strval', $readFilter['outlet_ids'] ?? [])));
-            $reportingSource = $this->dailySummaryService->readContractStatus(
+            $reportingSource = $this->hotWindowReadService->readContractStatus(
                 $readOutletIds,
                 $validated['date_from'] ?? null,
                 $validated['date_to'] ?? null,
@@ -60,7 +57,7 @@ class SalesSummaryController extends Controller
             }
         }
 
-        return $this->okCached($request, 'finance-sales-summary.v8i03.index', $validated, function () use ($request, $validated, $reportingSource) {
+        return $this->okCached($request, 'finance-sales-summary.console-i02.index', $validated, function () use ($request, $validated, $reportingSource) {
             $v = $validated;
             $sort = (string) ($v['sort'] ?? 'outlet_name');
             $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
@@ -144,7 +141,7 @@ class SalesSummaryController extends Controller
             }
 
             $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
-            $rows = $this->buildRows($outletIds, $v, $sort, $dir)->get();
+            $rows = $this->buildRows($outletIds, $v, $sort, $dir, $timezone)->get();
 
             $items = $rows->map(function ($row) {
                 $grossSales = (int) round((float) ($row->gross_sales ?? 0));
@@ -213,13 +210,13 @@ class SalesSummaryController extends Controller
             }
 
             return $payload;
-        });
+        }, $reportingSource);
     }
 
-    private function buildRows(array $outletIds, array $filters, string $sort, string $dir): Builder
+    private function buildRows(array $outletIds, array $filters, string $sort, string $dir, string $timezone): Builder
     {
-        $aggSub = $this->dailySummaryService
-            ->salesSummaryQuery($outletIds, $filters['date_from'] ?? null, $filters['date_to'] ?? null)
+        $aggSub = $this->hotWindowReadService
+            ->salesSummaryQuery($outletIds, $filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone)
             ->groupBy('rdss.outlet_id')
             ->selectRaw('rdss.outlet_id as outlet_id')
             ->selectRaw('COALESCE(SUM(rdss.subtotal_sales), 0) as gross_sales')

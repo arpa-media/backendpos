@@ -8,9 +8,67 @@ use Throwable;
 
 class AnalyticsResponseCache
 {
+    public const HOT_WINDOW_TTL_SECONDS = 30;
+    public const HISTORICAL_REPORT_TTL_SECONDS = 900;
+
     public static function remember(string $namespace, array $params, Closure $callback, int $ttlSeconds = 15, ?string $userId = null)
     {
         $ttlSeconds = self::resolveTtlSeconds($namespace, $ttlSeconds);
+
+        return self::rememberExact($namespace, $params, $callback, $ttlSeconds, $userId);
+    }
+
+    /**
+     * I04: reporting-aware cache boundary.
+     *
+     * Live / hybrid reads intentionally bypass the legacy Finance/Owner 15 minute
+     * minimum cache floor. The cache key also carries the reporting contract/window
+     * so a request cannot accidentally reuse a value produced under a different
+     * read boundary after the business date advances.
+     */
+    public static function rememberReporting(
+        string $namespace,
+        array $params,
+        array $reportingSource,
+        Closure $callback,
+        ?string $userId = null,
+    ) {
+        $mode = strtolower(trim((string) ($reportingSource['read_mode'] ?? 'materialized')));
+        $ttlSeconds = self::reportingTtlSeconds($reportingSource);
+
+        $params['__report_cache_boundary'] = [
+            'contract' => (string) ($reportingSource['contract'] ?? 'unknown'),
+            'consumer_contract' => (string) ($reportingSource['consumer_contract'] ?? ''),
+            'read_mode' => $mode,
+            'hot_window_days' => (int) ($reportingSource['hot_window_days'] ?? 0),
+            'hot_window_from' => $reportingSource['hot_window_from'] ?? null,
+            'hot_window_to' => $reportingSource['hot_window_to'] ?? null,
+            'live_date_from' => $reportingSource['live_date_from'] ?? null,
+            'live_date_to' => $reportingSource['live_date_to'] ?? null,
+            'materialized_date_from' => $reportingSource['materialized_date_from'] ?? null,
+            'materialized_date_to' => $reportingSource['materialized_date_to'] ?? null,
+        ];
+
+        return self::rememberExact($namespace, $params, $callback, $ttlSeconds, $userId);
+    }
+
+    public static function reportingTtlSeconds(array $reportingSource): int
+    {
+        $mode = strtolower(trim((string) ($reportingSource['read_mode'] ?? 'materialized')));
+
+        return in_array($mode, ['live', 'hybrid'], true)
+            ? self::HOT_WINDOW_TTL_SECONDS
+            : self::HISTORICAL_REPORT_TTL_SECONDS;
+    }
+
+    public static function bumpVersion(?string $reason = null): string
+    {
+        return AnalyticsResponseVersion::bump($reason);
+    }
+
+    private static function rememberExact(string $namespace, array $params, Closure $callback, int $ttlSeconds, ?string $userId = null)
+    {
+        $ttlSeconds = max(1, $ttlSeconds);
         $normalized = self::normalize($params);
         $resolvedUserId = trim((string) ($userId ?? optional(auth()->user())->getAuthIdentifier() ?? 'guest'));
         $version = AnalyticsResponseVersion::current();
@@ -27,8 +85,6 @@ class AnalyticsResponseCache
 
         return self::rememberWithLock($cacheKey, $callback, $ttlSeconds);
     }
-
-
 
     private static function rememberWithLock(string $cacheKey, Closure $callback, int $ttlSeconds)
     {
@@ -51,11 +107,6 @@ class AnalyticsResponseCache
         }
     }
 
-    public static function bumpVersion(?string $reason = null): string
-    {
-        return AnalyticsResponseVersion::bump($reason);
-    }
-
     private static function resolveTtlSeconds(string $namespace, int $ttlSeconds): int
     {
         $ttlSeconds = max(1, $ttlSeconds);
@@ -66,7 +117,7 @@ class AnalyticsResponseCache
             || str_starts_with($normalized, 'report-portal.')
             || str_starts_with($normalized, 'owner-overview')
         ) {
-            return max($ttlSeconds, 900);
+            return max($ttlSeconds, self::HISTORICAL_REPORT_TTL_SECONDS);
         }
 
         return $ttlSeconds;

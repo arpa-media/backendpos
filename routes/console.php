@@ -20,9 +20,8 @@ Schedule::command('report-sale-scopes:warm-common --days=30 --per-outlet=1')
     ->hourly()
     ->withoutOverlapping();
 
-Schedule::command('report-daily-summaries:refresh-dirty --limit=80 --outlet-chunk=4 --date-chunk=2')
-    ->everyFiveMinutes()
-    ->withoutOverlapping();
+// ERP POS Console I03: Daily/Hourly/Monthly reporting schedules are registered
+// only once via ReportingScheduleRegistry in bootstrap/app.php.
 
 // HR ITERATION 10: expire announcements and purge private attachment binaries.
 Schedule::command('hr:announcement-expiry-sweep --limit=200')

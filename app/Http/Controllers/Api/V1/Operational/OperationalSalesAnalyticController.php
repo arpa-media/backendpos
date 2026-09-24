@@ -70,11 +70,11 @@ class OperationalSalesAnalyticController extends Controller
             'timezone' => $timezone,
         ];
 
-        $payload = AnalyticsResponseCache::remember(
-            'operational-sales-analytic.daily.v8i07',
+        $payload = AnalyticsResponseCache::rememberReporting(
+            'operational-sales-analytic.daily.console-i02',
             $cacheParams,
+            $reportingSource,
             fn () => $this->service->daily($outletIds, $date, $timezone, $reportingSource),
-            60,
             (string) ($request->user()?->getAuthIdentifier() ?? ''),
         );
         $payload['filters'] = [

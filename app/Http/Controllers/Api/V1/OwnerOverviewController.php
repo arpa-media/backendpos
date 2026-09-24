@@ -28,11 +28,11 @@ class OwnerOverviewController extends Controller
             );
         }
 
-        $payload = AnalyticsResponseCache::remember(
-            'owner-overview.v8i03.index',
+        $payload = AnalyticsResponseCache::rememberReporting(
+            'owner-overview.console-i02.index',
             $params,
+            $reportingSource,
             fn () => $this->service->overview($params, $reportingSource),
-            300,
             (string) ($request->user()?->getAuthIdentifier() ?? '')
         );
 

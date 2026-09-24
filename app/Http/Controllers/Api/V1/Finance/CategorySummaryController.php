@@ -5,7 +5,7 @@ namespace App\Http\Controllers\Api\V1\Finance;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListCategorySummaryRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
-use App\Services\ReportDailySummaryService;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Support\AnalyticsResponseCache;
 use App\Support\FinanceCategorySegment;
 use App\Support\FinanceOutletFilter;
@@ -16,19 +16,17 @@ use Illuminate\Support\Facades\DB;
 class CategorySummaryController extends Controller
 {
     public function __construct(
-        private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
     ) {
     }
 
-    private function okCached($request, string $namespace, array $params, callable $callback)
+    private function okCached($request, string $namespace, array $params, callable $callback, ?array $reportingSource = null)
     {
-        return AnalyticsResponseCache::remember(
-            $namespace,
-            $params,
-            $callback,
-            300,
-            (string) ($request->user()?->getAuthIdentifier() ?? '')
-        );
+        $userId = (string) ($request->user()?->getAuthIdentifier() ?? '');
+
+        return $reportingSource !== null
+            ? AnalyticsResponseCache::rememberReporting($namespace, $params, $reportingSource, $callback, $userId)
+            : AnalyticsResponseCache::remember($namespace, $params, $callback, 300, $userId);
     }
 
     public function index(ListCategorySummaryRequest $request)
@@ -39,7 +37,7 @@ class CategorySummaryController extends Controller
         if (! $request->boolean('filters_only')) {
             $readFilter = FinanceOutletFilter::resolve((string) ($validated['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
             $readOutletIds = array_values(array_unique(array_map('strval', $readFilter['outlet_ids'] ?? [])));
-            $reportingSource = $this->dailySummaryService->readContractStatus(
+            $reportingSource = $this->hotWindowReadService->readContractStatus(
                 $readOutletIds,
                 $validated['date_from'] ?? null,
                 $validated['date_to'] ?? null,
@@ -57,7 +55,7 @@ class CategorySummaryController extends Controller
             }
         }
 
-        return ApiResponse::ok($this->okCached($request, 'finance-category-summary.v8i03.index', $validated, function () use ($request, $validated, $reportingSource) {
+        return ApiResponse::ok($this->okCached($request, 'finance-category-summary.console-i02.index', $validated, function () use ($request, $validated, $reportingSource) {
             $v = $validated;
             $sort = (string) ($v['sort'] ?? 'category_name');
             $dir = strtolower((string) ($v['dir'] ?? 'asc')) === 'desc' ? 'desc' : 'asc';
@@ -113,7 +111,7 @@ class CategorySummaryController extends Controller
                 ];
             }
 
-            $rows = $this->buildRows($outletIds, $v, $sort, $dir, $categorySegment)->get();
+            $rows = $this->buildRows($outletIds, $v, $sort, $dir, $categorySegment, $timezone)->get();
 
             $items = $rows->map(function ($row) {
                 $grossSales = (int) round((float) ($row->gross_sales ?? 0));
@@ -176,13 +174,13 @@ class CategorySummaryController extends Controller
                     'cogs_source' => 'not_available',
                 ],
             ];
-        }), 'OK');
+        }, $reportingSource), 'OK');
     }
 
-    private function buildRows(array $outletIds, array $filters, string $sort, string $dir, string $categorySegment): Builder
+    private function buildRows(array $outletIds, array $filters, string $sort, string $dir, string $categorySegment, string $timezone): Builder
     {
-        $aggSub = $this->dailySummaryService
-            ->categorySummaryQuery($outletIds, $filters['date_from'] ?? null, $filters['date_to'] ?? null, $categorySegment)
+        $aggSub = $this->hotWindowReadService
+            ->categorySummaryQuery($outletIds, $filters['date_from'] ?? null, $filters['date_to'] ?? null, $categorySegment, $timezone)
             ->groupBy('rdcat.category_id', 'rdcat.category_name')
             ->selectRaw('rdcat.category_id as category_id')
             ->selectRaw('rdcat.category_name as category_name')

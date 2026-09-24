@@ -20,6 +20,7 @@ class ReportingMaterializationOrchestrator
         private readonly ReportHourlySummaryService $hourly,
         private readonly ReportMonthlySummaryService $monthly,
         private readonly ReportHybridReadPlanner $hybrid,
+        private readonly ReportingRuntimeStatusService $runtimeStatus,
     ) {}
 
     public function settings(): array
@@ -280,9 +281,12 @@ class ReportingMaterializationOrchestrator
             $activeRun['stage_progress'] = $this->stageProgress((string) $active->id);
         }
 
+        $engineHealth = $this->engineHealth($settings, $active);
+
         return [
             'settings' => $settings,
-            'engine_health' => $this->engineHealth($settings, $active),
+            'engine_health' => $engineHealth,
+            'runtime' => $this->runtimeStatus->snapshot($settings, $engineHealth),
             'active_run' => $activeRun,
             'recovery_queue' => Schema::hasTable('report_materialization_recovery_requests')
                 ? [
@@ -440,9 +444,11 @@ class ReportingMaterializationOrchestrator
         $from=$clock->subDays($settings['rolling_days']-1)->toDateString();
         $outlets=$this->resolveOutletIds(null);
         $active=$this->activeRun();
+        $engineHealth=$this->engineHealth($settings,$active);
         return [
             'settings'=>$settings,
-            'engine_health'=>$this->engineHealth($settings,$active),
+            'engine_health'=>$engineHealth,
+            'runtime'=>$this->runtimeStatus->snapshot($settings,$engineHealth),
             'target'=>['date_from'=>$from,'date_to'=>$to,'days'=>$settings['rolling_days'],'outlet_count'=>count($outlets)],
             'coverage'=>['daily'=>$this->dailyCoverage($outlets,$from,$to),'hourly'=>$this->hourlyCoverage($outlets,$from,$to),'monthly'=>$this->monthlyCoverage($outlets,$from,$to)],
             'active_run'=>$active ? $this->runDetail((string)$active->id) : null,
@@ -846,16 +852,14 @@ class ReportingMaterializationOrchestrator
         $dispatched=Schema::hasTable('report_materialization_run_chunks') ? DB::table('report_materialization_run_chunks')->where('status','dispatched')->count() : 0;
         $stale=Schema::hasTable('report_materialization_run_chunks') && Schema::hasColumn('report_materialization_run_chunks','lease_expires_at') ? DB::table('report_materialization_run_chunks')->whereIn('status',['running','dispatched'])->where('lease_expires_at','<',$now)->count() : 0;
         $queueDepth=Schema::hasTable('jobs') ? DB::table('jobs')->where('queue',config('queue.connections.reporting.queue','reporting'))->count() : null;
+        $failed24h=Schema::hasTable('report_materialization_run_chunks') ? DB::table('report_materialization_run_chunks')->where('status','failed')->where('updated_at','>=',$now->copy()->subDay())->count() : 0;
         $schedulerState=$tickAge===null?'UNKNOWN':($tickAge<=180?'HEALTHY':'STALE');
-        $workerState='IDLE';
-        if($active) {
-            if($stale>0) $workerState='RECOVERY_REQUIRED';
-            elseif($running>0) $workerState='BUSY';
-            elseif($dispatched>0 && ($workerAge===null || $workerAge>300)) $workerState='WAITING_WORKER';
-            elseif($workerAge!==null && $workerAge<=600) $workerState='HEALTHY';
-            else $workerState='WAITING_WORKER';
-        } elseif($workerAge!==null && $workerAge<=600) $workerState='HEALTHY';
-        return ['scheduler_state'=>$schedulerState,'scheduler_tick_age_seconds'=>$tickAge,'worker_state'=>$workerState,'worker_last_activity_age_seconds'=>$workerAge,'running_chunks'=>$running,'dispatched_chunks'=>$dispatched,'stale_leases'=>$stale,'queue_depth'=>$queueDepth,'queue_connection'=>'reporting','queue_name'=>(string)config('queue.connections.reporting.queue','reporting'),'worker_lease_seconds'=>$settings['worker_lease_seconds'],'max_attempts'=>$settings['max_attempts']];
+        $workerState='WAITING_WORKER';
+        if($stale>0) $workerState='RECOVERY_REQUIRED';
+        elseif($running>0) $workerState='BUSY';
+        elseif($workerAge!==null && $workerAge<=180) $workerState='HEALTHY';
+        elseif($dispatched>0) $workerState='WAITING_WORKER';
+        return ['scheduler_state'=>$schedulerState,'scheduler_tick_age_seconds'=>$tickAge,'worker_state'=>$workerState,'worker_last_activity_age_seconds'=>$workerAge,'running_chunks'=>$running,'dispatched_chunks'=>$dispatched,'stale_leases'=>$stale,'failed_chunks_24h'=>$failed24h,'queue_depth'=>$queueDepth,'queue_connection'=>'reporting','queue_name'=>(string)config('queue.connections.reporting.queue','reporting'),'worker_lease_seconds'=>$settings['worker_lease_seconds'],'max_attempts'=>$settings['max_attempts']];
     }
 
 
@@ -973,26 +977,23 @@ class ReportingMaterializationOrchestrator
                 ->whereNotNull('h.outlet_id')->whereNotNull('h.source_daily_synced_at')->whereColumn('h.source_daily_synced_at','>=','d.synced_at')
                 ->select('d.outlet_id')->selectRaw('COUNT(*) ready_rows')->groupBy('d.outlet_id')->get()->keyBy(fn($r)=>(string)$r->outlet_id)
             : collect();
-        $monthlyByOutlet=$closed && Schema::hasTable('report_monthly_summary_coverage')
-            ? DB::table('report_monthly_summary_coverage')->whereIn('outlet_id',$ids)->where('business_month',$m->toDateString())->get()->keyBy(fn($r)=>(string)$r->outlet_id)
-            : collect();
-        $hasGeneration=Schema::hasColumn('report_daily_summary_coverage','generation_ulid') && Schema::hasColumn('report_monthly_summary_coverage','source_daily_generation_ulid');
-
         $outletRows=[];
         foreach($ids as $id) {
-            $d=$dailyByOutlet->get($id); $h=$hourlyByOutlet->get($id); $mo=$monthlyByOutlet->get($id);
+            $d=$dailyByOutlet->get($id); $h=$hourlyByOutlet->get($id);
             $dailyRows=(int)($d->ready_rows??0); $hourlyRows=(int)($h->ready_rows??0);
             $dailyPercent=$days?round(min($days,$dailyRows)/$days*100,2):100.0;
             $hourlyPercent=$days?round(min($days,$hourlyRows)/$days*100,2):100.0;
-            $monthlyReady=false;
-            if($closed && $dailyRows===$days && $mo) {
-                if($hasGeneration && !empty($d->max_generation_ulid)) {
-                    $monthlyReady=!empty($mo->source_daily_generation_ulid) && strcmp((string)$d->max_generation_ulid,(string)$mo->source_daily_generation_ulid)<=0;
-                } else {
-                    $monthlyReady=!empty($mo->source_daily_max_synced_at) && !empty($d->max_synced_at) && CarbonImmutable::parse($d->max_synced_at)->lte(CarbonImmutable::parse($mo->source_daily_max_synced_at));
-                }
-            }
-            $monthlyPercent=$closed?($monthlyReady?100.0:0.0):null;
+
+            // I01: use the exact same monthly readiness contract for the aggregate card
+            // and every outlet row. The previous duplicated generation/timestamp logic
+            // could disagree with ReportMonthlySummaryService (especially mixed legacy
+            // coverage rows created before generation_ulid existed), showing global 100%
+            // while each outlet still displayed 0%.
+            $monthlyStatus=$closed
+                ? $this->monthly->readContractStatus([(string)$id],$from)
+                : null;
+            $monthlyReady=$closed && (bool)($monthlyStatus['ready']??false);
+            $monthlyPercent=$closed?(float)($monthlyStatus['coverage_percent']??0.0):null;
             $ready=$closed ? ($dailyPercent>=100 && $monthlyReady) : $dailyPercent>=100;
             $o=$outletMap->get($id);
             $outletRows[]=[

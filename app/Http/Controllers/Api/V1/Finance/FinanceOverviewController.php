@@ -6,7 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Finance\ListFinanceOverviewRequest;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\FinanceNetReadService;
-use App\Services\ReportDailySummaryService;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Support\AnalyticsResponseCache;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
@@ -28,20 +28,17 @@ class FinanceOverviewController extends Controller
     ];
 
     public function __construct(
-        private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
         private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
 
-    private function okCached($request, string $namespace, array $params, callable $callback)
+    private function okCached($request, string $namespace, array $params, callable $callback, ?array $reportingSource = null)
     {
-        $payload = AnalyticsResponseCache::remember(
-            $namespace,
-            $params,
-            $callback,
-            300,
-            (string) ($request->user()?->getAuthIdentifier() ?? '')
-        );
+        $userId = (string) ($request->user()?->getAuthIdentifier() ?? '');
+        $payload = $reportingSource !== null
+            ? AnalyticsResponseCache::rememberReporting($namespace, $params, $reportingSource, $callback, $userId)
+            : AnalyticsResponseCache::remember($namespace, $params, $callback, 300, $userId);
 
         return ApiResponse::ok($payload, 'OK');
     }
@@ -54,7 +51,7 @@ class FinanceOverviewController extends Controller
         if (! $request->boolean('filters_only')) {
             $readFilter = FinanceOutletFilter::resolve((string) ($validated['outlet_filter'] ?? FinanceOutletFilter::FILTER_ALL));
             $readOutletIds = array_values(array_unique(array_map('strval', $readFilter['outlet_ids'] ?? [])));
-            $reportingSource = $this->dailySummaryService->readContractStatus(
+            $reportingSource = $this->hotWindowReadService->readContractStatus(
                 $readOutletIds,
                 $validated['date_from'] ?? null,
                 $validated['date_to'] ?? null,
@@ -72,7 +69,7 @@ class FinanceOverviewController extends Controller
             }
         }
 
-        return $this->okCached($request, 'finance-overview.v8i03.index', $validated, function () use ($request, $validated, $reportingSource) {
+        return $this->okCached($request, 'finance-overview.console-i02.index', $validated, function () use ($request, $validated, $reportingSource) {
             $v = $validated;
             $isExport = filter_var($v['export'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
@@ -149,16 +146,16 @@ class FinanceOverviewController extends Controller
 
             $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone);
 
-            $summaryRow = $this->dailySummaryService
-                ->salesSummaryQuery($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null)
+            $summaryRow = $this->hotWindowReadService
+                ->salesSummaryQuery($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone)
                 ->selectRaw('COALESCE(SUM(rdss.subtotal_sales), 0) as gross_sales')
                 ->selectRaw('COALESCE(SUM(rdss.marked_subtotal_sales), 0) as marking_gross_sales')
                 ->selectRaw('COALESCE(SUM(rdss.tax_total), 0) as total_tax')
                 ->selectRaw('COALESCE(SUM(rdss.discount_total), 0) as total_discount')
                 ->first();
 
-            $paymentRows = $this->dailySummaryService
-                ->paymentSummaryQuery($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null)
+            $paymentRows = $this->hotWindowReadService
+                ->paymentSummaryQuery($outletIds, $v['date_from'] ?? null, $v['date_to'] ?? null, $timezone)
                 ->selectRaw('rdps.outlet_id')
                 ->selectRaw('rdps.payment_method_name')
                 ->selectRaw('rdps.payment_method_type')
@@ -260,7 +257,7 @@ class FinanceOverviewController extends Controller
             }
 
             return $payload;
-        });
+        }, $reportingSource);
     }
 
     private function paymentColumnDefinitions(iterable $paymentRows = []): array
