@@ -177,10 +177,13 @@ return new class extends Migration
         if (Schema::hasTable('permissions')) {
             foreach (array_unique($allPermissions) as $permission) Permission::findOrCreate($permission, $guard);
             if (Schema::hasTable('roles')) {
-                $admins = Role::query()->where(function ($query): void {
-                    $query->whereRaw('LOWER(name) IN (?, ?)', ['admin', 'administrator'])
-                        ->orWhereRaw('LOWER(name) LIKE ?', ['%super%admin%']);
-                })->get();
+               $admins = Role::query()
+    ->where('guard_name', $guard)
+    ->where(function ($query): void {
+        $query->whereRaw('LOWER(name) IN (?, ?)', ['admin', 'administrator'])
+            ->orWhereRaw('LOWER(name) LIKE ?', ['%super%admin%']);
+    })
+    ->get();
                 foreach ($admins as $admin) $admin->givePermissionTo($allPermissions);
             }
         }
