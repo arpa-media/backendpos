@@ -79,6 +79,10 @@ class UserManagementService
 
     public function buildSessionAccess(User $user): array
     {
+        // I11-HF03: Console is canonical and must be repaired before the
+        // runtime access snapshot is generated. Exact role+level rows override
+        // base rows, so recovery covers both levels for Administrator.
+        app(\App\Services\Console\ConsoleCanonicalAccessRecoveryService::class)->ensureReady();
         $assignment = $this->ensureAccessAssignment($user);
         $roleId = $assignment->access_role_id;
         $levelId = $assignment->access_level_id;

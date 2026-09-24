@@ -33,6 +33,10 @@ class UserManagementController extends Controller
 
     public function overview(Request $request)
     {
+        // I11-HF03: make Console deterministic in Access Matrix. This is a
+        // cheap readiness check and only writes when canonical Console rows
+        // are missing, out of order, or shadowed by an Administrator level override.
+        app(\App\Services\Console\ConsoleCanonicalAccessRecoveryService::class)->ensureReady();
         $this->userManagement->ensureMasters();
 
         $q = trim((string) $request->string('q', ''));

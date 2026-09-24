@@ -4,6 +4,7 @@ namespace App\Services\Finance;
 
 use App\Support\Finance\FinanceScopeResolver;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Throwable;
@@ -462,11 +463,36 @@ final class FinanceGeneralPostingService
             $g=$this->posting($id,true);if($g->status!=='POSTED')throw new InvalidArgumentException('Hanya General Posting POSTED yang dapat di-unpost.');
             $link=DB::table('finance_general_posting_journals')->where('general_posting_id',$id)->where('posting_version',$g->posting_version)->lockForUpdate()->first();if(!$link)throw new InvalidArgumentException('Journal history General Posting tidak ditemukan.');
             if($link->reversal_journal_id){DB::table('finance_general_postings')->where('id',$id)->update(['status'=>'DRAFT','posted_at'=>null,'posted_by_user_id'=>null,'updated_at'=>now()]);return;}
+            $this->assertReconciliationSettlementReversalAllowed((string)$link->journal_entry_id);
             $originalDate=(string)(DB::table('finance_journal_entries')->where('id',$link->journal_entry_id)->value('journal_date')?:$g->journal_date);
             $reversalId=$this->journalService->reverse((string)$link->journal_entry_id,$originalDate,$reason,$userId);$reversalNo=(string)DB::table('finance_journal_entries')->where('id',$reversalId)->value('journal_no');
             DB::table('finance_general_posting_journals')->where('id',$link->id)->update(['reversal_journal_id'=>$reversalId,'reversal_journal_no'=>$reversalNo,'reversed_at'=>now(),'updated_at'=>now()]);
             DB::table('finance_general_postings')->where('id',$id)->update(['status'=>'DRAFT','posted_at'=>null,'posted_by_user_id'=>null,'reopened_at'=>now(),'reopened_by_user_id'=>$userId,'reopen_reason'=>$reason,'updated_by_user_id'=>$userId,'updated_at'=>now()]);
         },3);
+    }
+
+    private function assertReconciliationSettlementReversalAllowed(string $journalId): void
+    {
+        if (! Schema::hasTable('finance_journal_entries')
+            || ! Schema::hasTable('finance_settlement_sources')
+            || ! Schema::hasTable('finance_settlements')) {
+            return;
+        }
+
+        $sourceType = strtoupper((string) DB::table('finance_journal_entries')->where('id', $journalId)->value('source_type'));
+        if ($sourceType !== 'RECONCILIATION') {
+            return;
+        }
+
+        $blocked = DB::table('finance_settlement_sources as s')
+            ->join('finance_settlements as t', 't.settlement_source_id', '=', 's.id')
+            ->where('s.source_journal_entry_id', $journalId)
+            ->whereIn('t.status', ['DRAFT', 'POSTED'])
+            ->exists();
+
+        if ($blocked) {
+            throw new InvalidArgumentException('Reconciliation sudah memiliki Settlement DRAFT/POSTED. Hapus/reversal Settlement terlebih dahulu.');
+        }
     }
 
     public function destroyDraft(string $id): void

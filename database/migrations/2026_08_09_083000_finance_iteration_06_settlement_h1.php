@@ -194,14 +194,25 @@ return new class extends Migration {
 
     private function createReconciliationReversalGuard(): void
     {
-        if(DB::getDriverName()!=='mysql'||!Schema::hasTable('finance_journal_entries'))return;
-        DB::unprepared('DROP TRIGGER IF EXISTS finance_iter06_guard_recon_reversal');
-        DB::unprepared("CREATE TRIGGER finance_iter06_guard_recon_reversal BEFORE UPDATE ON finance_journal_entries FOR EACH ROW BEGIN IF OLD.source_type = 'RECONCILIATION' AND OLD.status = 'POSTED' AND NEW.status = 'REVERSED' AND EXISTS (SELECT 1 FROM finance_settlement_sources s JOIN finance_settlements t ON t.settlement_source_id = s.id WHERE s.source_journal_entry_id = OLD.id AND t.status IN ('DRAFT','POSTED')) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Reconciliation sudah memiliki Settlement DRAFT/POSTED. Hapus/reversal Settlement terlebih dahulu.'; END IF; END");
+        if(!in_array(DB::getDriverName(), ['mysql','mariadb'], true)||!Schema::hasTable('finance_journal_entries'))return;
+
+        try {
+            DB::unprepared('DROP TRIGGER IF EXISTS finance_iter06_guard_recon_reversal');
+            DB::unprepared("CREATE TRIGGER finance_iter06_guard_recon_reversal BEFORE UPDATE ON finance_journal_entries FOR EACH ROW BEGIN IF OLD.source_type = 'RECONCILIATION' AND OLD.status = 'POSTED' AND NEW.status = 'REVERSED' AND EXISTS (SELECT 1 FROM finance_settlement_sources s JOIN finance_settlements t ON t.settlement_source_id = s.id WHERE s.source_journal_entry_id = OLD.id AND t.status IN ('DRAFT','POSTED')) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Reconciliation sudah memiliki Settlement DRAFT/POSTED. Hapus/reversal Settlement terlebih dahulu.'; END IF; END");
+        } catch (\Throwable $e) {
+            // Shared hosting / managed MySQL sering mengaktifkan binary logging tetapi
+            // tidak memberi SUPER/SYSTEM_VARIABLES_ADMIN untuk CREATE TRIGGER.
+            // FinanceGeneralPostingService membawa guard aplikasi yang ekuivalen,
+            // sehingga trigger ini hanya defense-in-depth dan bukan syarat migration.
+            report($e);
+        }
     }
 
     public function down(): void
     {
-        if(DB::getDriverName()==='mysql')DB::unprepared('DROP TRIGGER IF EXISTS finance_iter06_guard_recon_reversal');
+        if(in_array(DB::getDriverName(), ['mysql','mariadb'], true)) {
+            try { DB::unprepared('DROP TRIGGER IF EXISTS finance_iter06_guard_recon_reversal'); } catch (\Throwable $e) { report($e); }
+        }
         if(Schema::hasTable('access_menus'))DB::table('access_menus')->where('code',$this->menu['code'])->update(['is_active'=>false,'updated_at'=>now()]);
         Schema::dropIfExists('finance_settlements');
         Schema::dropIfExists('finance_settlement_sources');
