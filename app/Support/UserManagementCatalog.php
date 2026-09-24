@@ -20,6 +20,7 @@ final class UserManagementCatalog
             ['code' => 'omzet-report', 'name' => 'Omzet Report', 'description' => 'Portal report omzet seluruh transaksi POS.', 'sort_order' => 110],
             ['code' => 'sales-report', 'name' => 'Sales Report', 'description' => 'Portal report transaksi dengan marking 1.', 'sort_order' => 120],
             ['code' => 'report', 'name' => 'Report', 'description' => 'Portal report operasional.', 'sort_order' => 130],
+            ['code' => 'console', 'name' => 'Console', 'description' => 'System console untuk observability, reporting control, dan storage file management.', 'sort_order' => 9999],
         ];
     }
 
@@ -77,7 +78,7 @@ final class UserManagementCatalog
             ['portal_code' => 'finance', 'code' => 'sales-list', 'name' => 'Sales', 'path' => '/sales', 'sort_order' => 20, 'permission_view' => 'sale.view'],
             ['portal_code' => 'finance', 'code' => 'sales-report', 'name' => 'Report', 'path' => '/reports', 'sort_order' => 30, 'permission_view' => 'report.view'],
             ['portal_code' => 'finance', 'code' => 'finance-cashier-report', 'name' => 'Cashier Report', 'path' => '/finance/cashier-report', 'sort_order' => 35, 'permission_view' => 'report.view'],
-            ['portal_code' => 'finance', 'code' => 'finance-i08-expense-report', 'name' => 'Expense Report', 'path' => '/finance/expense-report', 'sort_order' => 260, 'permission_view' => 'finance.expense_report.view', 'permission_update' => 'finance.expense_report.post'],
+            ['portal_code' => 'finance', 'code' => 'finance-i08-expense-report', 'name' => 'Finance Expense Report', 'path' => '/finance/expense-report', 'sort_order' => 260, 'permission_view' => 'finance.expense_report.view', 'permission_update' => 'finance.expense_report.post'],
             ['portal_code' => 'finance', 'code' => 'sales-cancel', 'name' => 'Cancel Bill', 'path' => '/cancel-requests', 'sort_order' => 40, 'permission_view' => 'sale.cancel.approve', 'permission_create' => 'sale.cancel.request', 'permission_update' => 'sale.cancel.approve', 'permission_delete' => 'sale.cancel.approve'],
             ['portal_code' => 'bank', 'code' => 'bank-dashboard', 'name' => 'Dashboard', 'path' => '/portal/bank/dashboard', 'sort_order' => 10],
             ['portal_code' => 'purchasing', 'code' => 'purchasing-dashboard', 'name' => 'Dashboard', 'path' => '/portal/purchasing/dashboard', 'sort_order' => 10],
@@ -97,6 +98,10 @@ final class UserManagementCatalog
             ['portal_code' => 'report', 'code' => 'report-kpi-squad', 'name' => 'KPI Squad', 'path' => '/report/kpi-squad', 'sort_order' => 30, 'permission_view' => 'hr.kpi.squad.view', 'permission_create' => 'hr.kpi.squad.input', 'permission_update' => 'hr.kpi.squad.update', 'permission_delete' => 'hr.kpi.squad.reopen'],
             ['portal_code' => 'report', 'code' => 'report-expense-request', 'name' => 'Petty Cash', 'path' => '/report/expense-request', 'sort_order' => 40, 'permission_view' => 'report.expense_request.view', 'permission_create' => 'report.expense_request.create', 'permission_update' => 'report.expense_request.update', 'permission_delete' => 'report.expense_request.delete'],
             ['portal_code' => 'report', 'code' => 'report-fund-requests', 'name' => 'Pengajuan Dana', 'path' => '/report/fund-requests', 'sort_order' => 50, 'permission_view' => 'purchasing.fund_request.view', 'permission_create' => 'purchasing.fund_request.create', 'permission_update' => 'purchasing.fund_request.update', 'permission_delete' => 'purchasing.fund_request.delete'],
+
+            ['portal_code' => 'console', 'code' => 'console-control-center', 'name' => 'Control Center', 'path' => '/console/control-center', 'sort_order' => 10, 'permission_view' => 'console.control_center.view', 'permission_create' => 'console.control_center.run', 'permission_update' => 'console.control_center.configure', 'permission_delete' => 'console.control_center.force_rebuild'],
+            ['portal_code' => 'console', 'code' => 'console-system-health', 'name' => 'System Health', 'path' => '/console/system-health', 'sort_order' => 20, 'permission_view' => 'console.system_health.view'],
+            ['portal_code' => 'console', 'code' => 'console-file-management', 'name' => 'File Management', 'path' => '/console/file-management', 'sort_order' => 30, 'permission_view' => 'console.file_management.view', 'permission_create' => 'console.file_management.create_folder', 'permission_update' => 'console.file_management.move', 'permission_delete' => 'console.file_management.delete'],
         ];
     }
 

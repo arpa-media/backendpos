@@ -1344,10 +1344,29 @@ class UserManagementService
             : SpatieRole::query()->where('guard_name', $guard)->whereIn('name', $mappedSpatieRoles->all())->count();
         $spatieRolesReady = $mappedSpatieRoles->isEmpty() || $availableSpatieRoleCount === $mappedSpatieRoles->count();
 
+        $requiredPortalCodes = collect(UserManagementCatalog::portals())
+            ->pluck('code')
+            ->push('pos')
+            ->map(fn ($code) => strtolower(trim((string) $code)))
+            ->filter()
+            ->unique()
+            ->values();
+        $canonicalPortalsReady = $requiredPortalCodes->isEmpty()
+            || AccessPortal::query()->whereIn('code', $requiredPortalCodes->all())->count() === $requiredPortalCodes->count();
+
+        $requiredMenuCodes = collect(UserManagementCatalog::menus())
+            ->pluck('code')
+            ->map(fn ($code) => strtolower(trim((string) $code)))
+            ->filter()
+            ->unique()
+            ->values();
+        $canonicalMenusReady = $requiredMenuCodes->isEmpty()
+            || AccessMenu::query()->whereIn('code', $requiredMenuCodes->all())->count() === $requiredMenuCodes->count();
+
         $ready = AccessRole::query()->where('code', 'ADMIN')->exists()
             && AccessLevel::query()->exists()
-            && AccessPortal::query()->exists()
-            && AccessMenu::query()->exists()
+            && $canonicalPortalsReady
+            && $canonicalMenusReady
             && $spatieRolesReady;
 
         if (! $ready) {
@@ -1426,6 +1445,65 @@ class UserManagementService
         }
 
         $this->syncCanonicalAccessMenus();
+        $this->ensureCanonicalConsoleAdminDefaults();
+    }
+
+    /**
+     * Console is operationally critical and must remain discoverable in the Access
+     * Matrix after a partial/fresh deployment. Only insert missing ADMIN defaults;
+     * never overwrite an explicitly disabled row.
+     */
+    private function ensureCanonicalConsoleAdminDefaults(): void
+    {
+        $portal = AccessPortal::query()->firstWhere('code', 'console');
+        $adminRole = AccessRole::query()->firstWhere('code', 'ADMIN');
+        if (! $portal || ! $adminRole) {
+            return;
+        }
+
+        $now = now();
+        if (! AccessRolePortalPermission::query()
+            ->where('access_role_id', $adminRole->id)
+            ->whereNull('access_level_id')
+            ->where('portal_id', $portal->id)
+            ->exists()) {
+            AccessRolePortalPermission::query()->create([
+                'id' => (string) Str::ulid(),
+                'access_role_id' => $adminRole->id,
+                'access_level_id' => null,
+                'portal_id' => $portal->id,
+                'can_view' => true,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]);
+        }
+
+        AccessMenu::query()
+            ->where('portal_id', $portal->id)
+            ->whereIn('code', ['console-control-center', 'console-system-health', 'console-file-management'])
+            ->get()
+            ->each(function (AccessMenu $menu) use ($adminRole, $now): void {
+                if (AccessRoleMenuPermission::query()
+                    ->where('access_role_id', $adminRole->id)
+                    ->whereNull('access_level_id')
+                    ->where('menu_id', $menu->id)
+                    ->exists()) {
+                    return;
+                }
+
+                AccessRoleMenuPermission::query()->create([
+                    'id' => (string) Str::ulid(),
+                    'access_role_id' => $adminRole->id,
+                    'access_level_id' => null,
+                    'menu_id' => $menu->id,
+                    'can_view' => true,
+                    'can_create' => (bool) $menu->permission_create,
+                    'can_edit' => (bool) $menu->permission_update,
+                    'can_delete' => (bool) $menu->permission_delete,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            });
     }
 
     private function syncCanonicalAccessMenus(): void
