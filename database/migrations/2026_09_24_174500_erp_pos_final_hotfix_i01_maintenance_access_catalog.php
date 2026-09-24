@@ -5,7 +5,6 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
-use Spatie\Permission\Models\Permission;
 use Spatie\Permission\Models\Role;
 use Spatie\Permission\PermissionRegistrar;
 
@@ -150,8 +149,25 @@ return new class extends Migration
 
     private function registerMaintenanceAccess(): void
     {
-        foreach (self::MAINTENANCE_PERMISSIONS as $permission) {
-            Permission::findOrCreate($permission, 'web');
+        $permissionTable = (string) config('permission.table_names.permissions', 'permissions');
+
+        if (Schema::hasTable($permissionTable)) {
+            $now = now();
+
+            foreach (self::MAINTENANCE_PERMISSIONS as $permission) {
+                // Hosting-safe / rerun-safe permission seed.
+                // Do not use Permission::findOrCreate() here because a previously
+                // seeded row (or a partial deployment) must never turn this
+                // migration into a duplicate-key failure.
+                DB::table($permissionTable)->insertOrIgnore([
+                    'name' => $permission,
+                    'guard_name' => 'web',
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            }
+
+            app(PermissionRegistrar::class)->forgetCachedPermissions();
         }
 
         if (! Schema::hasTable('access_portals') || ! Schema::hasTable('access_menus')) {
