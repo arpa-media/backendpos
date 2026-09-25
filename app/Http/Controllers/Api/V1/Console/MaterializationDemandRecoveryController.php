@@ -84,22 +84,25 @@ class MaterializationDemandRecoveryController extends Controller
 
         $pipeline = $validated['error_code'] === 'REPORT_HOURLY_SUMMARY_NOT_READY' ? 'hourly' : 'daily';
 
-        // I04: a stale browser/client must never re-introduce the old recovery loop
-        // for the 3-day live window. Daily demand recovery is restricted to the
-        // historical segment only; a live-only request becomes a no-op.
+        // I05: the latest five business dates use materialized-first reads with
+        // automatic Live fallback. A stale browser must therefore never trigger
+        // Material Recovery for that recent window. For longer ranges, recovery
+        // is clipped to the historical segment older than the five-day window.
         if ($pipeline === 'daily') {
             $timezone = TransactionDate::normalizeTimezone(
                 (string) ($source['timezone'] ?? ''),
                 TransactionDate::appTimezone(),
             );
             $plan = $this->hotWindowReadService->readPlan($dateFrom, $dateTo, $timezone);
+            $hasPreferredWindow = ! empty($plan['preferred_from']) && ! empty($plan['preferred_to']);
+            $hasHistoricalWindow = ! empty($plan['historical_from']) && ! empty($plan['historical_to']);
 
-            if (($plan['mode'] ?? null) === 'live') {
+            if ($hasPreferredWindow && ! $hasHistoricalWindow) {
                 return response()->json([
                     'data' => [
                         'accepted' => false,
                         'already_ready' => true,
-                        'live_window' => true,
+                        'live_fallback_available' => true,
                         'source_path' => $sourcePath,
                         'pipeline' => $pipeline,
                         'date_from' => $dateFrom,
@@ -107,13 +110,13 @@ class MaterializationDemandRecoveryController extends Controller
                         'outlet_count' => count($outletIds),
                         'read_plan' => $plan,
                     ],
-                    'message' => 'Rentang ini berada di Live Hot-Window 3 hari dan dibaca langsung dari transaksi POS. Material Recovery tidak diperlukan.',
+                    'message' => 'Rentang 1–5 hari terbaru memakai Materialized-First dengan Live fallback otomatis. Material Recovery tidak diperlukan.',
                 ], 200);
             }
 
-            if (($plan['mode'] ?? null) === 'hybrid') {
-                $dateFrom = (string) ($plan['historical_from'] ?? $dateFrom);
-                $dateTo = (string) ($plan['historical_to'] ?? $dateTo);
+            if ($hasPreferredWindow && $hasHistoricalWindow) {
+                $dateFrom = (string) $plan['historical_from'];
+                $dateTo = (string) $plan['historical_to'];
             }
         }
 
@@ -127,7 +130,7 @@ class MaterializationDemandRecoveryController extends Controller
         try {
             // IMPORTANT: use the canonical V2 recovery path, not startRun().
             // requestCoverageRecovery() persists/deduplicates the request, skips
-            // already-ready coverage and creates P100 1-outlet × max-3-day chunks.
+            // already-ready coverage and creates prioritized bounded recovery chunks.
             $result = $this->orchestrator->requestCoverageRecovery(
                 $payload,
                 (string) ($request->user()?->getAuthIdentifier() ?? '')

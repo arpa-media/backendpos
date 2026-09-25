@@ -22,7 +22,7 @@ class ErpPosConsoleI04VerificationCommand extends Command
         {--month= : Closed month YYYY-MM used for Monthly aggregate/per-outlet parity}
         {--outlet=* : Optional outlet ULID(s) used for Monthly parity}';
 
-    protected $description = 'I04 deployment gate for Console routing, 3-day live read boundary, cache freshness, monthly parity, scheduler uniqueness, and reporting queue.';
+    protected $description = 'I04/I05 deployment gate for Console routing, 5-day materialized-first/live-fallback boundary, cache freshness, monthly parity, scheduler uniqueness, and reporting queue.';
 
     private int $failures = 0;
     private int $warnings = 0;
@@ -120,52 +120,52 @@ class ErpPosConsoleI04VerificationCommand extends Command
     {
         $todayString = $today->toDateString();
         $h1 = $today->subDay()->toDateString();
-        $h2 = $today->subDays(2)->toDateString();
-        $h3 = $today->subDays(3)->toDateString();
+        $h4 = $today->subDays(4)->toDateString();
+        $h5 = $today->subDays(5)->toDateString();
         $monthFrom = $today->subDays(29)->toDateString();
 
-        $this->check('HOT_WINDOW_DAYS = 3', ReportHotWindowReadService::HOT_WINDOW_DAYS === 3, 'configured='.ReportHotWindowReadService::HOT_WINDOW_DAYS);
+        $this->check('MATERIALIZED_FIRST_DAYS = 5', ReportHotWindowReadService::MATERIALIZED_FIRST_DAYS === 5, 'configured='.ReportHotWindowReadService::MATERIALIZED_FIRST_DAYS);
 
         $plans = [
-            'Today selects LIVE' => [$hotWindow->readPlan($todayString, $todayString, $timezone), 'live'],
-            'H-1 selects LIVE' => [$hotWindow->readPlan($h1, $h1, $timezone), 'live'],
-            'H-2 selects LIVE' => [$hotWindow->readPlan($h2, $h2, $timezone), 'live'],
-            'H-3 selects MATERIALIZED' => [$hotWindow->readPlan($h3, $h3, $timezone), 'materialized'],
-            '30-day range ending today selects HYBRID' => [$hotWindow->readPlan($monthFrom, $todayString, $timezone), 'hybrid'],
+            'Today selects MATERIALIZED-FIRST' => [$hotWindow->readPlan($todayString, $todayString, $timezone), 'materialized_first'],
+            'H-1 selects MATERIALIZED-FIRST' => [$hotWindow->readPlan($h1, $h1, $timezone), 'materialized_first'],
+            'H-4 selects MATERIALIZED-FIRST' => [$hotWindow->readPlan($h4, $h4, $timezone), 'materialized_first'],
+            'H-5 selects MATERIALIZED history' => [$hotWindow->readPlan($h5, $h5, $timezone), 'materialized'],
+            '30-day range ending today selects MATERIALIZED-FIRST HYBRID' => [$hotWindow->readPlan($monthFrom, $todayString, $timezone), 'materialized_first_hybrid'],
         ];
         foreach ($plans as $label => [$plan, $expectedMode]) {
             $ok = ($plan['mode'] ?? null) === $expectedMode;
-            if ($expectedMode === 'hybrid') {
-                $ok = $ok && (int) ($plan['live_days'] ?? 0) === 3;
+            if ($expectedMode === 'materialized_first_hybrid') {
+                $ok = $ok && (int) ($plan['preferred_days'] ?? 0) === 5;
             }
-            $this->check($label, $ok, 'mode='.($plan['mode'] ?? '?').'; live_days='.(int) ($plan['live_days'] ?? 0));
+            $this->check($label, $ok, 'mode='.($plan['mode'] ?? '?').'; preferred_days='.(int) ($plan['preferred_days'] ?? 0));
         }
 
         try {
-            // Live-only status never queries historical coverage, so this directly proves
-            // that current business date cannot become HTTP 409 solely due to stale materialization.
-            $status = $hotWindow->readContractStatus(['__I04_LIVE_PROBE__'], $todayString, $todayString, $timezone);
+            // A probe outlet intentionally has no materialization coverage. I05 must
+            // still return READY for a recent business date by selecting Live fallback.
+            $status = $hotWindow->readContractStatus(['__I05_LIVE_FALLBACK_PROBE__'], $todayString, $todayString, $timezone);
             $this->check(
-                'Current business date no-409 invariant',
+                'Current business date materialized-first no-409 invariant',
                 ($status['ready'] ?? false) === true
-                    && ($status['read_mode'] ?? null) === 'live'
+                    && ($status['read_mode'] ?? null) === 'live_fallback'
                     && ($status['recovery_pipeline'] ?? null) === null
                     && ($status['http_backfill'] ?? true) === false,
-                'ready='.json_encode($status['ready'] ?? null).'; state='.($status['state'] ?? '?').'; recovery='.($status['recovery_pipeline'] ?? 'none')
+                'ready='.json_encode($status['ready'] ?? null).'; mode='.($status['read_mode'] ?? '?').'; fallback='.($status['fallback_reason'] ?? 'none')
             );
         } catch (Throwable $e) {
-            $this->check('Current business date no-409 invariant', false, $this->shortError($e));
+            $this->check('Current business date materialized-first no-409 invariant', false, $this->shortError($e));
         }
     }
 
     private function verifyCacheBoundary(): void
     {
-        $liveTtl = AnalyticsResponseCache::reportingTtlSeconds(['read_mode' => 'live']);
-        $hybridTtl = AnalyticsResponseCache::reportingTtlSeconds(['read_mode' => 'hybrid']);
+        $liveTtl = AnalyticsResponseCache::reportingTtlSeconds(['read_mode' => 'live_fallback']);
+        $hybridTtl = AnalyticsResponseCache::reportingTtlSeconds(['read_mode' => 'hybrid_fallback']);
         $historicalTtl = AnalyticsResponseCache::reportingTtlSeconds(['read_mode' => 'materialized']);
 
-        $this->check('LIVE cache TTL = 30s', $liveTtl === 30, "ttl={$liveTtl}");
-        $this->check('HYBRID cache TTL = 30s', $hybridTtl === 30, "ttl={$hybridTtl}");
+        $this->check('LIVE fallback cache TTL = 30s', $liveTtl === 30, "ttl={$liveTtl}");
+        $this->check('HYBRID fallback cache TTL = 30s', $hybridTtl === 30, "ttl={$hybridTtl}");
         $this->check('Historical materialized cache TTL >= 15m', $historicalTtl >= 900, "ttl={$historicalTtl}");
 
         $cacheSource = (string) @file_get_contents(app_path('Support/AnalyticsResponseCache.php'));

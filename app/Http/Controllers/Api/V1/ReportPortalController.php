@@ -14,7 +14,7 @@ use Illuminate\Http\Request;
 class ReportPortalController extends Controller
 {
 
-    private function okCached(Request $request, string $namespace, array $scope, callable $callback)
+    private function okCached(Request $request, string $namespace, array $scope, callable $callback, ?array $reportingSource = null)
     {
         $validated = method_exists($request, 'validated') ? $request->validated() : $request->all();
         $cacheParams = array_merge($validated, [
@@ -28,7 +28,10 @@ class ReportPortalController extends Controller
         @ini_set('max_execution_time', '180');
         @set_time_limit(180);
         $ttlSeconds = str_contains($namespace, 'dashboard') ? 300 : 180;
-        $payload = AnalyticsResponseCache::remember($namespace, $cacheParams, $callback, $ttlSeconds, (string) $request->user()?->getAuthIdentifier());
+        $userId = (string) $request->user()?->getAuthIdentifier();
+        $payload = $reportingSource !== null
+            ? AnalyticsResponseCache::rememberReporting($namespace, $cacheParams, $reportingSource, $callback, $userId)
+            : AnalyticsResponseCache::remember($namespace, $cacheParams, $callback, $ttlSeconds, $userId);
 
         return ApiResponse::ok($payload, 'OK');
     }
@@ -46,7 +49,25 @@ class ReportPortalController extends Controller
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        return $this->okCached($request, 'report-portal.dashboard', $scope, fn () => $this->analyticsService->dashboard($scope, $request->validated()));
+        $validated = $request->validated();
+        $reportingSource = $this->analyticsService->reportingStatus($scope, $validated);
+        if (! ($reportingSource['ready'] ?? false)) {
+            return ApiResponse::error(
+                'Data report historis belum selesai dimaterialisasi. Untuk 5 hari terbaru sistem otomatis fallback Live; recovery hanya diperlukan untuk bagian historis yang lebih lama.',
+                'REPORT_DAILY_SUMMARY_NOT_READY',
+                409,
+                [],
+                ['reporting_source' => $reportingSource],
+            );
+        }
+
+        return $this->okCached(
+            $request,
+            'report-portal.dashboard.i05',
+            $scope,
+            fn () => $this->analyticsService->dashboard($scope, $validated, $reportingSource),
+            $reportingSource,
+        );
     }
 
 
@@ -57,7 +78,19 @@ class ReportPortalController extends Controller
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        $csv = $this->analyticsService->summaryCsv($scope, $request->validated());
+        $validated = $request->validated();
+        $reportingSource = $this->analyticsService->reportingStatus($scope, $validated);
+        if (! ($reportingSource['ready'] ?? false)) {
+            return ApiResponse::error(
+                'Data report historis belum selesai dimaterialisasi. Untuk 5 hari terbaru sistem otomatis fallback Live.',
+                'REPORT_DAILY_SUMMARY_NOT_READY',
+                409,
+                [],
+                ['reporting_source' => $reportingSource],
+            );
+        }
+
+        $csv = $this->analyticsService->summaryCsv($scope, $validated);
 
         return response($csv['content'] ?? '', 200, [
             'Content-Type' => 'text/csv; charset=UTF-8',
@@ -73,7 +106,7 @@ class ReportPortalController extends Controller
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        return $this->okCached($request, 'report-portal.ledger', $scope, fn () => $this->analyticsService->ledger($scope, $request->validated()));
+        return $this->detailCached($request, 'report-portal.ledger.i05', $scope, fn () => $this->analyticsService->ledger($scope, $request->validated()));
     }
 
     public function recentSales(ReportPortalQueryRequest $request, string $portalCode)
@@ -83,7 +116,7 @@ class ReportPortalController extends Controller
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        return $this->okCached($request, 'report-portal.recent-sales', $scope, fn () => $this->analyticsService->recentSales($scope, $request->validated()));
+        return $this->detailCached($request, 'report-portal.recent-sales.i05', $scope, fn () => $this->analyticsService->recentSales($scope, $request->validated()));
     }
 
     public function itemSold(ReportPortalQueryRequest $request, string $portalCode)
@@ -93,7 +126,7 @@ class ReportPortalController extends Controller
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        return $this->okCached($request, 'report-portal.item-sold', $scope, fn () => $this->analyticsService->itemSold($scope, $request->validated()));
+        return $this->aggregateCached($request, 'report-portal.item-sold.i05', $scope, fn ($source) => $this->analyticsService->itemSold($scope, $request->validated(), $source));
     }
 
     public function itemByProduct(ReportPortalQueryRequest $request, string $portalCode)
@@ -103,7 +136,7 @@ class ReportPortalController extends Controller
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        return $this->okCached($request, 'report-portal.item-by-product', $scope, fn () => $this->analyticsService->itemByProduct($scope, $request->validated()));
+        return $this->aggregateCached($request, 'report-portal.item-by-product.i05', $scope, fn ($source) => $this->analyticsService->itemByProduct($scope, $request->validated(), $source));
     }
 
     public function itemByVariant(ReportPortalQueryRequest $request, string $portalCode)
@@ -113,7 +146,7 @@ class ReportPortalController extends Controller
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        return $this->okCached($request, 'report-portal.item-by-variant', $scope, fn () => $this->analyticsService->itemByVariant($scope, $request->validated()));
+        return $this->aggregateCached($request, 'report-portal.item-by-variant.i05', $scope, fn ($source) => $this->analyticsService->itemByVariant($scope, $request->validated(), $source));
     }
 
     public function tax(ReportPortalQueryRequest $request, string $portalCode)
@@ -123,7 +156,7 @@ class ReportPortalController extends Controller
             return ApiResponse::error($scope['message'], $scope['error_code'], $scope['status'], [], $scope['data'] ?? null);
         }
 
-        return $this->okCached($request, 'report-portal.tax', $scope, fn () => $this->analyticsService->tax($scope, $request->validated()));
+        return $this->detailCached($request, 'report-portal.tax.i05', $scope, fn () => $this->analyticsService->tax($scope, $request->validated()));
     }
 
     public function saleDetail(ReportPortalQueryRequest $request, string $portalCode, string $saleId)
@@ -141,6 +174,31 @@ class ReportPortalController extends Controller
         unset($payload['ok']);
 
         return ApiResponse::ok($payload, 'OK');
+    }
+
+    private function detailCached(Request $request, string $namespace, array $scope, callable $callback)
+    {
+        $validated = method_exists($request, 'validated') ? $request->validated() : $request->all();
+        $cacheSource = $this->analyticsService->detailCacheSource($scope, $validated);
+
+        return $this->okCached($request, $namespace, $scope, $callback, $cacheSource);
+    }
+
+    private function aggregateCached(Request $request, string $namespace, array $scope, callable $callback)
+    {
+        $validated = method_exists($request, 'validated') ? $request->validated() : $request->all();
+        $reportingSource = $this->analyticsService->reportingStatus($scope, $validated);
+        if (! ($reportingSource['ready'] ?? false)) {
+            return ApiResponse::error(
+                'Data report historis belum selesai dimaterialisasi. Untuk 5 hari terbaru sistem otomatis fallback Live; bagian historis tetap menunggu scheduler.',
+                'REPORT_DAILY_SUMMARY_NOT_READY',
+                409,
+                [],
+                ['reporting_source' => $reportingSource],
+            );
+        }
+
+        return $this->okCached($request, $namespace, $scope, fn () => $callback($reportingSource), $reportingSource);
     }
 
     private function resolveScope(Request $request, string $portalCode): array

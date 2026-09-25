@@ -135,7 +135,7 @@ class OperationalSalesAnalyticService
                 'reporting_source' => $reportingSource,
                 'net_read' => $this->financeNetReadService->adjustmentMeta($voidAdjustments),
                 'definitions' => [
-                    'omzet' => 'Grand Sales dari live hot-window (maksimal 3 hari) atau materialized history setelah approved VOID adjustment.',
+                    'omzet' => 'Grand Sales: 5 hari terbaru mencoba materialized summary terlebih dahulu; bila coverage belum siap/masih refresh pending, sistem fallback ke transaksi Live. Historical tetap materialized. Setelah itu approved VOID adjustment diterapkan.',
                     'basket_size' => 'Omzet dibagi jumlah transaksi. Outlet tanpa transaksi tidak masuk ranking basket size.',
                 ],
             ],

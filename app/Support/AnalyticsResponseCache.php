@@ -41,6 +41,9 @@ class AnalyticsResponseCache
             'consumer_contract' => (string) ($reportingSource['consumer_contract'] ?? ''),
             'read_mode' => $mode,
             'hot_window_days' => (int) ($reportingSource['hot_window_days'] ?? 0),
+            'materialized_first_days' => (int) ($reportingSource['materialized_first_days'] ?? 0),
+            'preferred_materialized_ready' => (bool) ($reportingSource['preferred_materialized_ready'] ?? false),
+            'fallback_reason' => (string) ($reportingSource['fallback_reason'] ?? ''),
             'hot_window_from' => $reportingSource['hot_window_from'] ?? null,
             'hot_window_to' => $reportingSource['hot_window_to'] ?? null,
             'live_date_from' => $reportingSource['live_date_from'] ?? null,
@@ -56,7 +59,7 @@ class AnalyticsResponseCache
     {
         $mode = strtolower(trim((string) ($reportingSource['read_mode'] ?? 'materialized')));
 
-        return in_array($mode, ['live', 'hybrid'], true)
+        return in_array($mode, ['live', 'hybrid', 'live_fallback', 'hybrid_fallback', 'live_detail'], true)
             ? self::HOT_WINDOW_TTL_SECONDS
             : self::HISTORICAL_REPORT_TTL_SECONDS;
     }

@@ -7,6 +7,7 @@ use App\Services\CashierAlignedSaleScopeService;
 use App\Support\DeliveryNoTaxReadModel;
 use App\Support\ReportPortalMarkedScopeVersion;
 use App\Support\TransactionDate;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Models\Sale;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
@@ -23,6 +24,7 @@ class ReportPortalAnalyticsService
         private readonly CashierAlignedSaleScopeService $cashierAlignedSaleScope,
         private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
         private readonly FinanceNetReadService $financeNetReadService,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
     ) {
     }
 
@@ -144,188 +146,204 @@ class ReportPortalAnalyticsService
         });
     }
 
-    public function dashboard(array $scope, array $params): array
+    public function reportingStatus(array $scope, array $params): array
+    {
+        $this->setScopeTimezone($scope);
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+
+        return $this->hotWindowReadService->readContractStatus(
+            $this->effectiveScopeOutletIds($scope),
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+        );
+    }
+
+    public function detailCacheSource(array $scope, array $params): array
+    {
+        $this->setScopeTimezone($scope);
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+        $plan = $this->hotWindowReadService->readPlan(
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+        );
+
+        if (! empty($plan['preferred_from']) && ! empty($plan['preferred_to'])) {
+            return [
+                'contract' => 'erp_pos_console_i05_report_portal_detail_cache_v1',
+                'consumer_contract' => 'canonical_detail_recent_5_days',
+                'read_mode' => 'live_detail',
+                'source' => 'sales canonical detail rows',
+                'ready' => true,
+                'http_backfill' => false,
+                'hot_window_days' => ReportHotWindowReadService::MATERIALIZED_FIRST_DAYS,
+                'materialized_first_days' => ReportHotWindowReadService::MATERIALIZED_FIRST_DAYS,
+                'hot_window_from' => $plan['hot_window_from'] ?? null,
+                'hot_window_to' => $plan['hot_window_to'] ?? null,
+                'live_date_from' => $plan['preferred_from'] ?? null,
+                'live_date_to' => $plan['preferred_to'] ?? null,
+                'materialized_date_from' => $plan['historical_from'] ?? null,
+                'materialized_date_to' => $plan['historical_to'] ?? null,
+            ];
+        }
+
+        return [
+            'contract' => 'erp_pos_console_i05_report_portal_detail_cache_v1',
+            'consumer_contract' => 'canonical_detail_historical',
+            'read_mode' => 'materialized',
+            'source' => 'sales canonical historical detail rows',
+            'ready' => true,
+            'http_backfill' => false,
+            'materialized_first_days' => ReportHotWindowReadService::MATERIALIZED_FIRST_DAYS,
+            'materialized_date_from' => $plan['historical_from'] ?? null,
+            'materialized_date_to' => $plan['historical_to'] ?? null,
+        ];
+    }
+
+    public function dashboard(array $scope, array $params, ?array $reportingSource = null): array
     {
         $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $recentLimit = max(1, min(20, (int) ($params['recent_limit'] ?? 5)));
         $topLimit = max(1, min(10, (int) ($params['top_limit'] ?? 5)));
-        $saleScope = $this->resolveEligibleSalesScope($scope, $params);
         $outletIds = $this->effectiveScopeOutletIds($scope);
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+        $markedOnly = ! empty($scope['marked_only']);
+        $reportingSource ??= $this->hotWindowReadService->readContractStatus(
+            $outletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+        );
+
         $netAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet(
             $outletIds,
             $params['date_from'] ?? null,
             $params['date_to'] ?? null,
-            $this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta')
+            $timezone
         );
 
-        if (! ($saleScope['has_rows'] ?? false)) {
+        if ($outletIds === []) {
             return [
                 'scope' => $this->scopeMeta($scope),
-                'range' => [
-                    'date_from' => $from->toDateString(),
-                    'date_to' => $to->toDateString(),
-                ],
-                'metrics' => [
-                    'gross_sales' => 0,
-                    'transaction_count' => 0,
-                    'items_sold' => 0,
-                    'avg_ticket' => 0,
-                ],
-                'breakdowns' => [
-                    'by_channel' => [],
-                    'by_payment_method_snapshot' => [],
-                ],
-                'top_items' => [
-                    'variants' => [],
-                    'products' => [],
-                ],
-                'recent_sales' => [
-                    'items' => [],
-                    'meta' => [
-                        'limit' => $recentLimit,
-                        'total' => 0,
-                    ],
-                ],
+                'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
+                'metrics' => ['gross_sales' => 0, 'transaction_count' => 0, 'items_sold' => 0, 'avg_ticket' => 0],
+                'breakdowns' => ['by_channel' => [], 'by_payment_method_snapshot' => []],
+                'top_items' => ['variants' => [], 'products' => []],
+                'recent_sales' => ['items' => [], 'meta' => ['limit' => $recentLimit, 'total' => 0]],
+                'meta' => ['reporting_source' => $reportingSource],
             ];
         }
 
-        $scopeKey = (string) ($saleScope['scope_key'] ?? '');
-        $paymentBreakdownRows = $this->resolvePaymentBreakdown($saleScope, $outletIds);
+        $sales = $this->hotWindowReadService
+            ->salesSummaryQuery($outletIds, $from->toDateString(), $to->toDateString(), $timezone)
+            ->selectRaw($markedOnly
+                ? 'COALESCE(SUM(rdss.marked_trx_count), 0) as trx_count, COALESCE(SUM(rdss.marked_grand_sales), 0) as gross_sales, COALESCE(SUM(rdss.marked_item_qty_sold), 0) as items_sold'
+                : 'COALESCE(SUM(rdss.trx_count), 0) as trx_count, COALESCE(SUM(rdss.grand_sales), 0) as gross_sales, COALESCE(SUM(rdss.item_qty_sold), 0) as items_sold')
+            ->first();
 
-        $salesRows = DB::table('sales as s')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->leftJoinSub($this->paymentSummarySubquery($scopeKey), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'))
-            ->leftJoinSub($this->channelMapSubquery($scopeKey), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-
-        $this->scopeService->applySalesScope($salesRows, $scope, 's');
-
-        $salesRows = $salesRows->get([
-            's.id as sale_id',
-            's.outlet_id',
-            's.sale_number',
-            's.channel',
-            's.payment_method_name',
-            's.payment_method_type',
-            's.subtotal',
-            's.discount_total',
-            's.service_charge_total',
-            DB::raw('COALESCE(s.grand_total, 0) as grand_total'),
-            DB::raw('COALESCE(s.tax_total, 0) as tax_total'),
-            DB::raw('COALESCE(s.rounding_total, 0) as rounding_total'),
-            's.paid_total',
-            's.change_total',
-            's.marking',
-            's.created_at',
-            'o.code as outlet_code',
-            'o.name as outlet_name',
-            'o.timezone as outlet_timezone',
-            DB::raw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel"),
-            DB::raw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display"),
-            DB::raw('COALESCE(payments.has_payment_rows, 0) as has_payment_rows'),
-        ]);
-
-        $trxCount = $salesRows->count();
-        $grossSales = (int) $salesRows->sum(fn ($row) => (int) ($row->grand_total ?? 0));
+        $trxCount = (int) ($sales->trx_count ?? 0);
+        $grossSales = (int) round((float) ($sales->gross_sales ?? 0));
+        $itemsSold = (int) round((float) ($sales->items_sold ?? 0));
         $avgTicket = $trxCount > 0 ? (int) floor($grossSales / $trxCount) : 0;
 
-        $itemsSoldQuery = DB::table('sale_items as si')
-            ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->whereNull('si.voided_at')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-        $this->scopeService->applySalesScope($itemsSoldQuery, $scope, 's');
-        $itemsSold = (int) $itemsSoldQuery->selectRaw('COALESCE(SUM(si.qty), 0) as qty_sum')->value('qty_sum');
+        $byChannel = $this->hotWindowReadService
+            ->channelSummaryQuery($outletIds, $from->toDateString(), $to->toDateString(), $timezone)
+            ->selectRaw("COALESCE(NULLIF(rdcs.display_channel, ''), '-') as channel")
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdcs.marked_trx_count), 0) as trx_count' : 'COALESCE(SUM(rdcs.trx_count), 0) as trx_count')
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdcs.marked_gross_sales), 0) as gross_sales' : 'COALESCE(SUM(rdcs.gross_sales), 0) as gross_sales')
+            ->groupBy('rdcs.display_channel')
+            ->orderByDesc('gross_sales')
+            ->get()
+            ->map(fn ($row) => [
+                'channel' => (string) ($row->channel ?? '-'),
+                'trx_count' => (int) ($row->trx_count ?? 0),
+                'gross_sales' => (int) round((float) ($row->gross_sales ?? 0)),
+            ])->values()->all();
 
-        $channelAccumulator = [];
-        foreach ($salesRows as $row) {
-            $channelKey = (string) ($row->display_channel ?? $row->channel ?? '-');
-            $channelAccumulator[$channelKey] ??= [
-                'channel' => $channelKey,
-                'trx_count' => 0,
-                'gross_sales' => 0,
-            ];
-            $channelAccumulator[$channelKey]['trx_count']++;
-            $channelAccumulator[$channelKey]['gross_sales'] += (int) ($row->grand_total ?? 0);
-        }
-        $byChannel = array_values($channelAccumulator);
-        usort($byChannel, fn (array $a, array $b) => ($b['gross_sales'] <=> $a['gross_sales']) ?: (($b['trx_count'] ?? 0) <=> ($a['trx_count'] ?? 0)) ?: strcmp((string) ($a['channel'] ?? ''), (string) ($b['channel'] ?? '')));
+        $byPaymentMethod = $this->hotWindowReadService
+            ->paymentSummaryQuery($outletIds, $from->toDateString(), $to->toDateString(), $timezone)
+            ->selectRaw("COALESCE(NULLIF(rdps.payment_method_name, ''), '-') as payment_method_name")
+            ->selectRaw("COALESCE(NULLIF(rdps.payment_method_type, ''), '') as payment_method_type")
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdps.marked_trx_count), 0) as trx_count' : 'COALESCE(SUM(rdps.trx_count), 0) as trx_count')
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdps.marked_gross_sales), 0) as gross_sales' : 'COALESCE(SUM(rdps.gross_sales), 0) as gross_sales')
+            ->groupBy('rdps.payment_method_name', 'rdps.payment_method_type')
+            ->orderByDesc('gross_sales')
+            ->get()
+            ->map(fn ($row) => [
+                'payment_method_name' => (string) ($row->payment_method_name ?? '-'),
+                'payment_method_type' => (string) ($row->payment_method_type ?? ''),
+                'trx_count' => (int) ($row->trx_count ?? 0),
+                'gross_sales' => (int) round((float) ($row->gross_sales ?? 0)),
+            ])->values()->all();
 
-        $byPaymentMethod = $paymentBreakdownRows;
-        usort($byPaymentMethod, fn (array $a, array $b) => ($b['gross_sales'] <=> $a['gross_sales']) ?: (($b['trx_count'] ?? 0) <=> ($a['trx_count'] ?? 0)) ?: strcmp((string) ($a['payment_method_name'] ?? ''), (string) ($b['payment_method_name'] ?? '')));
-
-        $topVariantsQuery = DB::table('sale_items as si')
-            ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->whereNull('si.voided_at')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-        $this->scopeService->applySalesScope($topVariantsQuery, $scope, 's');
-        $topVariants = $topVariantsQuery
-            ->select('si.product_name', 'si.variant_name')
-            ->selectRaw('COALESCE(SUM(si.qty), 0) as qty_sold')
-            ->selectRaw('COALESCE(SUM(si.line_total), 0) as revenue')
-            ->groupBy('si.product_name', 'si.variant_name')
+        $topVariants = $this->hotWindowReadService
+            ->variantSummaryQuery($outletIds, $from->toDateString(), $to->toDateString(), null, $timezone)
+            ->selectRaw("COALESCE(NULLIF(rdvar.product_name, ''), '-') as product_name")
+            ->selectRaw("COALESCE(NULLIF(rdvar.variant_name, ''), '') as variant_name")
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdvar.marked_item_sold), 0) as qty_sold' : 'COALESCE(SUM(rdvar.item_sold), 0) as qty_sold')
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdvar.marked_gross_sales), 0) as revenue' : 'COALESCE(SUM(rdvar.gross_sales), 0) as revenue')
+            ->groupBy('rdvar.product_name', 'rdvar.variant_name')
             ->orderByDesc('qty_sold')
-            ->orderBy('si.product_name')
+            ->orderBy('rdvar.product_name')
             ->limit($topLimit)
             ->get()
             ->map(fn ($row) => [
                 'product_name' => (string) ($row->product_name ?? ''),
                 'variant_name' => (string) ($row->variant_name ?? ''),
-                'qty_sold' => (int) ($row->qty_sold ?? 0),
-                'revenue' => (int) ($row->revenue ?? 0),
-            ])
-            ->values()
-            ->all();
+                'qty_sold' => (int) round((float) ($row->qty_sold ?? 0)),
+                'revenue' => (int) round((float) ($row->revenue ?? 0)),
+            ])->values()->all();
 
-        $topProductsQuery = DB::table('sale_items as si')
-            ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->whereNull('si.voided_at')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-        $this->scopeService->applySalesScope($topProductsQuery, $scope, 's');
-        $topProducts = $topProductsQuery
-            ->select('si.product_name')
-            ->selectRaw('COALESCE(SUM(si.qty), 0) as qty_sold')
-            ->selectRaw('COALESCE(SUM(si.line_total), 0) as revenue')
-            ->groupBy('si.product_name')
+        $topProducts = $this->hotWindowReadService
+            ->productSummaryQuery($outletIds, $from->toDateString(), $to->toDateString(), null, $timezone)
+            ->selectRaw("COALESCE(NULLIF(rdprod.product_name, ''), '-') as product_name")
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdprod.marked_item_sold), 0) as qty_sold' : 'COALESCE(SUM(rdprod.item_sold), 0) as qty_sold')
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdprod.marked_gross_sales), 0) as revenue' : 'COALESCE(SUM(rdprod.gross_sales), 0) as revenue')
+            ->groupBy('rdprod.product_name')
             ->orderByDesc('qty_sold')
-            ->orderBy('si.product_name')
+            ->orderBy('rdprod.product_name')
             ->limit($topLimit)
             ->get()
             ->map(fn ($row) => [
                 'product_name' => (string) ($row->product_name ?? ''),
-                'qty_sold' => (int) ($row->qty_sold ?? 0),
-                'revenue' => (int) ($row->revenue ?? 0),
-            ])
-            ->values()
-            ->all();
+                'qty_sold' => (int) round((float) ($row->qty_sold ?? 0)),
+                'revenue' => (int) round((float) ($row->revenue ?? 0)),
+            ])->values()->all();
 
-        $recentSales = $salesRows
-            ->sort(function ($left, $right) {
-                $createdCompare = strcmp((string) ($right->created_at ?? ''), (string) ($left->created_at ?? ''));
-                if ($createdCompare !== 0) {
-                    return $createdCompare;
-                }
-                return strcmp((string) ($right->sale_id ?? ''), (string) ($left->sale_id ?? ''));
-            })
-            ->take($recentLimit)
-            ->map(fn ($row) => $this->mapSaleListRow($row))
-            ->values()
-            ->all();
+        $recentSaleIds = $this->hotWindowReadService->recentSaleIds(
+            $outletIds,
+            $from->toDateString(),
+            $to->toDateString(),
+            $timezone,
+            $recentLimit,
+            $markedOnly,
+        );
+        $recentRows = $recentSaleIds === [] ? collect() : DB::table('sales as s')
+            ->join('outlets as o', 'o.id', '=', 's.outlet_id')
+            ->whereIn('s.id', $recentSaleIds)
+            ->whereNull('s.deleted_at')
+            ->where('s.status', 'PAID')
+            ->select([
+                's.id as sale_id', 's.outlet_id', 's.sale_number', 's.channel', 's.payment_method_name', 's.payment_method_type',
+                's.subtotal', 's.discount_total', 's.service_charge_total', DB::raw('COALESCE(s.grand_total, 0) as grand_total'),
+                DB::raw('COALESCE(s.tax_total, 0) as tax_total'), DB::raw('COALESCE(s.rounding_total, 0) as rounding_total'),
+                's.paid_total', 's.change_total', 's.marking', 's.created_at', 'o.code as outlet_code', 'o.name as outlet_name', 'o.timezone as outlet_timezone',
+                DB::raw("UPPER(COALESCE(s.channel, '')) as display_channel"),
+                DB::raw("COALESCE(NULLIF(s.payment_method_name, ''), '-') as payment_method_display"),
+            ])
+            ->orderByDesc('s.created_at')->orderByDesc('s.id')->get()->keyBy(fn ($row) => (string) $row->sale_id);
+
+        $recentSales = [];
+        foreach ($recentSaleIds as $saleId) {
+            $row = $recentRows->get((string) $saleId);
+            if ($row) $recentSales[] = $this->mapSaleListRow($row);
+        }
 
         $payload = [
             'scope' => $this->scopeMeta($scope),
-            'range' => [
-                'date_from' => $from->toDateString(),
-                'date_to' => $to->toDateString(),
-            ],
+            'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
             'metrics' => [
                 'gross_sales' => $grossSales,
                 'transaction_count' => $trxCount,
@@ -336,17 +354,9 @@ class ReportPortalAnalyticsService
                 'by_channel' => $byChannel,
                 'by_payment_method_snapshot' => $byPaymentMethod,
             ],
-            'top_items' => [
-                'variants' => $topVariants,
-                'products' => $topProducts,
-            ],
-            'recent_sales' => [
-                'items' => $recentSales,
-                'meta' => [
-                    'limit' => $recentLimit,
-                    'total' => count($recentSales),
-                ],
-            ],
+            'top_items' => ['variants' => $topVariants, 'products' => $topProducts],
+            'recent_sales' => ['items' => $recentSales, 'meta' => ['limit' => $recentLimit, 'total' => count($recentSales)]],
+            'meta' => ['reporting_source' => $reportingSource],
         ];
 
         return $this->financeNetReadService->applyToReportPortalDashboardPayload($payload, $netAdjustments);
@@ -572,144 +582,111 @@ class ReportPortalAnalyticsService
         return $this->saleListing($scope, $params, max(1, min(100, (int) ($params['per_page'] ?? 5))));
     }
 
-    public function itemSold(array $scope, array $params): array
+    public function itemSold(array $scope, array $params, ?array $reportingSource = null): array
     {
         $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? 10)));
         $page = max(1, (int) ($params['page'] ?? 1));
-        $saleScope = $this->resolveEligibleSalesScope($scope, $params);
-        $scopeKey = (string) ($saleScope['scope_key'] ?? '');
+        $outletIds = $this->effectiveScopeOutletIds($scope);
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+        $markedOnly = ! empty($scope['marked_only']);
+        $reportingSource ??= $this->hotWindowReadService->readContractStatus($outletIds, $from->toDateString(), $to->toDateString(), $timezone);
 
-        $query = DB::table('sale_items as si')
-            ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->whereNull('si.voided_at')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-
-        $this->scopeService->applySalesScope($query, $scope, 's');
-
-        $query
-            ->select('si.product_name', 'si.variant_name')
-            ->selectRaw('COALESCE(SUM(si.qty), 0) as qty')
-            ->selectRaw('COALESCE(AVG(si.unit_price), 0) as unit_price')
-            ->selectRaw('COALESCE(SUM(si.line_total), 0) as total')
-            ->groupBy('si.product_name', 'si.variant_name')
-            ->orderByDesc('qty')
-            ->orderBy('si.product_name')
-            ->orderBy('si.variant_name');
+        $query = $this->hotWindowReadService
+            ->variantSummaryQuery($outletIds, $from->toDateString(), $to->toDateString(), null, $timezone)
+            ->selectRaw("COALESCE(NULLIF(rdvar.product_name, ''), '-') as product_name")
+            ->selectRaw("COALESCE(NULLIF(rdvar.variant_name, ''), '') as variant_name")
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdvar.marked_item_sold), 0) as qty' : 'COALESCE(SUM(rdvar.item_sold), 0) as qty')
+            ->selectRaw($markedOnly
+                ? 'CASE WHEN COALESCE(SUM(rdvar.marked_line_count),0) > 0 THEN COALESCE(SUM(rdvar.marked_unit_price_sum),0) / SUM(rdvar.marked_line_count) ELSE 0 END as unit_price'
+                : 'CASE WHEN COALESCE(SUM(rdvar.line_count),0) > 0 THEN COALESCE(SUM(rdvar.unit_price_sum),0) / SUM(rdvar.line_count) ELSE 0 END as unit_price')
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdvar.marked_gross_sales), 0) as total' : 'COALESCE(SUM(rdvar.gross_sales), 0) as total')
+            ->groupBy('rdvar.product_name', 'rdvar.variant_name')
+            ->orderByDesc('qty')->orderBy('rdvar.product_name')->orderBy('rdvar.variant_name');
 
         $paginator = $this->paginate($query, $perPage, $page);
-
         $items = collect($paginator->items())->map(fn ($row) => [
             'item' => (string) ($row->product_name ?? ''),
             'variant' => (string) ($row->variant_name ?? ''),
-            'qty' => (int) ($row->qty ?? 0),
-            'unit_price' => (int) ($row->unit_price ?? 0),
-            'total' => (int) ($row->total ?? 0),
+            'qty' => (int) round((float) ($row->qty ?? 0)),
+            'unit_price' => (int) round((float) ($row->unit_price ?? 0)),
+            'total' => (int) round((float) ($row->total ?? 0)),
         ])->values()->all();
 
         return [
             'scope' => $this->scopeMeta($scope),
-            'range' => [
-                'date_from' => $from->toDateString(),
-                'date_to' => $to->toDateString(),
-            ],
+            'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
             'data' => $items,
-            'meta' => $this->paginationMeta($paginator),
+            'meta' => array_merge($this->paginationMeta($paginator), ['reporting_source' => $reportingSource]),
         ];
     }
 
-    public function itemByProduct(array $scope, array $params): array
+    public function itemByProduct(array $scope, array $params, ?array $reportingSource = null): array
     {
         $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? 10)));
         $page = max(1, (int) ($params['page'] ?? 1));
-        $saleScope = $this->resolveEligibleSalesScope($scope, $params);
-        $scopeKey = (string) ($saleScope['scope_key'] ?? '');
+        $outletIds = $this->effectiveScopeOutletIds($scope);
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+        $markedOnly = ! empty($scope['marked_only']);
+        $reportingSource ??= $this->hotWindowReadService->readContractStatus($outletIds, $from->toDateString(), $to->toDateString(), $timezone);
 
-        $query = DB::table('sale_items as si')
-            ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->whereNull('si.voided_at')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-
-        $this->scopeService->applySalesScope($query, $scope, 's');
-
-        $query
-            ->select('si.product_name')
-            ->selectRaw('COALESCE(SUM(si.qty), 0) as qty')
-            ->selectRaw('COALESCE(SUM(si.line_total), 0) as total')
-            ->groupBy('si.product_name')
-            ->orderByDesc('qty')
-            ->orderBy('si.product_name');
+        $query = $this->hotWindowReadService
+            ->productSummaryQuery($outletIds, $from->toDateString(), $to->toDateString(), null, $timezone)
+            ->selectRaw("COALESCE(NULLIF(rdprod.product_name, ''), '-') as product_name")
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdprod.marked_item_sold), 0) as qty' : 'COALESCE(SUM(rdprod.item_sold), 0) as qty')
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdprod.marked_gross_sales), 0) as total' : 'COALESCE(SUM(rdprod.gross_sales), 0) as total')
+            ->groupBy('rdprod.product_name')->orderByDesc('qty')->orderBy('rdprod.product_name');
 
         $paginator = $this->paginate($query, $perPage, $page);
-
         $items = collect($paginator->items())->map(fn ($row) => [
             'product_name' => (string) ($row->product_name ?? ''),
-            'qty' => (int) ($row->qty ?? 0),
-            'total' => (int) ($row->total ?? 0),
+            'qty' => (int) round((float) ($row->qty ?? 0)),
+            'total' => (int) round((float) ($row->total ?? 0)),
         ])->values()->all();
 
         return [
             'scope' => $this->scopeMeta($scope),
-            'range' => [
-                'date_from' => $from->toDateString(),
-                'date_to' => $to->toDateString(),
-            ],
+            'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
             'data' => $items,
-            'meta' => $this->paginationMeta($paginator),
+            'meta' => array_merge($this->paginationMeta($paginator), ['reporting_source' => $reportingSource]),
         ];
     }
 
-    public function itemByVariant(array $scope, array $params): array
+    public function itemByVariant(array $scope, array $params, ?array $reportingSource = null): array
     {
         $this->setScopeTimezone($scope);
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? 10)));
         $page = max(1, (int) ($params['page'] ?? 1));
-        $saleScope = $this->resolveEligibleSalesScope($scope, $params);
-        $scopeKey = (string) ($saleScope['scope_key'] ?? '');
+        $outletIds = $this->effectiveScopeOutletIds($scope);
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+        $markedOnly = ! empty($scope['marked_only']);
+        $reportingSource ??= $this->hotWindowReadService->readContractStatus($outletIds, $from->toDateString(), $to->toDateString(), $timezone);
 
-        $query = DB::table('sale_items as si')
-            ->join('sales as s', 's.id', '=', 'si.sale_id')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
-            ->whereNull('si.voided_at')
-            ->whereNull('s.deleted_at')
-            ->where('s.status', '=', 'PAID');
-
-        $this->scopeService->applySalesScope($query, $scope, 's');
-
-        $query
-            ->select('si.product_name', 'si.variant_name')
-            ->selectRaw('COALESCE(SUM(si.qty), 0) as qty')
-            ->selectRaw('COALESCE(SUM(si.line_total), 0) as total')
-            ->groupBy('si.product_name', 'si.variant_name')
-            ->orderByDesc('qty')
-            ->orderBy('si.product_name')
-            ->orderBy('si.variant_name');
+        $query = $this->hotWindowReadService
+            ->variantSummaryQuery($outletIds, $from->toDateString(), $to->toDateString(), null, $timezone)
+            ->selectRaw("COALESCE(NULLIF(rdvar.product_name, ''), '-') as product_name")
+            ->selectRaw("COALESCE(NULLIF(rdvar.variant_name, ''), '') as variant_name")
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdvar.marked_item_sold), 0) as qty' : 'COALESCE(SUM(rdvar.item_sold), 0) as qty')
+            ->selectRaw($markedOnly ? 'COALESCE(SUM(rdvar.marked_gross_sales), 0) as total' : 'COALESCE(SUM(rdvar.gross_sales), 0) as total')
+            ->groupBy('rdvar.product_name', 'rdvar.variant_name')->orderByDesc('qty')->orderBy('rdvar.product_name')->orderBy('rdvar.variant_name');
 
         $paginator = $this->paginate($query, $perPage, $page);
-
         $items = collect($paginator->items())->map(fn ($row) => [
             'product_name' => (string) ($row->product_name ?? ''),
             'variant_name' => (string) ($row->variant_name ?? ''),
-            'qty' => (int) ($row->qty ?? 0),
-            'total' => (int) ($row->total ?? 0),
+            'qty' => (int) round((float) ($row->qty ?? 0)),
+            'total' => (int) round((float) ($row->total ?? 0)),
         ])->values()->all();
 
         return [
             'scope' => $this->scopeMeta($scope),
-            'range' => [
-                'date_from' => $from->toDateString(),
-                'date_to' => $to->toDateString(),
-            ],
+            'range' => ['date_from' => $from->toDateString(), 'date_to' => $to->toDateString()],
             'data' => $items,
-            'meta' => $this->paginationMeta($paginator),
+            'meta' => array_merge($this->paginationMeta($paginator), ['reporting_source' => $reportingSource]),
         ];
     }
 
