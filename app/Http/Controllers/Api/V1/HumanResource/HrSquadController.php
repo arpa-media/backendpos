@@ -681,17 +681,29 @@ class HrSquadController extends Controller
             ]);
         }
 
+        $allImportRows = array_values($rows);
+        $sourceRowCount = count($allImportRows);
+        $workbookTotalRows = count(array_filter($allImportRows, fn ($row) => count(array_filter($row, fn ($value) => trim((string) $value) !== '')) > 0));
+        $chunkedImport = $request->boolean('chunked');
+        $chunkOffset = $chunkedImport ? max(0, (int) $request->input('chunk_offset', 0)) : 0;
+        $chunkSize = $chunkedImport ? min(50, max(1, (int) $request->input('chunk_size', 25))) : max(1, $sourceRowCount);
+        $duplicateNisjLineMap = $this->duplicateImportNisjLineMap($allImportRows, $headerResolution['map']['nisj'] ?? null);
+        if ($chunkedImport) {
+            $rows = array_slice($allImportRows, $chunkOffset, $chunkSize);
+        }
+
         $inserted = 0;
         $updated = 0;
         $unchanged = 0;
         $restored = 0;
         $usersCreated = 0;
         $usersLinked = 0;
+        $emailFallbacks = 0;
         $skipped = 0;
         $errors = [];
         $rowResults = [];
         $seenNisj = [];
-        $line = 1;
+        $line = $chunkedImport ? ($chunkOffset + 1) : 1;
         $totalRows = 0;
 
         foreach ($rows as $row) {
@@ -711,6 +723,22 @@ class HrSquadController extends Controller
             try {
                 $nisj = $this->normalizeImportIdentity($data['nisj'] ?? '');
                 $nisjKey = mb_strtolower($nisj);
+                if (isset($duplicateNisjLineMap[$line])) {
+                    $errors[] = [
+                        'line' => $line,
+                        'row_number' => $line,
+                        'name' => $data['full_name'] ?? '',
+                        'nisj' => $nisj,
+                        'details' => [[
+                            'column' => 'nisj',
+                            'field' => 'nisj',
+                            'value' => $nisj,
+                            'message' => 'NISJ duplikat di file yang sama. Pertama kali ditemukan pada baris '.$duplicateNisjLineMap[$line].'.',
+                        ]],
+                        'error_text' => 'nisj: NISJ duplikat di file yang sama.',
+                    ];
+                    continue;
+                }
                 if ($nisjKey !== '' && isset($seenNisj[$nisjKey])) {
                     $errors[] = [
                         'line' => $line,
@@ -733,6 +761,15 @@ class HrSquadController extends Controller
 
                 $existing = $this->findExistingSquadForImport(['nisj' => $nisj]);
                 $mapped = $this->mapImportData($data, $existing !== null);
+
+                $emailResolution = $this->resolveImportEmailAvailability(
+                    $mapped['email'] ?? null,
+                    $nisj,
+                    $existing?->id ? (int) $existing->id : null,
+                );
+                if ($emailResolution['changed']) {
+                    $mapped['email'] = $emailResolution['email'];
+                }
 
                 $validationPayload = $existing
                     ? array_merge((array) $existing, $mapped)
@@ -830,6 +867,7 @@ class HrSquadController extends Controller
                 if ($rowResult['restored']) $restored++;
                 if ($rowResult['user_created']) $usersCreated++;
                 if ($rowResult['user_linked']) $usersLinked++;
+                if ($emailResolution['changed'] ?? false) $emailFallbacks++;
 
                 $rowResults[] = [
                     'line' => $line,
@@ -839,6 +877,9 @@ class HrSquadController extends Controller
                     'restored' => (bool) $rowResult['restored'],
                     'changed_fields' => $rowResult['changed_fields'],
                     'squad_id' => $rowResult['squad_id'],
+                    'email_fallback_applied' => (bool) ($emailResolution['changed'] ?? false),
+                    'original_email' => $emailResolution['original'] ?? null,
+                    'final_email' => $emailResolution['email'] ?? ($mapped['email'] ?? null),
                 ];
             } catch (\Throwable $exception) {
                 $errors[] = $this->formatImportExceptionRowError($line, $data, $mapped, $exception);
@@ -859,17 +900,28 @@ class HrSquadController extends Controller
             'restored' => $restored,
             'users_created' => $usersCreated,
             'users_linked' => $usersLinked,
+            'email_fallbacks' => $emailFallbacks,
             'skipped' => $skipped,
             'errors' => $errors,
             'error_count' => $errorCount,
             'row_results' => $rowResults,
             'ignored_headers' => $headerResolution['unsupported'],
-            'note' => 'Upsert berdasarkan NISJ: data baru ditambah, data existing hanya mengubah field yang tersedia di Excel dan benar-benar berbeda, baris tanpa perubahan tidak ditulis ulang. Data User existing tidak pernah dioverwrite.',
+            'workbook_total_rows' => $workbookTotalRows,
+            'chunk' => [
+                'enabled' => $chunkedImport,
+                'offset' => $chunkOffset,
+                'size' => $chunkSize,
+                'source_rows' => $sourceRowCount,
+                'next_offset' => min($sourceRowCount, $chunkOffset + count($rows)),
+                'has_more' => $chunkedImport && ($chunkOffset + count($rows) < $sourceRowCount),
+                'percent' => $sourceRowCount > 0 ? round(min(100, (($chunkOffset + count($rows)) / $sourceRowCount) * 100), 2) : 100,
+            ],
+            'note' => 'Upsert berdasarkan NISJ: data baru ditambah, data existing hanya mengubah field yang tersedia di Excel dan benar-benar berbeda, baris tanpa perubahan tidak ditulis ulang. Jika email sudah dipakai Data Squad/User lain, import otomatis mengganti email menjadi format username@gmail.com yang unik. Data User existing tidak pernah dioverwrite.',
         ];
 
         $message = $success
-            ? "Import sukses. {$inserted} data baru, {$updated} data berubah, {$unchanged} tanpa perubahan, {$usersCreated} user dibuat, 0 error."
-            : "Import parsial. {$inserted} data baru, {$updated} data berubah, {$unchanged} tanpa perubahan, {$errorCount} baris gagal. Buka detail error untuk melihat baris, kolom, nilai, dan penyebab.";
+            ? "Import sukses. {$inserted} data baru, {$updated} data berubah, {$unchanged} tanpa perubahan, {$usersCreated} user dibuat, {$emailFallbacks} email otomatis disesuaikan, 0 error."
+            : "Import parsial. {$inserted} data baru, {$updated} data berubah, {$unchanged} tanpa perubahan, {$emailFallbacks} email otomatis disesuaikan, {$errorCount} baris gagal. Buka detail error untuk melihat baris, kolom, nilai, dan penyebab.";
 
         return ApiResponse::ok($summary, $message);
     }
@@ -1637,6 +1689,87 @@ class HrSquadController extends Controller
         return $candidate;
     }
 
+
+    /**
+     * Khusus import Data Squad:
+     * - pertahankan email Excel bila belum dipakai identitas lain;
+     * - bila sudah taken di HR_squads atau users, ubah otomatis ke
+     *   <username>@gmail.com;
+     * - bila fallback juga taken, tambahkan suffix -2, -3, dst.
+     *
+     * Existing User dengan NISJ yang sama tidak dianggap konflik karena
+     * import memang tidak mengubah Data User existing.
+     */
+    private function resolveImportEmailAvailability(mixed $requested, string $nisj, ?int $ignoreSquadId = null): array
+    {
+        $original = strtolower(trim((string) $requested));
+        if ($original === '' || ! filter_var($original, FILTER_VALIDATE_EMAIL)) {
+            return [
+                'email' => $original !== '' ? $original : null,
+                'original' => $original !== '' ? $original : null,
+                'changed' => false,
+            ];
+        }
+
+        $matchingUser = $this->squadWiring->findUserByNisj($nisj);
+        $ignoreUserId = $matchingUser?->id ? (string) $matchingUser->id : null;
+
+        if (! $this->importEmailTaken($original, $ignoreSquadId, $ignoreUserId)) {
+            return [
+                'email' => $original,
+                'original' => $original,
+                'changed' => false,
+            ];
+        }
+
+        $username = trim((string) ($matchingUser?->username ?? ''));
+        if ($username === '') {
+            $username = $this->availableUsername($nisj, $nisj);
+        }
+
+        $local = strtolower($username);
+        $local = preg_replace('/[^a-z0-9._-]+/i', '-', $local) ?: '';
+        $local = trim($local, '.-_');
+        if ($local === '') {
+            $local = preg_replace('/[^a-z0-9._-]+/i', '-', strtolower($nisj)) ?: 'squad';
+            $local = trim($local, '.-_') ?: 'squad';
+        }
+
+        $candidate = $local.'@gmail.com';
+        $suffix = 2;
+        while ($this->importEmailTaken($candidate, $ignoreSquadId, $ignoreUserId)) {
+            $candidate = $local.'-'.$suffix++.'@gmail.com';
+        }
+
+        return [
+            'email' => $candidate,
+            'original' => $original,
+            'changed' => true,
+        ];
+    }
+
+    private function importEmailTaken(string $email, ?int $ignoreSquadId = null, ?string $ignoreUserId = null): bool
+    {
+        $normalized = strtolower(trim($email));
+
+        $squadQuery = DB::table(self::TABLE)
+            ->whereRaw('LOWER(TRIM(`email`)) = ?', [$normalized]);
+        if ($ignoreSquadId) {
+            $squadQuery->where('id', '<>', $ignoreSquadId);
+        }
+        if ($squadQuery->exists()) {
+            return true;
+        }
+
+        $userQuery = User::query()
+            ->whereRaw('LOWER(TRIM(`email`)) = ?', [$normalized]);
+        if ($ignoreUserId !== null && $ignoreUserId !== '') {
+            $userQuery->where('id', '<>', $ignoreUserId);
+        }
+
+        return $userQuery->exists();
+    }
+
     private function findSquadOrFail(string $id): object
     {
         $squad = DB::table(self::TABLE)->where('id', $id)->whereNull('deleted_at')->first();
@@ -2200,6 +2333,39 @@ class HrSquadController extends Controller
         } catch (\Throwable $exception) {
             return $raw;
         }
+    }
+
+    private function duplicateImportNisjLineMap(array $rows, mixed $nisjIndex): array
+    {
+        if (! is_int($nisjIndex) && ! ctype_digit((string) $nisjIndex)) {
+            return [];
+        }
+
+        $nisjIndex = (int) $nisjIndex;
+        $firstLineByNisj = [];
+        $duplicateLineMap = [];
+
+        foreach (array_values($rows) as $index => $row) {
+            $line = $index + 2;
+            if (count(array_filter((array) $row, fn ($value) => trim((string) $value) !== '')) === 0) {
+                continue;
+            }
+
+            $nisj = $this->normalizeImportIdentity($row[$nisjIndex] ?? '');
+            $key = mb_strtolower($nisj);
+            if ($key === '') {
+                continue;
+            }
+
+            if (isset($firstLineByNisj[$key])) {
+                $duplicateLineMap[$line] = $firstLineByNisj[$key];
+                continue;
+            }
+
+            $firstLineByNisj[$key] = $line;
+        }
+
+        return $duplicateLineMap;
     }
 
     private function normalizeImportCell($value): string
