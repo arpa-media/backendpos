@@ -996,11 +996,22 @@ class UserManagementService
     public function updateUserProfile(User $actor, User $subject, array $payload): array
     {
         return DB::transaction(function () use ($actor, $subject, $payload) {
-            $subject->fill([
+            $userUpdates = [
                 'username' => trim((string) ($payload['username'] ?? $subject->username ?? '')),
                 'nisj' => $this->nullableString($payload['nisj'] ?? $subject->nisj),
                 'outlet_id' => $this->nullableString($payload['outlet_id'] ?? $subject->outlet_id),
-            ]);
+            ];
+
+            // Password is optional on Edit Profile. The controller already validates
+            // min:8 + confirmed; only persist it when the user actually supplied one.
+            // User::casts() uses Laravel's `hashed` cast, so assigning the plain value
+            // here stores a bcrypt/argon hash instead of the raw password.
+            $newPassword = $payload['password'] ?? null;
+            if (is_string($newPassword) && $newPassword !== '') {
+                $userUpdates['password'] = $newPassword;
+            }
+
+            $subject->fill($userUpdates);
             $subject->save();
 
             $employee = $subject->employee;
