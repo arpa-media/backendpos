@@ -2,6 +2,8 @@
 
 namespace App\Services\Operational;
 
+use App\Support\TransactionDate;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
@@ -11,16 +13,23 @@ class OperationalDailyTopItemsByCategoryService
      * Top items by category for one complete business date (00:00-23:59).
      * Historical reads use hourly materialization; current business-date reads remain bounded to one day.
      */
-    public function forDate(array $outletIds, string $businessDate, bool $isLive, int $top = 10): array
-    {
+    public function forDate(
+        array $outletIds,
+        string $businessDate,
+        bool $isLive,
+        int $top = 10,
+        bool $exactHistoricalFallback = false,
+    ): array {
         $outletIds = $this->normalizeOutletIds($outletIds);
         if ($outletIds === []) {
             return [];
         }
 
-        $rows = $isLive
-            ? $this->liveRows($outletIds, $businessDate)
-            : $this->historicalRows($outletIds, $businessDate);
+        $rows = $exactHistoricalFallback
+            ? $this->exactRows($outletIds, $businessDate)
+            : ($isLive
+                ? $this->liveRows($outletIds, $businessDate)
+                : $this->historicalRows($outletIds, $businessDate));
 
         return $this->groupTopItems($rows, $top);
     }
@@ -37,6 +46,33 @@ class OperationalDailyTopItemsByCategoryService
             ->selectRaw("MAX(product_name) as product_name")
             ->selectRaw('SUM(item_sold) as item_sold')
             ->selectRaw('SUM(gross_sales) as gross_sales')
+            ->get();
+    }
+
+    /**
+     * Exact, read-only one-business-date fallback.
+     *
+     * Uses the same TransactionDate predicate as Cashier Report and therefore
+     * honors Asia/Makassar's 01:00 WITA cutoff without needing hourly materialization.
+     */
+    private function exactRows(array $outletIds, string $businessDate): Collection
+    {
+        $scope = $this->exactSaleScope($outletIds, $businessDate);
+
+        return DB::query()
+            ->fromSub($scope, 'scope_sales')
+            ->join('sale_items as si', 'si.sale_id', '=', 'scope_sales.sale_id')
+            ->leftJoin('products as p', 'p.id', '=', 'si.product_id')
+            ->leftJoin('categories as c', 'c.id', '=', 'p.category_id')
+            ->whereNull('si.voided_at')
+            ->groupBy('p.category_id', 'si.product_id')
+            ->selectRaw("COALESCE(p.category_id, '') as category_id")
+            ->selectRaw("MAX(COALESCE(NULLIF(c.name, ''), 'Uncategorized')) as category_name")
+            ->selectRaw("MAX(COALESCE(NULLIF(si.category_kind_snapshot, ''), '')) as category_kind")
+            ->selectRaw("COALESCE(si.product_id, '') as product_id")
+            ->selectRaw("MAX(COALESCE(NULLIF(si.product_name, ''), '-')) as product_name")
+            ->selectRaw('COALESCE(SUM(si.qty), 0) as item_sold')
+            ->selectRaw('COALESCE(SUM(si.line_total), 0) as gross_sales')
             ->get();
     }
 
@@ -61,6 +97,65 @@ class OperationalDailyTopItemsByCategoryService
             ->selectRaw('COALESCE(SUM(si.qty), 0) as item_sold')
             ->selectRaw('COALESCE(SUM(si.line_total), 0) as gross_sales')
             ->get();
+    }
+
+    private function exactSaleScope(array $outletIds, string $businessDate): Builder
+    {
+        $timezoneMap = DB::table('outlets')
+            ->whereIn('id', $outletIds)
+            ->pluck('timezone', 'id');
+
+        $groups = [];
+        foreach ($outletIds as $outletId) {
+            $timezone = TransactionDate::normalizeTimezone(
+                (string) ($timezoneMap[$outletId] ?? ''),
+                TransactionDate::appTimezone()
+            );
+            $groups[$timezone] ??= [];
+            $groups[$timezone][] = $outletId;
+        }
+
+        $queries = [];
+        foreach ($groups as $timezone => $ids) {
+            $query = DB::table('sales as exact_s')
+                ->whereIn('exact_s.outlet_id', $ids)
+                ->whereNull('exact_s.deleted_at')
+                ->where('exact_s.status', 'PAID');
+
+            TransactionDate::applyExactBusinessDateScope(
+                $query,
+                'exact_s.created_at',
+                $businessDate,
+                $businessDate,
+                $timezone,
+                'exact_s.sale_number',
+            );
+
+            $query
+                ->selectRaw('exact_s.id as sale_id')
+                ->selectRaw('exact_s.outlet_id');
+
+            $queries[] = $query;
+        }
+
+        if ($queries === []) {
+            return DB::table('sales as exact_s')
+                ->selectRaw('exact_s.id as sale_id')
+                ->selectRaw('exact_s.outlet_id')
+                ->whereRaw('1=0');
+        }
+
+        $union = array_shift($queries);
+        foreach ($queries as $query) {
+            $union->unionAll($query);
+        }
+
+        return DB::query()
+            ->fromSub($union, 'exact_scope_sales')
+            ->select([
+                'exact_scope_sales.sale_id',
+                'exact_scope_sales.outlet_id',
+            ]);
     }
 
     private function groupTopItems(Collection $rows, int $top): array

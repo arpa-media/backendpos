@@ -162,6 +162,41 @@ class ReportHourlySummaryService
         return $this->fill24Hours($rows);
     }
 
+    /**
+     * Exact historical fallback for ONE business date only.
+     *
+     * This intentionally does not materialize anything. It reads raw paid sales
+     * through TransactionDate's Cashier-aligned business-date predicate, so an
+     * hourly report remains available while report_hourly_* is warming.
+     */
+    public function exactSalesSeries(array $outletIds, string $businessDate): array
+    {
+        $outletIds = $this->normalizeOutletIds($outletIds);
+        if ($outletIds === []) {
+            return $this->fill24Hours(collect());
+        }
+
+        $scope = $this->exactSaleScope($outletIds, $businessDate);
+        $hourSql = $this->hourSql('scope_sales.business_timezone');
+
+        $hourlySales = DB::query()
+            ->fromSub($scope, 'scope_sales')
+            ->join('sales as s', 's.id', '=', 'scope_sales.sale_id')
+            ->selectRaw("{$hourSql} as business_hour")
+            ->selectRaw('s.grand_total');
+
+        $rows = DB::query()
+            ->fromSub($hourlySales, 'hourly_sales')
+            ->groupBy('hourly_sales.business_hour')
+            ->orderBy('hourly_sales.business_hour')
+            ->selectRaw('hourly_sales.business_hour as business_hour')
+            ->selectRaw('COUNT(*) as trx_count')
+            ->selectRaw('COALESCE(SUM(hourly_sales.grand_total), 0) as gross_amount_sales')
+            ->get();
+
+        return $this->fill24Hours($rows);
+    }
+
     public function liveSalesSeries(array $outletIds, string $businessDate): array
     {
         $outletIds = $this->normalizeOutletIds($outletIds);
@@ -402,6 +437,80 @@ class ReportHourlySummaryService
         if ($payload !== []) {
             DB::table('report_hourly_summary_coverage')->insert($payload);
         }
+    }
+
+    /**
+     * Build a raw-sale scope for exactly one business date, grouped per outlet
+     * timezone. No writes/backfill are performed in this path.
+     */
+    private function exactSaleScope(array $outletIds, string $businessDate): Builder
+    {
+        $outletIds = $this->normalizeOutletIds($outletIds);
+
+        if ($outletIds === []) {
+            return DB::table('sales as exact_s')
+                ->selectRaw('exact_s.id as sale_id')
+                ->selectRaw('exact_s.outlet_id')
+                ->selectRaw('? as business_date', [$businessDate])
+                ->selectRaw('? as business_timezone', [TransactionDate::appTimezone()])
+                ->selectRaw('COALESCE(CAST(exact_s.marking AS SIGNED), 0) as marking')
+                ->whereRaw('1=0');
+        }
+
+        $timezoneMap = DB::table('outlets')
+            ->whereIn('id', $outletIds)
+            ->pluck('timezone', 'id');
+
+        $groups = [];
+        foreach ($outletIds as $outletId) {
+            $timezone = TransactionDate::normalizeTimezone(
+                (string) ($timezoneMap[$outletId] ?? ''),
+                TransactionDate::appTimezone()
+            );
+            $groups[$timezone] ??= [];
+            $groups[$timezone][] = $outletId;
+        }
+
+        $queries = [];
+        foreach ($groups as $timezone => $ids) {
+            $query = DB::table('sales as exact_s')
+                ->whereIn('exact_s.outlet_id', $ids)
+                ->whereNull('exact_s.deleted_at')
+                ->where('exact_s.status', 'PAID');
+
+            TransactionDate::applyExactBusinessDateScope(
+                $query,
+                'exact_s.created_at',
+                $businessDate,
+                $businessDate,
+                $timezone,
+                'exact_s.sale_number',
+            );
+
+            $query
+                ->selectRaw('exact_s.id as sale_id')
+                ->selectRaw('exact_s.outlet_id')
+                ->selectRaw('? as business_date', [$businessDate])
+                ->selectRaw('? as business_timezone', [$timezone])
+                ->selectRaw('COALESCE(CAST(exact_s.marking AS SIGNED), 0) as marking');
+
+            $queries[] = $query;
+        }
+
+        $union = array_shift($queries);
+        foreach ($queries as $query) {
+            $union->unionAll($query);
+        }
+
+        return DB::query()
+            ->fromSub($union, 'exact_scope_sales')
+            ->select([
+                'exact_scope_sales.sale_id',
+                'exact_scope_sales.outlet_id',
+                'exact_scope_sales.business_date',
+                'exact_scope_sales.business_timezone',
+                'exact_scope_sales.marking',
+            ]);
     }
 
     private function scopeSales(array $outletIds, string $businessDate): Builder

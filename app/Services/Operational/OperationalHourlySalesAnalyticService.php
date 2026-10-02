@@ -19,7 +19,8 @@ class OperationalHourlySalesAnalyticService
         $currentDate = TransactionDate::businessTodayDateString($timezone);
         $currentHour = (int) CarbonImmutable::now($timezone)->format('G');
 
-        $baselineStatus = $baselineDate === $currentDate
+        $isCurrentBaseline = $baselineDate === $currentDate;
+        $materializedStatus = $isCurrentBaseline
             ? [
                 'contract' => 'erp_finance_v8_i08_hourly_live',
                 'ready' => true,
@@ -29,13 +30,29 @@ class OperationalHourlySalesAnalyticService
             ]
             : $this->hourlySummaryService->readContractStatus($outletIds, $baselineDate);
 
-        if (! ($baselineStatus['ready'] ?? false)) {
-            return ['ready' => false, 'reporting_source' => $baselineStatus];
+        $useExactHistoricalFallback = ! $isCurrentBaseline && ! ($materializedStatus['ready'] ?? false);
+
+        if ($useExactHistoricalFallback) {
+            $baseline = $this->hourlySummaryService->exactSalesSeries($outletIds, $baselineDate);
+            $reportingSource = array_merge($materializedStatus, [
+                'ready' => true,
+                'materialized_ready' => false,
+                'state' => 'served_by_exact_historical_fallback',
+                'read_mode' => 'live_historical_fallback',
+                'source' => 'sales raw exact one-business-date TransactionDate resolver',
+                'fallback_reason' => 'hourly_materialization_not_ready',
+                'http_backfill' => false,
+            ]);
+        } else {
+            $baseline = $isCurrentBaseline
+                ? $this->hourlySummaryService->liveSalesSeries($outletIds, $baselineDate)
+                : $this->hourlySummaryService->historicalSalesSeries($outletIds, $baselineDate);
+            $reportingSource = array_merge($materializedStatus, [
+                'materialized_ready' => ! $isCurrentBaseline,
+                'read_mode' => $isCurrentBaseline ? 'live_current_business_date' : 'materialized',
+            ]);
         }
 
-        $baseline = $baselineDate === $currentDate
-            ? $this->hourlySummaryService->liveSalesSeries($outletIds, $baselineDate)
-            : $this->hourlySummaryService->historicalSalesSeries($outletIds, $baselineDate);
         $live = $this->hourlySummaryService->liveSalesSeries($outletIds, $currentDate);
         $liveOutlets = $this->hourlySummaryService->liveOutletCurrentHour($outletIds, $currentDate, $currentHour);
 
@@ -92,10 +109,15 @@ class OperationalHourlySalesAnalyticService
             'series' => $series,
             'live_outlets' => $liveOutlets,
             'meta' => [
-                'contract' => 'erp_finance_v8_i08_hourly_comparison',
-                'historical_source' => $baselineDate === $currentDate ? 'live_one_day_query' : 'report_hourly_sales_summaries',
+                'contract' => 'erp_finance_hf04_hourly_comparison_fallback',
+                'historical_source' => $useExactHistoricalFallback
+                    ? 'raw_exact_one_business_date'
+                    : ($isCurrentBaseline ? 'live_one_day_query' : 'report_hourly_sales_summaries'),
                 'live_source' => 'report_sale_business_dates + sales, bounded to current business date',
-                'reporting_source' => $baselineStatus,
+                'reporting_source' => $reportingSource,
+                'hourly_materialized' => ! $useExactHistoricalFallback && ! $isCurrentBaseline,
+                'fallback_active' => $useExactHistoricalFallback,
+                'fallback_scope' => $useExactHistoricalFallback ? 'one_business_date_only' : null,
                 'refresh_hint_seconds' => 60,
                 'spike_rule' => 'live hourly gross amount sales > baseline hourly gross amount sales',
                 'http_backfill' => false,
@@ -110,7 +132,7 @@ class OperationalHourlySalesAnalyticService
         $hour = max(0, min(23, $hour));
         $isLive = $date === $currentDate;
 
-        $status = $isLive
+        $materializedStatus = $isLive
             ? [
                 'contract' => 'erp_finance_v8_i08_hourly_live',
                 'ready' => true,
@@ -120,18 +142,39 @@ class OperationalHourlySalesAnalyticService
             ]
             : $this->hourlySummaryService->readContractStatus($outletIds, $date);
 
-        if (! ($status['ready'] ?? false)) {
-            return ['ready' => false, 'reporting_source' => $status];
-        }
+        $useExactHistoricalFallback = ! $isLive && ! ($materializedStatus['ready'] ?? false);
 
-        $series = $isLive
-            ? $this->hourlySummaryService->liveSalesSeries($outletIds, $date)
-            : $this->hourlySummaryService->historicalSalesSeries($outletIds, $date);
-        // Top Items by Category is intentionally whole-day (00:00-23:59).
-        // Do not aggregate the hourly top-N result: an item can rank outside top-N
-        // per hour and still become a daily top item. Historical reads aggregate the
-        // complete hourly product materialization; current-date reads stay bounded to one day.
-        $categories = $this->dailyTopItemsService->forDate($outletIds, $date, $isLive, 10);
+        if ($useExactHistoricalFallback) {
+            $series = $this->hourlySummaryService->exactSalesSeries($outletIds, $date);
+            $categories = $this->dailyTopItemsService->forDate(
+                $outletIds,
+                $date,
+                false,
+                10,
+                true,
+            );
+            $status = array_merge($materializedStatus, [
+                'ready' => true,
+                'materialized_ready' => false,
+                'state' => 'served_by_exact_historical_fallback',
+                'read_mode' => 'live_historical_fallback',
+                'source' => 'sales + sale_items exact one-business-date TransactionDate resolver',
+                'fallback_reason' => 'hourly_materialization_not_ready',
+                'http_backfill' => false,
+            ]);
+        } else {
+            $series = $isLive
+                ? $this->hourlySummaryService->liveSalesSeries($outletIds, $date)
+                : $this->hourlySummaryService->historicalSalesSeries($outletIds, $date);
+
+            // Top Items by Category is intentionally whole-day (00:00-23:59).
+            $categories = $this->dailyTopItemsService->forDate($outletIds, $date, $isLive, 10);
+
+            $status = array_merge($materializedStatus, [
+                'materialized_ready' => ! $isLive,
+                'read_mode' => $isLive ? 'live_current_business_date' : 'materialized',
+            ]);
+        }
 
         $selected = $series[$hour] ?? ['gross_amount_sales' => 0, 'trx_count' => 0];
         $totalGross = (int) collect($series)->sum('gross_amount_sales');
@@ -160,11 +203,16 @@ class OperationalHourlySalesAnalyticService
             'hourly_gross' => $series,
             'top_items_by_category' => $categories,
             'meta' => [
-                'contract' => 'erp_finance_v8_i08_hourly_summary',
-                'source' => $isLive
-                    ? 'live one-business-date canonical query'
-                    : 'report_hourly_sales_summaries + report_hourly_product_summaries',
+                'contract' => 'erp_finance_hf04_hourly_summary_fallback',
+                'source' => $useExactHistoricalFallback
+                    ? 'raw exact one-business-date sales + sale_items fallback'
+                    : ($isLive
+                        ? 'live one-business-date canonical query'
+                        : 'report_hourly_sales_summaries + report_hourly_product_summaries'),
                 'reporting_source' => $status,
+                'hourly_materialized' => ! $useExactHistoricalFallback && ! $isLive,
+                'fallback_active' => $useExactHistoricalFallback,
+                'fallback_scope' => $useExactHistoricalFallback ? 'one_business_date_only' : null,
                 'top_item_metric' => 'item_sold',
                 'top_items_window' => '00:00-23:59 whole business date',
                 'top_items_limit_per_category' => 10,
