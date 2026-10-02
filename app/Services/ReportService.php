@@ -1544,53 +1544,18 @@ class ReportService
 
     private function resolveCashierReportBusinessToday(?string $timezone = null): string
     {
-        $tz = TransactionDate::normalizeTimezone($timezone, $this->currentTimezone());
-        $now = CarbonImmutable::now($tz);
-
-        if ($this->isMakassarCashierBusinessTimezone($tz)) {
-            return $now->subHour()->toDateString();
-        }
-
-        return $now->toDateString();
+        return TransactionDate::businessTodayDateString(
+            TransactionDate::normalizeTimezone($timezone, $this->currentTimezone())
+        );
     }
 
     private function resolveCashierReportBusinessWindow(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
     {
-        $tz = TransactionDate::normalizeTimezone($timezone, $this->currentTimezone());
-        $today = CarbonImmutable::parse($this->resolveCashierReportBusinessToday($tz), $tz)->startOfDay();
-
-        try {
-            $requestedFrom = $dateFrom ? CarbonImmutable::parse($dateFrom, $tz)->startOfDay() : $today;
-        } catch (\Throwable $e) {
-            $requestedFrom = $today;
-        }
-
-        try {
-            $requestedTo = $dateTo ? CarbonImmutable::parse($dateTo, $tz)->startOfDay() : $today;
-        } catch (\Throwable $e) {
-            $requestedTo = $today;
-        }
-
-        if ($requestedTo->lessThan($requestedFrom)) {
-            [$requestedFrom, $requestedTo] = [$requestedTo, $requestedFrom];
-        }
-
-        if ($this->isMakassarCashierBusinessTimezone($tz)) {
-            $fromLocal = $requestedFrom->addHour();
-            $toExclusiveLocal = $requestedTo->addDay()->addHour();
-        } else {
-            $fromLocal = $requestedFrom->startOfDay();
-            $toExclusiveLocal = $requestedTo->addDay()->startOfDay();
-        }
-
-        return [
-            'timezone' => $tz,
-            'requested_from' => $requestedFrom,
-            'requested_to' => $requestedTo,
-            'from_local' => $fromLocal,
-            'to_exclusive_local' => $toExclusiveLocal,
-            'to_inclusive_local' => $toExclusiveLocal->subSecond(),
-        ];
+        return TransactionDate::businessDateWindow(
+            $dateFrom,
+            $dateTo,
+            TransactionDate::normalizeTimezone($timezone, $this->currentTimezone())
+        );
     }
 
     private function saleLocalMomentForCashierWindow(Sale $sale, ?string $timezone = null): ?CarbonImmutable

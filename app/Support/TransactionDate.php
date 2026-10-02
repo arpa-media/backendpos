@@ -226,6 +226,28 @@ class TransactionDate
         return $dt->toIso8601String();
     }
 
+    public static function businessDateForSale($value, ?string $timezone = null, ?string $saleNumber = null): ?string
+    {
+        $tz = self::normalizeTimezone($timezone, self::appTimezone());
+        $localText = self::formatSaleLocal($value, $tz, $saleNumber);
+        if (! $localText) {
+            return null;
+        }
+
+        try {
+            $moment = CarbonImmutable::parse($localText, $tz);
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        $startHour = self::businessDayStartHour($tz);
+        if ($startHour > 0) {
+            $moment = $moment->subHours($startHour);
+        }
+
+        return $moment->toDateString();
+    }
+
     public static function timezoneUtcOffsetHours(?string $timezone = null): int
     {
         return match (self::normalizeTimezone($timezone, self::appTimezone())) {
@@ -237,10 +259,23 @@ class TransactionDate
 
     public static function saleNumberTokenSqlExpression(string $saleNumberColumn): string
     {
-        // Sale numbers use patterns such as S.KTA-20260925-RD4K-001.
-        // Extract the token immediately after the first hyphen, not the penultimate segment.
-        // The previous -2 extraction returned RD4K and made SQL/PHP date resolution diverge.
-        return "CASE WHEN {$saleNumberColumn} REGEXP '-[0-9]{8}-' THEN SUBSTRING_INDEX(SUBSTRING_INDEX({$saleNumberColumn}, '-', 2), '-', -1) ELSE NULL END";
+        // Mirror saleNumberDateToken() without assuming the date is immediately
+        // after the first hyphen. This stays compatible with MySQL/MariaDB string
+        // functions and accepts a valid -YYYYMMDD- token in any normal sale-number
+        // segment while still requiring a following alphanumeric segment.
+        $hyphenCount = "(LENGTH({$saleNumberColumn}) - LENGTH(REPLACE({$saleNumberColumn}, '-', '')))";
+        $cases = [];
+
+        // POS sale numbers are short; 16 segments gives generous headroom while
+        // avoiding REGEXP_SUBSTR/REGEXP_REPLACE version dependencies.
+        for ($position = 2; $position <= 16; $position++) {
+            $token = "SUBSTRING_INDEX(SUBSTRING_INDEX({$saleNumberColumn}, '-', {$position}), '-', -1)";
+            $nextPosition = $position + 1;
+            $next = "SUBSTRING_INDEX(SUBSTRING_INDEX({$saleNumberColumn}, '-', {$nextPosition}), '-', -1)";
+            $cases[] = "WHEN {$hyphenCount} >= {$position} AND {$token} REGEXP '^[0-9]{8}$' AND {$next} REGEXP '^[A-Z0-9]{2,}$' THEN {$token}";
+        }
+
+        return 'CASE '.implode(' ', $cases).' ELSE NULL END';
     }
 
     public static function resolvedSaleLocalSqlExpression(string $createdAtColumn, ?string $saleNumberColumn = null, ?string $timezone = null): string
@@ -260,7 +295,7 @@ class TransactionDate
 
         return implode(' ', [
             'CASE',
-            "WHEN ({$saleNumberColumn} IS NULL OR {$saleNumberColumn} NOT REGEXP '-[0-9]{8}-') THEN {$utcLocalExpr}",
+            "WHEN ({$tokenExpr} IS NULL) THEN {$utcLocalExpr}",
             "WHEN {$utcTokenExpr} = {$tokenExpr} AND {$localTokenExpr} <> {$tokenExpr} THEN {$utcLocalExpr}",
             "WHEN {$localTokenExpr} = {$tokenExpr} AND {$utcTokenExpr} <> {$tokenExpr} THEN {$createdAtColumn}",
             "ELSE {$utcLocalExpr}",

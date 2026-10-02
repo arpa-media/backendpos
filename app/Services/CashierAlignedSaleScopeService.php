@@ -120,7 +120,7 @@ class CashierAlignedSaleScopeService
             return $this->emptyCoveredSaleIdSubquery();
         }
 
-        return $this->businessDateIndex->saleIdsCoveredSubquery(
+        return $this->businessDateIndex->saleIdsCashierReadableSubquery(
             $normalizedOutletIds,
             $dateFrom,
             $dateTo,
@@ -207,53 +207,18 @@ class CashierAlignedSaleScopeService
 
     private function resolveCashierBusinessToday(?string $timezone = null): string
     {
-        $tz = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
-        $now = CarbonImmutable::now($tz);
-
-        if ($this->isMakassarCashierBusinessTimezone($tz)) {
-            return $now->subHour()->toDateString();
-        }
-
-        return $now->toDateString();
+        return TransactionDate::businessTodayDateString(
+            TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone())
+        );
     }
 
     private function resolveCashierBusinessWindow(?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
     {
-        $tz = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
-        $today = CarbonImmutable::parse($this->resolveCashierBusinessToday($tz), $tz)->startOfDay();
-
-        try {
-            $requestedFrom = $dateFrom ? CarbonImmutable::parse($dateFrom, $tz)->startOfDay() : $today;
-        } catch (\Throwable $e) {
-            $requestedFrom = $today;
-        }
-
-        try {
-            $requestedTo = $dateTo ? CarbonImmutable::parse($dateTo, $tz)->startOfDay() : $today;
-        } catch (\Throwable $e) {
-            $requestedTo = $today;
-        }
-
-        if ($requestedTo->lessThan($requestedFrom)) {
-            [$requestedFrom, $requestedTo] = [$requestedTo, $requestedFrom];
-        }
-
-        if ($this->isMakassarCashierBusinessTimezone($tz)) {
-            $fromLocal = $requestedFrom->addHour();
-            $toExclusiveLocal = $requestedTo->addDay()->addHour();
-        } else {
-            $fromLocal = $requestedFrom->startOfDay();
-            $toExclusiveLocal = $requestedTo->addDay()->startOfDay();
-        }
-
-        return [
-            'timezone' => $tz,
-            'requested_from' => $requestedFrom,
-            'requested_to' => $requestedTo,
-            'from_local' => $fromLocal,
-            'to_exclusive_local' => $toExclusiveLocal,
-            'to_inclusive_local' => $toExclusiveLocal->subSecond(),
-        ];
+        return TransactionDate::businessDateWindow(
+            $dateFrom,
+            $dateTo,
+            TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone())
+        );
     }
 
     private function saleFallsWithinCashierBusinessWindow($createdAt, ?string $saleNumber, CarbonImmutable $fromLocal, CarbonImmutable $toExclusiveLocal, ?string $timezone = null): bool

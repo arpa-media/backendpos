@@ -6,6 +6,7 @@ use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class ReportSaleBusinessDateIndexService
 {
@@ -212,6 +213,134 @@ class ReportSaleBusinessDateIndexService
         }
 
         return array_values($stats);
+    }
+
+    /**
+     * Keep the canonical Cashier membership index current synchronously for one sale.
+     *
+     * This is intentionally lightweight: it does NOT rebuild Daily summaries.
+     * Checkout/mutation can therefore make Cashier Report exact immediately while
+     * Daily/Hourly/Monthly continue through the reporting queue.
+     */
+    public function upsertSaleIndex(\App\Models\Sale|string $saleOrId): ?array
+    {
+        $saleId = $saleOrId instanceof \App\Models\Sale
+            ? trim((string) $saleOrId->id)
+            : trim((string) $saleOrId);
+
+        if ($saleId === '') {
+            return null;
+        }
+
+        $row = DB::table('sales as s')
+            ->leftJoin('outlets as o', 'o.id', '=', 's.outlet_id')
+            ->where('s.id', $saleId)
+            ->select([
+                's.id',
+                's.outlet_id',
+                's.sale_number',
+                's.created_at',
+                's.status',
+                's.deleted_at',
+                's.marking',
+                'o.timezone as outlet_timezone',
+            ])
+            ->first();
+
+        if (! $row) {
+            DB::table('report_sale_business_dates')->where('sale_id', $saleId)->delete();
+            return null;
+        }
+
+        if ((string) ($row->status ?? '') !== 'PAID' || ! is_null($row->deleted_at ?? null)) {
+            DB::table('report_sale_business_dates')->where('sale_id', $saleId)->delete();
+            return null;
+        }
+
+        $outletId = trim((string) ($row->outlet_id ?? ''));
+        if ($outletId === '') {
+            return null;
+        }
+
+        $timezone = TransactionDate::normalizeTimezone(
+            (string) ($row->outlet_timezone ?? ''),
+            TransactionDate::appTimezone()
+        );
+        $businessDate = $this->resolveExactBusinessDate(
+            $row->created_at ?? null,
+            isset($row->sale_number) ? (string) $row->sale_number : null,
+            $timezone
+        );
+
+        if (! $businessDate) {
+            return null;
+        }
+
+        $timestamp = now()->format('Y-m-d H:i:s');
+        DB::table('report_sale_business_dates')->updateOrInsert(
+            ['sale_id' => $saleId],
+            [
+                'outlet_id' => $outletId,
+                'business_timezone' => $timezone,
+                'business_date' => $businessDate,
+                'marking' => (int) ($row->marking ?? 0),
+                'updated_at' => $timestamp,
+                'created_at' => $timestamp,
+            ]
+        );
+
+        return [
+            'sale_id' => $saleId,
+            'outlet_id' => $outletId,
+            'business_timezone' => $timezone,
+            'business_date' => $businessDate,
+        ];
+    }
+
+    /**
+     * Cashier Report only needs membership in report_sale_business_dates.
+     * A pending Daily-summary refresh must not force the expensive exact raw-day
+     * fallback after every checkout, provided canonical base coverage exists and
+     * is not a future/pre-seeded false-ready row.
+     */
+    public function saleIdsCashierReadableSubquery(array $outletIds, ?string $dateFrom, ?string $dateTo, bool $markedOnly = false, ?string $fallbackTimezone = null): ?Builder
+    {
+        $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        sort($normalizedOutletIds);
+
+        if ($normalizedOutletIds === []) {
+            return $this->emptySaleIdSubquery();
+        }
+
+        $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
+        $groupedOutletIds = [];
+        foreach ($normalizedOutletIds as $outletId) {
+            $timezone = $timezoneMap[$outletId] ?? TransactionDate::normalizeTimezone($fallbackTimezone, TransactionDate::appTimezone());
+            $groupedOutletIds[$timezone] ??= [];
+            $groupedOutletIds[$timezone][] = $outletId;
+        }
+
+        $queries = [];
+        foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
+            [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $timezone);
+            if (! $this->hasCashierReadableCoverage($tzOutletIds, $fromDate, $toDate, $timezone)) {
+                return null;
+            }
+
+            $query = DB::table('report_sale_business_dates as rsbd')
+                ->selectRaw('rsbd.sale_id as id')
+                ->whereIn('rsbd.outlet_id', $tzOutletIds)
+                ->where('rsbd.business_timezone', '=', $timezone)
+                ->whereBetween('rsbd.business_date', [$fromDate, $toDate]);
+
+            if ($markedOnly) {
+                $query->whereRaw('COALESCE(CAST(rsbd.marking AS SIGNED), 0) = 1');
+            }
+
+            $queries[] = $query;
+        }
+
+        return $this->unionSaleIdQueries($queries);
     }
 
     public function saleIdsIfCovered(array $outletIds, ?string $dateFrom, ?string $dateTo, bool $markedOnly = false, ?string $fallbackTimezone = null): ?array
@@ -435,7 +564,7 @@ class ReportSaleBusinessDateIndexService
     private function refreshWindows(array $outletIds, string $fromDate, string $toDate, string $timezone): array
     {
         $rows = DB::table('report_sale_business_date_coverage')
-            ->selectRaw('business_date, COUNT(DISTINCT outlet_id) as outlet_count, MAX(synced_at) as last_synced_at')
+            ->selectRaw('business_date, COUNT(DISTINCT outlet_id) as outlet_count, MIN(synced_at) as first_synced_at, MAX(synced_at) as last_synced_at')
             ->whereIn('outlet_id', $outletIds)
             ->where('business_timezone', '=', $timezone)
             ->whereBetween('business_date', [$fromDate, $toDate])
@@ -445,6 +574,18 @@ class ReportSaleBusinessDateIndexService
 
         $requiredOutletCount = count($outletIds);
         $datesNeedingRefresh = [];
+        $pendingRefreshDates = [];
+
+        if (Schema::hasTable('report_daily_summary_refresh_queue')) {
+            $pendingRefreshDates = DB::table('report_daily_summary_refresh_queue')
+                ->whereIn('outlet_id', $outletIds)
+                ->whereBetween('business_date', [$fromDate, $toDate])
+                ->whereIn('status', ['pending', 'processing'])
+                ->distinct()
+                ->pluck('business_date')
+                ->mapWithKeys(fn ($date) => [(string) $date => true])
+                ->all();
+        }
         $refreshThreshold = now()->subMinutes(20);
         $hotDates = $this->hotBusinessDates($timezone);
 
@@ -452,6 +593,20 @@ class ReportSaleBusinessDateIndexService
             $date = $cursor->toDateString();
             $row = $rows->get($date);
             if (! $row || (int) ($row->outlet_count ?? 0) < $requiredOutletCount) {
+                $datesNeedingRefresh[] = $date;
+                continue;
+            }
+
+            // Coverage created before the business date even started can never be
+            // a final historical snapshot (the KTA 25-Sep false-ready case).
+            if ($this->coverageWasPremature($row->first_synced_at ?? null, $date, $timezone)) {
+                $datesNeedingRefresh[] = $date;
+                continue;
+            }
+
+            // A checkout/void refresh request invalidates canonical coverage even
+            // when the coverage row itself still says READY.
+            if (isset($pendingRefreshDates[$date])) {
                 $datesNeedingRefresh[] = $date;
                 continue;
             }
@@ -502,6 +657,65 @@ class ReportSaleBusinessDateIndexService
         return $windows;
     }
 
+    private function hasCashierReadableCoverage(array $outletIds, string $fromDate, string $toDate, string $timezone): bool
+    {
+        $outletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        if ($outletIds === []) {
+            return false;
+        }
+
+        $rows = DB::table('report_sale_business_date_coverage')
+            ->whereIn('outlet_id', $outletIds)
+            ->where('business_timezone', '=', $timezone)
+            ->whereBetween('business_date', [$fromDate, $toDate])
+            ->get(['outlet_id', 'business_date', 'synced_at']);
+
+        $coverage = [];
+        foreach ($rows as $row) {
+            $key = (string) ($row->outlet_id ?? '').'#'.(string) ($row->business_date ?? '');
+            $coverage[$key] = $row;
+        }
+
+        $cursor = CarbonImmutable::parse($fromDate, $timezone);
+        $end = CarbonImmutable::parse($toDate, $timezone);
+        while ($cursor->lessThanOrEqualTo($end)) {
+            $date = $cursor->toDateString();
+            foreach ($outletIds as $outletId) {
+                $row = $coverage[$outletId.'#'.$date] ?? null;
+                if (! $row) {
+                    return false;
+                }
+
+                if ($this->coverageWasPremature($row->synced_at ?? null, $date, $timezone)) {
+                    return false;
+                }
+            }
+            $cursor = $cursor->addDay();
+        }
+
+        return true;
+    }
+
+    private function coverageWasPremature($syncedAt, string $businessDate, string $timezone): bool
+    {
+        $raw = trim((string) ($syncedAt ?? ''));
+        if ($raw === '') {
+            return true;
+        }
+
+        try {
+            $synced = CarbonImmutable::parse($raw, config('app.timezone', 'UTC'))
+                ->setTimezone(TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone()));
+            $businessStart = CarbonImmutable::parse($businessDate, $timezone)
+                ->startOfDay()
+                ->addHours(TransactionDate::businessDayStartHour($timezone));
+
+            return $synced->lessThan($businessStart);
+        } catch (\Throwable) {
+            return true;
+        }
+    }
+
     private function hasFreshCoverage(array $outletIds, string $fromDate, string $toDate, string $timezone): bool
     {
         return $this->refreshWindows($outletIds, $fromDate, $toDate, $timezone) === [];
@@ -519,24 +733,7 @@ class ReportSaleBusinessDateIndexService
 
     private function resolveExactBusinessDate($createdAt, ?string $saleNumber, ?string $timezone = null): ?string
     {
-        $tz = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
-        $localText = TransactionDate::formatSaleLocal($createdAt, $tz, $saleNumber);
-        if (! $localText) {
-            return null;
-        }
-
-        try {
-            $moment = CarbonImmutable::parse($localText, $tz);
-        } catch (\Throwable $e) {
-            return null;
-        }
-
-        $startHour = TransactionDate::businessDayStartHour($tz);
-        if ($startHour > 0) {
-            $moment = $moment->subHours($startHour);
-        }
-
-        return $moment->toDateString();
+        return TransactionDate::businessDateForSale($createdAt, $timezone, $saleNumber);
     }
 
     private function resolveTimezoneMap(array $outletIds, ?string $fallbackTimezone = null): array

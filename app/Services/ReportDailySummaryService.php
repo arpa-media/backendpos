@@ -21,6 +21,9 @@ class ReportDailySummaryService
     private const HOT_COVERAGE_READY_TTL_SECONDS = 45;
     private const COVERAGE_LOCK_SECONDS = 120;
 
+    /** @var array<string,array> */
+    private array $coverageAnomalyCache = [];
+
     public function __construct(
         private readonly ReportSaleBusinessDateIndexService $businessDateIndex,
         private readonly ReportHybridReadPlanner $hybridReadPlanner,
@@ -60,7 +63,7 @@ class ReportDailySummaryService
             ]);
 
             $rows = DB::table('report_daily_summary_coverage')
-                ->selectRaw('business_date, COUNT(DISTINCT outlet_id) as outlet_count, MAX(synced_at) as last_synced_at')
+                ->selectRaw('business_date, COUNT(DISTINCT outlet_id) as outlet_count, MIN(synced_at) as first_synced_at, MAX(synced_at) as last_synced_at')
                 ->whereIn('outlet_id', $normalizedOutletIds)
                 ->whereBetween('business_date', [$fromDate, $toDate])
                 ->groupBy('business_date')
@@ -68,6 +71,18 @@ class ReportDailySummaryService
                 ->keyBy(fn ($row) => (string) ($row->business_date ?? ''));
 
             $requiredOutletCount = count($normalizedOutletIds);
+            $pendingRefreshDates = [];
+            if (Schema::hasTable('report_daily_summary_refresh_queue')) {
+                $pendingRefreshDates = DB::table('report_daily_summary_refresh_queue')
+                    ->whereIn('outlet_id', $normalizedOutletIds)
+                    ->whereBetween('business_date', [$fromDate, $toDate])
+                    ->whereIn('status', ['pending', 'processing'])
+                    ->distinct()
+                    ->pluck('business_date')
+                    ->mapWithKeys(fn ($date) => [(string) $date => true])
+                    ->all();
+            }
+
             $refreshThreshold = now()->subMinutes(self::HOT_REFRESH_MINUTES);
             $hotDates = [$toDate];
             if ($fromDate < $toDate) {
@@ -81,6 +96,16 @@ class ReportDailySummaryService
                 $row = $rows->get($businessDate);
 
                 if (! $row || (int) ($row->outlet_count ?? 0) < $requiredOutletCount) {
+                    $datesNeedingRefresh[] = $businessDate;
+                    continue;
+                }
+
+                if ($this->coverageWasPremature($row->first_synced_at ?? null, $businessDate, $fallbackTimezone)) {
+                    $datesNeedingRefresh[] = $businessDate;
+                    continue;
+                }
+
+                if (isset($pendingRefreshDates[$businessDate])) {
                     $datesNeedingRefresh[] = $businessDate;
                     continue;
                 }
@@ -216,6 +241,117 @@ class ReportDailySummaryService
      * IMPORTANT: this method never builds/backfills coverage. It only reports whether
      * the requested outlet/date matrix has already been materialized by CLI/scheduler.
      */
+    /**
+     * Read-only integrity signal for report consumers.
+     *
+     * Dirty means at least one outlet-date is missing, was pre-seeded before the
+     * business date started, or has an outstanding checkout/void refresh request.
+     * No backfill is performed here.
+     */
+    public function coverageAnomalies(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
+    {
+        $normalizedOutletIds = $this->normalizeOutletIds($outletIds);
+        sort($normalizedOutletIds);
+
+        $fallbackTimezone = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
+        [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $fallbackTimezone);
+        $cacheKey = sha1(json_encode([$normalizedOutletIds, $fromDate, $toDate, $fallbackTimezone]));
+
+        if (isset($this->coverageAnomalyCache[$cacheKey])) {
+            return $this->coverageAnomalyCache[$cacheKey];
+        }
+
+        $dates = [];
+        for ($cursor = CarbonImmutable::parse($fromDate, $fallbackTimezone); $cursor->lessThanOrEqualTo(CarbonImmutable::parse($toDate, $fallbackTimezone)); $cursor = $cursor->addDay()) {
+            $dates[] = $cursor->toDateString();
+        }
+
+        $base = [
+            'date_from' => $fromDate,
+            'date_to' => $toDate,
+            'dirty_dates' => [],
+            'missing_dates' => [],
+            'premature_dates' => [],
+            'pending_dates' => [],
+        ];
+
+        if ($normalizedOutletIds === [] || $dates === []) {
+            return $this->coverageAnomalyCache[$cacheKey] = $base;
+        }
+
+        if (! Schema::hasTable('report_daily_summary_coverage')) {
+            $base['dirty_dates'] = $dates;
+            $base['missing_dates'] = $dates;
+            return $this->coverageAnomalyCache[$cacheKey] = $base;
+        }
+
+        $coverage = DB::table('report_daily_summary_coverage')
+            ->whereIn('outlet_id', $normalizedOutletIds)
+            ->whereBetween('business_date', [$fromDate, $toDate])
+            ->selectRaw('business_date, COUNT(DISTINCT outlet_id) as outlet_count, MIN(synced_at) as first_synced_at')
+            ->groupBy('business_date')
+            ->get()
+            ->keyBy(fn ($row) => (string) ($row->business_date ?? ''));
+
+        $pending = [];
+        if (Schema::hasTable('report_daily_summary_refresh_queue')) {
+            $pending = DB::table('report_daily_summary_refresh_queue')
+                ->whereIn('outlet_id', $normalizedOutletIds)
+                ->whereBetween('business_date', [$fromDate, $toDate])
+                ->whereIn('status', ['pending', 'processing'])
+                ->distinct()
+                ->pluck('business_date')
+                ->mapWithKeys(fn ($date) => [(string) $date => true])
+                ->all();
+        }
+
+        $requiredOutlets = count($normalizedOutletIds);
+        foreach ($dates as $date) {
+            $row = $coverage->get($date);
+            if (! $row || (int) ($row->outlet_count ?? 0) < $requiredOutlets) {
+                $base['missing_dates'][] = $date;
+            }
+
+            if ($row && $this->coverageWasPremature($row->first_synced_at ?? null, $date, $fallbackTimezone)) {
+                $base['premature_dates'][] = $date;
+            }
+
+            if (isset($pending[$date])) {
+                $base['pending_dates'][] = $date;
+            }
+        }
+
+        $base['dirty_dates'] = array_values(array_unique(array_merge(
+            $base['missing_dates'],
+            $base['premature_dates'],
+            $base['pending_dates'],
+        )));
+        sort($base['dirty_dates']);
+
+        return $this->coverageAnomalyCache[$cacheKey] = $base;
+    }
+
+    private function coverageWasPremature($syncedAt, string $businessDate, string $timezone): bool
+    {
+        $raw = trim((string) ($syncedAt ?? ''));
+        if ($raw === '') {
+            return true;
+        }
+
+        $timezone = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
+
+        try {
+            $synced = CarbonImmutable::parse($raw, config('app.timezone', 'UTC'))->setTimezone($timezone);
+            $businessStart = CarbonImmutable::parse($businessDate, $timezone)
+                ->startOfDay()
+                ->addHours(TransactionDate::businessDayStartHour($timezone));
+
+            return $synced->lessThan($businessStart);
+        } catch (\Throwable) {
+            return true;
+        }
+    }
+
     public function readContractStatus(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): array
     {
         $normalizedOutletIds = $this->normalizeOutletIds($outletIds);
@@ -281,6 +417,8 @@ class ReportDailySummaryService
                 ->count();
         }
 
+        $anomalies = $this->coverageAnomalies($normalizedOutletIds, $fromDate, $toDate, $fallbackTimezone);
+
         return array_merge($base, [
             'covered_rows' => $coveredRows,
             'missing_rows' => $missingRows,
@@ -288,6 +426,10 @@ class ReportDailySummaryService
             'oldest_synced_at' => $coverage->oldest_synced_at ?? null,
             'latest_synced_at' => $coverage->latest_synced_at ?? null,
             'pending_refresh_rows' => $pendingRefreshRows,
+            'dirty_business_dates' => $anomalies['dirty_dates'],
+            'missing_business_dates' => $anomalies['missing_dates'],
+            'premature_coverage_dates' => $anomalies['premature_dates'],
+            'pending_business_dates' => $anomalies['pending_dates'],
             'ready' => $ready,
             'state' => $ready ? ($pendingRefreshRows > 0 ? 'ready_refresh_pending' : 'ready') : 'warming_required',
         ]);

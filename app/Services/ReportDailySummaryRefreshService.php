@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Sale;
 use App\Support\AnalyticsResponseCache;
+use App\Support\CashierReportCacheVersion;
 use App\Support\TransactionDate;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Collection;
@@ -24,6 +25,14 @@ class ReportDailySummaryRefreshService
         $saleId = $saleOrId instanceof Sale ? (string) $saleOrId->id : trim((string) $saleOrId);
         if ($saleId === '') {
             return;
+        }
+
+        // Keep Cashier Report membership current immediately. Daily summaries stay
+        // asynchronous; this upsert touches only one canonical sale row.
+        try {
+            $this->businessDateIndex->upsertSaleIndex($saleOrId);
+        } catch (\Throwable) {
+            // Queue marking below remains the recovery path.
         }
 
         $row = DB::table('sales as s')
@@ -100,6 +109,7 @@ class ReportDailySummaryRefreshService
                     'touch_count' => DB::raw('touch_count + 1'),
                 ]);
 
+            $this->bumpCashierVersion($outletId, $businessDate);
             return;
         }
 
@@ -118,6 +128,17 @@ class ReportDailySummaryRefreshService
             'created_at' => $timestamp,
             'updated_at' => $timestamp,
         ]);
+
+        $this->bumpCashierVersion($outletId, $businessDate);
+    }
+
+    private function bumpCashierVersion(string $outletId, string $businessDate): void
+    {
+        try {
+            CashierReportCacheVersion::bump($outletId, $businessDate);
+        } catch (\Throwable) {
+            // Cashier cache is an acceleration layer only.
+        }
     }
 
     public function markOutletRecentCoverage(string $outletId, int $days = self::DEFAULT_RECENT_DAYS, string $reason = 'bulk_mutation'): int

@@ -59,7 +59,7 @@ class AnalyticsResponseCache
     {
         $mode = strtolower(trim((string) ($reportingSource['read_mode'] ?? 'materialized')));
 
-        return in_array($mode, ['live', 'hybrid', 'live_fallback', 'hybrid_fallback', 'live_detail'], true)
+        return in_array($mode, ['live', 'hybrid', 'live_fallback', 'hybrid_fallback', 'live_recovery', 'hybrid_recovery', 'live_detail'], true)
             ? self::HOT_WINDOW_TTL_SECONDS
             : self::HISTORICAL_REPORT_TTL_SECONDS;
     }

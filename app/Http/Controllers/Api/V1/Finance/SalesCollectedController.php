@@ -8,6 +8,7 @@ use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Models\Sale;
 use App\Services\ReportDailySummaryService;
+use App\Services\Reporting\ReportHotWindowReadService;
 use App\Support\FinanceOutletFilter;
 use App\Support\AnalyticsResponseCache;
 use App\Support\DeliveryNoTaxReadModel;
@@ -15,7 +16,6 @@ use App\Support\TransactionDate;
 use Throwable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Pagination\LengthAwarePaginator;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 class SalesCollectedController extends Controller
@@ -23,6 +23,7 @@ class SalesCollectedController extends Controller
 
     public function __construct(
         private readonly ReportDailySummaryService $dailySummaryService,
+        private readonly ReportHotWindowReadService $hotWindowReadService,
     ) {
     }
 
@@ -366,7 +367,7 @@ class SalesCollectedController extends Controller
                 'items_loaded' => $includeItems,
                 'filter_options_loaded' => $includeFilterOptions,
                 'performance_notes' => [
-                    'range_scope' => 'report_sale_business_dates_direct',
+                    'range_scope' => 'canonical_business_date_materialized_clean + exact_cashier_dirty_date_fallback',
                     'summary_source' => $this->canUseMaterializedSummary($v) && $this->hasCompleteDailySummaryCoverage($outletIds, $v, $timezone)
                         ? 'report_daily_sales_summaries'
                         : 'canonical_filtered_sales',
@@ -444,15 +445,18 @@ class SalesCollectedController extends Controller
             $timezone
         );
 
-        $query = DB::table('report_sale_business_dates as rsbd')
-            ->join('sales as s', 's.id', '=', 'rsbd.sale_id')
-            ->whereBetween('rsbd.business_date', [
-                $window['requested_from']->format('Y-m-d'),
-                $window['requested_to']->format('Y-m-d'),
-            ])
+        $scope = $this->hotWindowReadService->saleScopeQuery(
+            $outletIds,
+            $window['requested_from']->format('Y-m-d'),
+            $window['requested_to']->format('Y-m-d'),
+            $timezone,
+        );
+
+        $query = DB::query()
+            ->fromSub($scope, 'canonical_scope')
+            ->join('sales as s', 's.id', '=', 'canonical_scope.sale_id')
             ->whereNull('s.deleted_at')
-            ->where('s.status', 'PAID')
-            ->when(!empty($outletIds), fn ($q) => $q->whereIn('rsbd.outlet_id', $outletIds));
+            ->where('s.status', 'PAID');
 
         $this->applySaleNumberFilter($query, (string) ($filters['q'] ?? ''));
 
@@ -475,23 +479,15 @@ class SalesCollectedController extends Controller
         }
 
         $window = $this->resolveLocalDateRange($filters['date_from'] ?? null, $filters['date_to'] ?? null, $timezone);
-        $from = $window['requested_from'];
-        $to = $window['requested_to'];
-        $expectedRows = count($outletIds) * ($from->diffInDays($to) + 1);
+        $from = $window['requested_from']->format('Y-m-d');
+        $to = $window['requested_to']->format('Y-m-d');
 
-        sort($outletIds);
-        $cacheKey = 'sales-collected:daily-coverage-ready:v8i02:' . sha1(json_encode([
-            'outlets' => $outletIds,
-            'date_from' => $from->format('Y-m-d'),
-            'date_to' => $to->format('Y-m-d'),
-        ], JSON_UNESCAPED_SLASHES));
+        $status = $this->dailySummaryService->readContractStatus($outletIds, $from, $to, $timezone);
+        $anomalies = $this->dailySummaryService->coverageAnomalies($outletIds, $from, $to, $timezone);
 
-        return (bool) Cache::remember($cacheKey, now()->addSeconds(60), function () use ($outletIds, $from, $to, $expectedRows) {
-            return DB::table('report_daily_summary_coverage')
-                ->whereIn('outlet_id', $outletIds)
-                ->whereBetween('business_date', [$from->format('Y-m-d'), $to->format('Y-m-d')])
-                ->count() >= $expectedRows;
-        });
+        return (bool) ($status['ready'] ?? false)
+            && (int) ($status['pending_refresh_rows'] ?? 0) === 0
+            && empty($anomalies['dirty_dates']);
     }
 
     private function canUseMaterializedSummary(array $filters): bool

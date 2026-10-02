@@ -13,9 +13,13 @@ class ReportHotWindowReadService
 {
     public const HOT_WINDOW_DAYS = 5;
     public const MATERIALIZED_FIRST_DAYS = 5;
+    public const MAX_CANONICAL_RECOVERY_DAYS = 7;
 
     /** @var array<string,array> */
     private array $effectivePlanCache = [];
+
+    /** @var array<string,array> */
+    private array $resolvedReadWindowsCache = [];
 
     private const SPECS = [
         'sales' => ['alias' => 'rdss', 'columns' => [
@@ -76,10 +80,14 @@ class ReportHotWindowReadService
         $timezone = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
         [$fromDate, $toDate] = $this->normalizeRange($dateFrom, $dateTo, $timezone);
         $plan = $this->effectivePlan($outletIds, $fromDate, $toDate, $timezone);
+        $resolvedWindows = $this->resolvedReadWindows($outletIds, $fromDate, $toDate, $timezone);
 
         $requestedDays = CarbonImmutable::parse($fromDate, $timezone)->diffInDays(CarbonImmutable::parse($toDate, $timezone)) + 1;
         $requestedRows = count($outletIds) * $requestedDays;
-        $liveDays = (int) ($plan['live_days'] ?? 0);
+        $liveDays = 0;
+        foreach ($resolvedWindows['live'] as [$liveFrom, $liveTo]) {
+            $liveDays += CarbonImmutable::parse($liveFrom, $timezone)->diffInDays(CarbonImmutable::parse($liveTo, $timezone)) + 1;
+        }
         $liveRows = count($outletIds) * $liveDays;
 
         $materializedStatus = null;
@@ -96,18 +104,32 @@ class ReportHotWindowReadService
         $materializedCoveredRows = (int) ($materializedStatus['covered_rows'] ?? 0);
         $materializedMissingRows = (int) ($materializedStatus['missing_rows'] ?? 0);
         $materializedGateReady = $materializedStatus === null || (bool) ($materializedStatus['ready'] ?? false);
-        $readyRows = min($requestedRows, $liveRows + $materializedCoveredRows);
+
+        $recoveryActive = (bool) ($resolvedWindows['recovery_active'] ?? false);
+        $unrecoverableDirtyDates = array_values($resolvedWindows['unrecoverable_dirty_dates'] ?? []);
+        $contractReady = $unrecoverableDirtyDates === [] && ($materializedGateReady || $recoveryActive);
+
+        $readyRows = $contractReady
+            ? $requestedRows
+            : min($requestedRows, $liveRows + $materializedCoveredRows);
         $missingRows = max(0, $requestedRows - $readyRows);
         $coveragePercent = $requestedRows > 0 ? round(($readyRows / $requestedRows) * 100, 2) : 100.0;
 
-        $mode = (string) ($plan['mode'] ?? 'materialized');
-        $state = ! $materializedGateReady
-            ? 'warming_required'
-            : match ($mode) {
-                'live_fallback' => 'live_fallback_materialized_not_ready',
-                'hybrid_fallback' => 'hybrid_fallback_materialized_not_ready',
-                default => (string) ($materializedStatus['state'] ?? 'ready'),
-            };
+        $mode = $recoveryActive
+            ? (! empty($resolvedWindows['materialized']) ? 'hybrid_recovery' : 'live_recovery')
+            : (string) ($plan['mode'] ?? 'materialized');
+
+        $state = $unrecoverableDirtyDates !== []
+            ? 'warming_required_dirty_range'
+            : ($recoveryActive
+                ? 'canonical_dirty_date_live_fallback'
+                : (! $materializedGateReady
+                    ? 'warming_required'
+                    : match ($mode) {
+                        'live_fallback' => 'live_fallback_materialized_not_ready',
+                        'hybrid_fallback' => 'hybrid_fallback_materialized_not_ready',
+                        default => (string) ($materializedStatus['state'] ?? 'ready'),
+                    }));
 
         $preferredStatus = is_array($plan['preferred_materialized_status'] ?? null)
             ? $plan['preferred_materialized_status']
@@ -115,22 +137,22 @@ class ReportHotWindowReadService
 
         return [
             'contract' => 'erp_pos_console_i05_materialized_first_live_fallback_v1',
-            'consumer_contract' => 'materialized_first_then_live_fallback_max_5_days',
+            'consumer_contract' => 'materialized_first_exact_dirty_date_fallback_v2',
             'source' => match ($mode) {
-                'live_fallback' => 'live_sales_canonical (materialized fallback)',
-                'hybrid_fallback' => 'materialized_history + live_sales_canonical fallback',
+                'live_fallback', 'live_recovery' => 'live_sales_canonical (exact Cashier fallback)',
+                'hybrid_fallback', 'hybrid_recovery' => 'materialized_clean_dates + live_sales_canonical dirty-date fallback',
                 default => (string) ($materializedStatus['source'] ?? 'report_daily_*_summaries'),
             },
             'read_mode' => $mode,
             'state' => $state,
-            'ready' => $materializedGateReady,
+            'ready' => $contractReady,
             'http_backfill' => false,
             'materialized_first' => true,
             'preferred_materialized_ready' => (bool) ($plan['preferred_materialized_ready'] ?? true),
             'fallback_reason' => $plan['fallback_reason'] ?? null,
             'business_date_source' => $mode === 'materialized'
                 ? (string) ($materializedStatus['business_date_source'] ?? 'report_sale_business_dates')
-                : 'materialized history + sales.created_at/sale_number exact business-date resolver',
+                : 'report_sale_business_dates clean dates + TransactionDate exact Cashier resolver fallback',
             'hot_window_days' => self::HOT_WINDOW_DAYS,
             'materialized_first_days' => self::MATERIALIZED_FIRST_DAYS,
             'hot_window_from' => $plan['hot_window_from'],
@@ -158,7 +180,11 @@ class ReportHotWindowReadService
             'preferred_materialized_pending_refresh_rows' => (int) ($preferredStatus['pending_refresh_rows'] ?? 0),
             'oldest_synced_at' => $materializedStatus['oldest_synced_at'] ?? null,
             'latest_synced_at' => $materializedStatus['latest_synced_at'] ?? null,
-            'recovery_pipeline' => $materializedGateReady ? null : 'daily',
+            'recovery_pipeline' => ($recoveryActive || $unrecoverableDirtyDates !== []) ? 'daily' : ($materializedGateReady ? null : 'daily'),
+            'canonical_recovery_active' => $recoveryActive,
+            'dirty_business_dates' => array_values($resolvedWindows['dirty_dates'] ?? []),
+            'unrecoverable_dirty_business_dates' => $unrecoverableDirtyDates,
+            'max_exact_recovery_days' => self::MAX_CANONICAL_RECOVERY_DAYS,
             'live_rows' => $liveRows,
             'historical_status' => $materializedStatus,
             'preferred_materialized_status' => $preferredStatus,
@@ -204,58 +230,74 @@ class ReportHotWindowReadService
         return $query;
     }
 
+    /**
+     * Canonical sale membership for detail/list consumers.
+     *
+     * Clean dates use report_sale_business_dates. Up to seven dirty dates use the
+     * exact Cashier resolver without mutating/backfilling data inside HTTP.
+     */
+    public function saleScopeQuery(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $timezone = null): Builder
+    {
+        $outletIds = $this->normalizeOutletIds($outletIds);
+        $timezone = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
+        [$fromDate, $toDate] = $this->normalizeRange($dateFrom, $dateTo, $timezone);
+
+        if ($outletIds === []) {
+            return DB::query()->fromSub(
+                DB::query()->selectRaw('1 as sale_id, 1 as outlet_id, NULL as business_date, NULL as business_timezone, 0 as marking')->whereRaw('1=0'),
+                'canonical_sale_scope'
+            );
+        }
+
+        $windows = $this->resolvedReadWindows($outletIds, $fromDate, $toDate, $timezone);
+        $parts = [];
+
+        foreach ($windows['materialized'] as [$windowFrom, $windowTo]) {
+            $parts[] = $this->materializedSaleScopeQuery($outletIds, $windowFrom, $windowTo);
+        }
+        foreach ($windows['live'] as [$windowFrom, $windowTo]) {
+            $parts[] = $this->liveScopeSalesSubquery($outletIds, $windowFrom, $windowTo);
+        }
+
+        if ($parts === []) {
+            return DB::query()->fromSub(
+                DB::query()->selectRaw('1 as sale_id, 1 as outlet_id, NULL as business_date, NULL as business_timezone, 0 as marking')->whereRaw('1=0'),
+                'canonical_sale_scope'
+            );
+        }
+
+        $union = array_shift($parts);
+        foreach ($parts as $part) $union->unionAll($part);
+
+        return DB::query()->fromSub($union, 'canonical_sale_scope')
+            ->select([
+                'canonical_sale_scope.sale_id',
+                'canonical_sale_scope.outlet_id',
+                'canonical_sale_scope.business_date',
+                'canonical_sale_scope.business_timezone',
+                'canonical_sale_scope.marking',
+            ]);
+    }
+
     public function recentSaleIds(array $outletIds, ?string $dateFrom, ?string $dateTo, string $timezone, int $limit, bool $markedOnly = false): array
     {
         $outletIds = $this->normalizeOutletIds($outletIds);
         if ($outletIds === []) return [];
 
-        [$fromDate, $toDate] = $this->normalizeRange($dateFrom, $dateTo, $timezone);
-        $plan = $this->effectivePlan($outletIds, $fromDate, $toDate, $timezone);
         $limit = max(1, min(100, $limit));
-        $ids = [];
+        $scope = $this->saleScopeQuery($outletIds, $dateFrom, $dateTo, $timezone);
 
-        if ($plan['live_from'] && $plan['live_to']) {
-            $liveScope = $this->liveScopeSalesSubquery($outletIds, $plan['live_from'], $plan['live_to']);
-            $query = DB::query()
-                ->fromSub($liveScope, 'live_scope')
-                ->join('sales as s', 's.id', '=', 'live_scope.sale_id')
-                ->when($markedOnly, fn ($q) => $q->whereRaw('COALESCE(CAST(live_scope.marking AS SIGNED), 0) = 1'))
-                ->selectRaw('live_scope.sale_id')
-                ->selectRaw('MAX(s.created_at) as latest_created_at')
-                ->groupBy('live_scope.sale_id')
-                ->orderByDesc('latest_created_at')
-                ->orderByDesc('live_scope.sale_id')
-                ->limit($limit);
-            foreach ($query->pluck('live_scope.sale_id') as $id) $ids[(string) $id] = true;
-        }
-
-        if (count($ids) < $limit && $plan['historical_from'] && $plan['historical_to']) {
-            $remaining = $limit - count($ids);
-            $query = DB::table('report_sale_business_dates as rsbd')
-                ->join('sales as s', 's.id', '=', 'rsbd.sale_id')
-                ->whereIn('rsbd.outlet_id', $outletIds)
-                ->whereBetween('rsbd.business_date', [$plan['historical_from'], $plan['historical_to']])
-                ->whereNull('s.deleted_at')
-                ->where('s.status', 'PAID')
-                ->when($markedOnly, fn ($q) => $q->whereRaw('COALESCE(CAST(s.marking AS SIGNED), 0) = 1'))
-                ->selectRaw('rsbd.sale_id')
-                ->selectRaw('MAX(s.created_at) as latest_created_at')
-                ->groupBy('rsbd.sale_id')
-                ->orderByDesc('latest_created_at')
-                ->orderByDesc('rsbd.sale_id')
-                ->limit($remaining);
-            foreach ($query->pluck('rsbd.sale_id') as $id) $ids[(string) $id] = true;
-        }
-
-        if ($ids === []) return [];
-
-        return DB::table('sales')
-            ->whereIn('id', array_keys($ids))
-            ->when($markedOnly, fn ($q) => $q->whereRaw('COALESCE(CAST(marking AS SIGNED), 0) = 1'))
-            ->orderByDesc('created_at')
-            ->orderByDesc('id')
+        return DB::query()
+            ->fromSub($scope, 'sale_scope')
+            ->join('sales as s', 's.id', '=', 'sale_scope.sale_id')
+            ->when($markedOnly, fn ($q) => $q->whereRaw('COALESCE(CAST(sale_scope.marking AS SIGNED), 0) = 1'))
+            ->selectRaw('sale_scope.sale_id')
+            ->selectRaw('MAX(s.created_at) as latest_created_at')
+            ->groupBy('sale_scope.sale_id')
+            ->orderByDesc('latest_created_at')
+            ->orderByDesc('sale_scope.sale_id')
             ->limit($limit)
-            ->pluck('id')
+            ->pluck('sale_scope.sale_id')
             ->map(fn ($id) => (string) $id)
             ->values()
             ->all();
@@ -267,27 +309,13 @@ class ReportHotWindowReadService
         $saleId = trim($saleId);
         if ($outletIds === [] || $saleId === '') return false;
 
-        [$fromDate, $toDate] = $this->normalizeRange($dateFrom, $dateTo, $timezone);
-        $plan = $this->effectivePlan($outletIds, $fromDate, $toDate, $timezone);
+        $scope = $this->saleScopeQuery($outletIds, $dateFrom, $dateTo, $timezone);
 
-        if ($plan['live_from'] && $plan['live_to']) {
-            $scope = $this->liveScopeSalesSubquery($outletIds, $plan['live_from'], $plan['live_to']);
-            $query = DB::query()->fromSub($scope, 'live_scope')->where('live_scope.sale_id', $saleId);
-            if ($markedOnly) $query->whereRaw('COALESCE(CAST(live_scope.marking AS SIGNED), 0) = 1');
-            if ($query->exists()) return true;
-        }
-
-        if ($plan['historical_from'] && $plan['historical_to']) {
-            return DB::table('report_sale_business_dates as rsbd')
-                ->join('sales as s', 's.id', '=', 'rsbd.sale_id')
-                ->where('rsbd.sale_id', $saleId)
-                ->whereIn('rsbd.outlet_id', $outletIds)
-                ->whereBetween('rsbd.business_date', [$plan['historical_from'], $plan['historical_to']])
-                ->when($markedOnly, fn ($q) => $q->whereRaw('COALESCE(CAST(s.marking AS SIGNED), 0) = 1'))
-                ->exists();
-        }
-
-        return false;
+        return DB::query()
+            ->fromSub($scope, 'sale_scope')
+            ->where('sale_scope.sale_id', $saleId)
+            ->when($markedOnly, fn ($q) => $q->whereRaw('COALESCE(CAST(sale_scope.marking AS SIGNED), 0) = 1'))
+            ->exists();
     }
 
     public function cacheTtlSeconds(array $reportingSource, int $materializedTtl = 300): int
@@ -305,16 +333,16 @@ class ReportHotWindowReadService
         $outletIds = $this->normalizeOutletIds($outletIds);
         $timezone = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
         [$fromDate, $toDate] = $this->normalizeRange($dateFrom, $dateTo, $timezone);
-        $plan = $this->effectivePlan($outletIds, $fromDate, $toDate, $timezone);
+        $windows = $this->resolvedReadWindows($outletIds, $fromDate, $toDate, $timezone);
         $parts = [];
 
-        if ($plan['historical_from'] && $plan['historical_to']) {
-            $historical = $this->historicalSummaryQuery($family, $outletIds, $plan['historical_from'], $plan['historical_to']);
+        foreach ($windows['materialized'] as [$windowFrom, $windowTo]) {
+            $historical = $this->historicalSummaryQuery($family, $outletIds, $windowFrom, $windowTo);
             $parts[] = $historical->select(array_map(fn ($column) => $spec['alias'].'.'.$column, $spec['columns']));
         }
 
-        if ($plan['live_from'] && $plan['live_to']) {
-            $parts[] = $this->liveSummaryQuery($family, $outletIds, $plan['live_from'], $plan['live_to']);
+        foreach ($windows['live'] as [$windowFrom, $windowTo]) {
+            $parts[] = $this->liveSummaryQuery($family, $outletIds, $windowFrom, $windowTo);
         }
 
         if ($parts === []) {
@@ -561,6 +589,106 @@ class ReportHotWindowReadService
             ->selectRaw('scope_sales.sale_id')
             ->selectRaw("GROUP_CONCAT(DISTINCT si.channel ORDER BY FIELD(si.channel, 'DINE_IN', 'TAKEAWAY', 'DELIVERY'), si.channel SEPARATOR ' + ') as channel_display")
             ->groupBy('scope_sales.sale_id');
+    }
+
+    private function materializedSaleScopeQuery(array $outletIds, string $fromDate, string $toDate): Builder
+    {
+        return DB::table('report_sale_business_dates as rsbd')
+            ->join('sales as materialized_s', 'materialized_s.id', '=', 'rsbd.sale_id')
+            ->whereIn('rsbd.outlet_id', $outletIds)
+            ->whereBetween('rsbd.business_date', [$fromDate, $toDate])
+            ->whereNull('materialized_s.deleted_at')
+            ->where('materialized_s.status', 'PAID')
+            ->selectRaw('rsbd.sale_id')
+            ->selectRaw('rsbd.outlet_id')
+            ->selectRaw('rsbd.business_date')
+            ->selectRaw('rsbd.business_timezone')
+            ->selectRaw('COALESCE(CAST(rsbd.marking AS SIGNED), 0) as marking');
+    }
+
+    private function resolvedReadWindows(array $outletIds, string $fromDate, string $toDate, string $timezone): array
+    {
+        $outletIds = $this->normalizeOutletIds($outletIds);
+        $cacheKey = sha1(json_encode([$outletIds, $fromDate, $toDate, $timezone]));
+        if (isset($this->resolvedReadWindowsCache[$cacheKey])) {
+            return $this->resolvedReadWindowsCache[$cacheKey];
+        }
+
+        $plan = $this->effectivePlan($outletIds, $fromDate, $toDate, $timezone);
+        $liveDates = [];
+
+        if (! empty($plan['live_from']) && ! empty($plan['live_to'])) {
+            foreach ($this->dateList((string) $plan['live_from'], (string) $plan['live_to'], $timezone) as $date) {
+                $liveDates[$date] = true;
+            }
+        }
+
+        $anomalies = $this->dailySummaryService->coverageAnomalies($outletIds, $fromDate, $toDate, $timezone);
+        $dirtyDates = array_values(array_unique(array_map('strval', $anomalies['dirty_dates'] ?? [])));
+        sort($dirtyDates);
+
+        $recoveryActive = $dirtyDates !== [] && count($dirtyDates) <= self::MAX_CANONICAL_RECOVERY_DAYS;
+        $unrecoverableDirtyDates = $recoveryActive ? [] : $dirtyDates;
+
+        if ($recoveryActive) {
+            foreach ($dirtyDates as $date) {
+                $liveDates[$date] = true;
+            }
+        }
+
+        $materializedDates = [];
+        foreach ($this->dateList($fromDate, $toDate, $timezone) as $date) {
+            if (! isset($liveDates[$date])) {
+                $materializedDates[] = $date;
+            }
+        }
+
+        $liveDateList = array_keys($liveDates);
+        sort($liveDateList);
+
+        return $this->resolvedReadWindowsCache[$cacheKey] = [
+            'materialized' => $this->consecutiveWindows($materializedDates, $timezone),
+            'live' => $this->consecutiveWindows($liveDateList, $timezone),
+            'dirty_dates' => $dirtyDates,
+            'recovery_active' => $recoveryActive,
+            'unrecoverable_dirty_dates' => $unrecoverableDirtyDates,
+            'anomalies' => $anomalies,
+        ];
+    }
+
+    private function dateList(string $fromDate, string $toDate, string $timezone): array
+    {
+        $dates = [];
+        for ($cursor = CarbonImmutable::parse($fromDate, $timezone); $cursor->lessThanOrEqualTo(CarbonImmutable::parse($toDate, $timezone)); $cursor = $cursor->addDay()) {
+            $dates[] = $cursor->toDateString();
+        }
+        return $dates;
+    }
+
+    private function consecutiveWindows(array $dates, string $timezone): array
+    {
+        $dates = array_values(array_unique(array_filter(array_map('strval', $dates))));
+        sort($dates);
+        if ($dates === []) return [];
+
+        $windows = [];
+        $start = $dates[0];
+        $previous = CarbonImmutable::parse($dates[0], $timezone);
+
+        for ($i = 1, $count = count($dates); $i < $count; $i++) {
+            $current = CarbonImmutable::parse($dates[$i], $timezone);
+            if ($current->equalTo($previous->addDay())) {
+                $previous = $current;
+                continue;
+            }
+
+            $windows[] = [$start, $previous->toDateString()];
+            $start = $dates[$i];
+            $previous = $current;
+        }
+
+        $windows[] = [$start, $previous->toDateString()];
+        return $windows;
     }
 
     private function liveScopeSalesSubquery(array $outletIds, string $fromDate, string $toDate): Builder

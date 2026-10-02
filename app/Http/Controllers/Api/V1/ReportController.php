@@ -15,6 +15,7 @@ use App\Http\Requests\Api\V1\Reports\UpdateMarkingSettingRequest;
 use App\Services\MarkingService;
 use App\Services\ReportService;
 use App\Support\BackofficeOutletScope;
+use App\Support\CashierReportRuntimeCache;
 use App\Support\FinanceOutletFilter;
 use App\Support\OutletScope;
 use App\Support\AnalyticsResponseCache;
@@ -70,30 +71,53 @@ class ReportController extends Controller
             ]);
     }
 
-    public function cashierReport(CashierReportRequest $request, ReportService $service): JsonResponse
+    public function cashierReport(CashierReportRequest $request, ReportService $service, CashierReportRuntimeCache $cashierCache): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
+        $outletId = OutletScope::id($request);
+        $userId = (string) ($request->user()?->getAuthIdentifier() ?? '');
 
-        // Cashier Report harus menampilkan transaksi tersync terbaru dari server.
-        // Jangan gunakan analytics cache di endpoint ini karena POS Android sering
-        // membuka report beberapa detik setelah sync transaksi berhasil. Cache 300s
-        // bisa membuat sumber tetap tertulis "server" tetapi payload masih snapshot lama.
-        return $this->jsonFresh(fn () => $service->cashierReport($params, OutletScope::id($request)));
+        // Keep HTTP no-store for Android, but collapse duplicate focus/visibility/
+        // sync reloads on the server. The cache version is bumped synchronously by
+        // checkout/void/cancel mutations, so a new transaction never waits for TTL.
+        return $this->jsonFresh(fn () => $cashierCache->remember(
+            'full',
+            $params,
+            $outletId,
+            $userId,
+            fn () => $service->cashierReport($params, $outletId)
+        ));
     }
 
-    public function cashierReportCashiers(CashierReportRequest $request, ReportService $service): JsonResponse
+    public function cashierReportCashiers(CashierReportRequest $request, ReportService $service, CashierReportRuntimeCache $cashierCache): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
+        $outletId = OutletScope::id($request);
+        $userId = (string) ($request->user()?->getAuthIdentifier() ?? '');
 
-        return $this->jsonFresh(fn () => $service->cashierReportCashiers($params, OutletScope::id($request)));
+        return $this->jsonFresh(fn () => $cashierCache->remember(
+            'cashiers',
+            $params,
+            $outletId,
+            $userId,
+            fn () => $service->cashierReportCashiers($params, $outletId)
+        ));
     }
 
-    public function cashierReportByCashier(CashierReportRequest $request, string $cashierId, ReportService $service): JsonResponse
+    public function cashierReportByCashier(CashierReportRequest $request, string $cashierId, ReportService $service, CashierReportRuntimeCache $cashierCache): JsonResponse
     {
         $params = $this->injectBackofficeScope($request);
         $params['cashier_id'] = $cashierId;
+        $outletId = OutletScope::id($request);
+        $userId = (string) ($request->user()?->getAuthIdentifier() ?? '');
 
-        return $this->jsonFresh(fn () => $service->cashierReport($params, OutletScope::id($request)));
+        return $this->jsonFresh(fn () => $cashierCache->remember(
+            'cashier-detail',
+            $params,
+            $outletId,
+            $userId,
+            fn () => $service->cashierReport($params, $outletId)
+        ));
     }
 
     public function ledger(LedgerReportRequest $request, ReportService $service): JsonResponse
