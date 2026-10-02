@@ -1,0 +1,15 @@
+<?php
+
+namespace App\Models\GeneralAffair;
+
+use Illuminate\Database\Eloquent\Concerns\HasUlids;
+use Illuminate\Database\Eloquent\Model;
+
+class AssetLocationBalance extends Model
+{
+    use HasUlids;
+
+    protected $table = 'ga_asset_location_balances';
+    protected $guarded = [];
+    protected $casts = ['quantity' => 'decimal:3'];
+}

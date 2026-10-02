@@ -24,6 +24,7 @@ final class FinanceOpenXmlXlsxWriter
     public const STYLE_TOTAL_TEXT = 10;
     public const STYLE_TOTAL_NUMBER = 11;
     public const STYLE_NOTE = 12;
+    public const STYLE_TIME = 13;
 
     /**
      * @param array<int,array{cells:array<int,mixed>,height?:float}> $rows
@@ -123,9 +124,20 @@ final class FinanceOpenXmlXlsxWriter
                 if ($value === null) continue;
                 $style = (int)($cell['style'] ?? 0);
                 $type = $cell['type'] ?? null;
+                if ($type === 'time' && $style === self::STYLE_DEFAULT) {
+                    $style = self::STYLE_TIME;
+                }
                 $ref = $this->colLetter($cIndex + 1).$rowNo;
                 $s = $style > 0 ? ' s="'.$style.'"' : '';
 
+                if ($type === 'time') {
+                    $serial = $this->excelTimeSerial($value);
+                    if ($serial !== null) {
+                        $cellsXml[] = '<c r="'.$ref.'"'.$s.'><v>'.number_format($serial, 10, '.', '').'</v></c>';
+                        continue;
+                    }
+                    // Invalid/unknown time input is preserved as text instead of coercing a wrong value.
+                }
                 if ($type === 'n' || ($type === null && (is_int($value) || is_float($value)))) {
                     $numeric = is_finite((float)$value) ? number_format((float)$value, 2, '.', '') : '0';
                     $cellsXml[] = '<c r="'.$ref.'"'.$s.'><v>'.$numeric.'</v></c>';
@@ -162,7 +174,10 @@ final class FinanceOpenXmlXlsxWriter
         return <<<'XML'
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00;[Red]-#,##0.00;0.00"/></numFmts>
+  <numFmts count="2">
+    <numFmt numFmtId="164" formatCode="#,##0.00;[Red]-#,##0.00;0.00"/>
+    <numFmt numFmtId="165" formatCode="hh:mm:ss"/>
+  </numFmts>
   <fonts count="5">
     <font><sz val="10"/><name val="Aptos"/><family val="2"/></font>
     <font><b/><sz val="18"/><color rgb="FF0F172A"/><name val="Aptos Display"/><family val="2"/></font>
@@ -182,7 +197,7 @@ final class FinanceOpenXmlXlsxWriter
     <border><left style="thin"><color rgb="FFCBD5E1"/></left><right style="thin"><color rgb="FFCBD5E1"/></right><top style="thin"><color rgb="FFCBD5E1"/></top><bottom style="thin"><color rgb="FFCBD5E1"/></bottom><diagonal/></border>
   </borders>
   <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="13">
+  <cellXfs count="14">
     <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
     <xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"><alignment vertical="center"/></xf>
     <xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>
@@ -196,10 +211,39 @@ final class FinanceOpenXmlXlsxWriter
     <xf numFmtId="0" fontId="3" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
     <xf numFmtId="164" fontId="3" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyNumberFormat="1"><alignment horizontal="right"/></xf>
     <xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1"><alignment wrapText="1"/></xf>
+    <xf numFmtId="165" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyNumberFormat="1"><alignment horizontal="center"/></xf>
   </cellXfs>
   <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>
 XML;
+    }
+
+    private function excelTimeSerial(mixed $value): ?float
+    {
+        if (is_int($value) || is_float($value)) {
+            $numeric = (float) $value;
+            return is_finite($numeric) && $numeric >= 0.0 && $numeric < 1.0 ? $numeric : null;
+        }
+
+        $text = trim((string) $value);
+        if ($text === '') return null;
+
+        // Finance APIs normally expose HH:mm:ss. Also accept HH:mm and fractional seconds.
+        if (! preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?$/', $text, $match)) {
+            return null;
+        }
+
+        $hour = (int) $match[1];
+        $minute = (int) $match[2];
+        $second = isset($match[3]) && $match[3] !== '' ? (int) $match[3] : 0;
+        if ($hour > 23 || $minute > 59 || $second > 59) return null;
+
+        $fraction = 0.0;
+        if (isset($match[4]) && $match[4] !== '') {
+            $fraction = ((float) ('0.'.$match[4]));
+        }
+
+        return (($hour * 3600) + ($minute * 60) + $second + $fraction) / 86400;
     }
 
     private function contentTypesXml(): string

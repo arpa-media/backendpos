@@ -88,6 +88,7 @@ final class FinanceSummaryXlsxExportService
     {
         $result = [];
         $metadataPhase = true;
+        $columnTypes = [];
         foreach ($rows as $index => $row) {
             $nonEmpty = array_values(array_filter($row, fn ($v) => $v !== null && $v !== ''));
             $isBlank = $nonEmpty === [];
@@ -103,14 +104,21 @@ final class FinanceSummaryXlsxExportService
 
             $first = strtoupper(trim((string) ($row[0] ?? '')));
             $isTotal = in_array($first, ['TOTAL', 'GRAND TOTAL', 'TOTAL SUMMARY'], true) || str_starts_with($first, 'TOTAL ');
-            $isSection = count($nonEmpty) === 1 && ! is_numeric($nonEmpty[0]);
+            $isSection = count($nonEmpty) === 1 && ! $this->isNativeNumber($nonEmpty[0]);
             $isHeader = ! $metadataPhase && count($nonEmpty) >= 2 && $this->allText($nonEmpty);
 
             $cells = [];
+            if ($isHeader) {
+                $columnTypes = [];
+                foreach ($row as $column => $heading) {
+                    $columnTypes[$column] = $this->semanticColumnType($heading);
+                }
+            }
+
             foreach ($row as $column => $value) {
                 if ($metadataPhase) {
                     $style = $column === 0 ? FinanceOpenXmlXlsxWriter::STYLE_META_LABEL : FinanceOpenXmlXlsxWriter::STYLE_META_VALUE;
-                    $cells[] = FinanceOpenXmlXlsxWriter::cell($value, $style, is_numeric($value) ? 'n' : 's');
+                    $cells[] = FinanceOpenXmlXlsxWriter::cell($value, $style, $this->isNativeNumber($value) ? 'n' : 's');
                     continue;
                 }
                 if ($isSection) {
@@ -121,17 +129,56 @@ final class FinanceSummaryXlsxExportService
                     $cells[] = FinanceOpenXmlXlsxWriter::cell($value, FinanceOpenXmlXlsxWriter::STYLE_HEADER, 's');
                     continue;
                 }
-                if ($isTotal) {
-                    $style = is_numeric($value) ? FinanceOpenXmlXlsxWriter::STYLE_TOTAL_NUMBER : FinanceOpenXmlXlsxWriter::STYLE_TOTAL_TEXT;
-                    $cells[] = FinanceOpenXmlXlsxWriter::cell($value, $style, is_numeric($value) ? 'n' : 's');
+
+                $semanticType = $columnTypes[$column] ?? null;
+                if ($semanticType === 'time' && $this->isTimeValue($value)) {
+                    $cells[] = FinanceOpenXmlXlsxWriter::cell($value, FinanceOpenXmlXlsxWriter::STYLE_TIME, 'time');
                     continue;
                 }
-                $style = is_numeric($value) ? FinanceOpenXmlXlsxWriter::STYLE_NUMBER : FinanceOpenXmlXlsxWriter::STYLE_TEXT;
-                $cells[] = FinanceOpenXmlXlsxWriter::cell($value, $style, is_numeric($value) ? 'n' : 's');
+
+                if ($isTotal) {
+                    $style = $this->isNativeNumber($value) ? FinanceOpenXmlXlsxWriter::STYLE_TOTAL_NUMBER : FinanceOpenXmlXlsxWriter::STYLE_TOTAL_TEXT;
+                    $cells[] = FinanceOpenXmlXlsxWriter::cell($value, $style, $this->isNativeNumber($value) ? 'n' : 's');
+                    continue;
+                }
+                $style = $this->isNativeNumber($value) ? FinanceOpenXmlXlsxWriter::STYLE_NUMBER : FinanceOpenXmlXlsxWriter::STYLE_TEXT;
+                $cells[] = FinanceOpenXmlXlsxWriter::cell($value, $style, $this->isNativeNumber($value) ? 'n' : 's');
             }
             $result[] = ['cells' => $cells, 'height' => $isHeader ? 24 : null];
         }
         return $result;
+    }
+
+    private function isNativeNumber(mixed $value): bool
+    {
+        return is_int($value) || is_float($value);
+    }
+
+    private function semanticColumnType(mixed $heading): ?string
+    {
+        $label = strtoupper(trim((string) $heading));
+        $label = preg_replace('/[_\-\/]+/', ' ', $label) ?: $label;
+        $label = preg_replace('/\s+/', ' ', $label) ?: $label;
+
+        // Deliberately excludes TIMEZONE and datetime columns such as Created At.
+        if (preg_match('/(?:^| )(TIME|JAM|WAKTU)$/', $label) === 1) return 'time';
+        return null;
+    }
+
+    private function isTimeValue(mixed $value): bool
+    {
+        if (is_int($value) || is_float($value)) {
+            $number = (float) $value;
+            return is_finite($number) && $number >= 0.0 && $number < 1.0;
+        }
+        if (! is_string($value)) return false;
+        $value = trim($value);
+        if ($value === '') return false;
+        if (! preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?$/', $value, $match)) return false;
+
+        return (int) $match[1] <= 23
+            && (int) $match[2] <= 59
+            && (! isset($match[3]) || $match[3] === '' || (int) $match[3] <= 59);
     }
 
     private function allText(array $values): bool
@@ -170,7 +217,7 @@ final class FinanceSummaryXlsxExportService
                 $metadataPhase = false;
                 continue;
             }
-            if (! $metadataPhase && count($nonEmpty) === 1 && ! is_numeric($nonEmpty[0])) {
+            if (! $metadataPhase && count($nonEmpty) === 1 && ! $this->isNativeNumber($nonEmpty[0])) {
                 $rowNo = $index + 1;
                 $merges[] = 'A'.$rowNo.':'.$this->columnLetter($maxColumns).$rowNo;
             }

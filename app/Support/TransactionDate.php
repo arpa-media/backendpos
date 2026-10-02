@@ -237,7 +237,10 @@ class TransactionDate
 
     public static function saleNumberTokenSqlExpression(string $saleNumberColumn): string
     {
-        return "CASE WHEN {$saleNumberColumn} REGEXP '-[0-9]{8}-' THEN SUBSTRING_INDEX(SUBSTRING_INDEX({$saleNumberColumn}, '-', -2), '-', 1) ELSE NULL END";
+        // Sale numbers use patterns such as S.KTA-20260925-RD4K-001.
+        // Extract the token immediately after the first hyphen, not the penultimate segment.
+        // The previous -2 extraction returned RD4K and made SQL/PHP date resolution diverge.
+        return "CASE WHEN {$saleNumberColumn} REGEXP '-[0-9]{8}-' THEN SUBSTRING_INDEX(SUBSTRING_INDEX({$saleNumberColumn}, '-', 2), '-', -1) ELSE NULL END";
     }
 
     public static function resolvedSaleLocalSqlExpression(string $createdAtColumn, ?string $saleNumberColumn = null, ?string $timezone = null): string

@@ -12,6 +12,7 @@ use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Validation\ValidationException;
 use Carbon\CarbonImmutable;
 
 class OperationalSalesAnalyticController extends Controller
@@ -25,7 +26,10 @@ class OperationalSalesAnalyticController extends Controller
     public function daily(Request $request): JsonResponse
     {
         $validated = $request->validate([
+            // Legacy single-date is still accepted so bookmarks / old clients do not break.
             'date' => ['nullable', 'date_format:Y-m-d'],
+            'date_from' => ['nullable', 'date_format:Y-m-d'],
+            'date_to' => ['nullable', 'date_format:Y-m-d'],
             'outlet_filter' => ['nullable', 'string', 'max:100'],
             'filters_only' => ['nullable', 'boolean'],
         ]);
@@ -36,26 +40,53 @@ class OperationalSalesAnalyticController extends Controller
             true,
         );
         $timezone = TransactionDate::normalizeTimezone((string) ($scope['timezone'] ?? ''), TransactionDate::appTimezone());
-        $date = (string) ($validated['date'] ?? TransactionDate::businessTodayDateString($timezone));
+        $today = TransactionDate::businessTodayDateString($timezone);
+        $legacyDate = (string) ($validated['date'] ?? '');
+        $dateFrom = (string) ($validated['date_from'] ?? ($legacyDate !== '' ? $legacyDate : $today));
+        $dateTo = (string) ($validated['date_to'] ?? ($legacyDate !== '' ? $legacyDate : $dateFrom));
+
+        try {
+            $from = CarbonImmutable::parse($dateFrom, $timezone)->startOfDay();
+            $to = CarbonImmutable::parse($dateTo, $timezone)->startOfDay();
+        } catch (\Throwable) {
+            throw ValidationException::withMessages(['date_from' => ['Rentang tanggal Daily Analytic tidak valid.']]);
+        }
+
+        if ($to->lessThan($from)) {
+            [$from, $to] = [$to, $from];
+        }
+
+        $rangeDays = (int) $from->diffInDays($to) + 1;
+        if ($rangeDays > 370) {
+            throw ValidationException::withMessages(['date_to' => ['Rentang Daily Analytic maksimal 370 business date.']]);
+        }
+
+        $dateFrom = $from->toDateString();
+        $dateTo = $to->toDateString();
         $outletIds = array_values(array_unique(array_filter(array_map('strval', $scope['outlet_ids'] ?? []))));
         $outletOptions = $this->scopeOptions($request, $scope);
+        $businessMeta = $this->businessDateMeta($timezone);
 
         if ($request->boolean('filters_only')) {
             return ApiResponse::ok([
-                'filters' => ['date' => $date, 'outlet_filter' => (string) ($scope['value'] ?? FinanceOutletFilter::FILTER_ALL)],
+                'filters' => [
+                    'date_from' => $dateFrom,
+                    'date_to' => $dateTo,
+                    'outlet_filter' => (string) ($scope['value'] ?? FinanceOutletFilter::FILTER_ALL),
+                ],
                 'filter_options' => ['outlet_filters' => $outletOptions],
-                'meta' => [
+                'meta' => array_merge([
                     'timezone' => $timezone,
                     'outlet_scope_name' => (string) ($scope['label'] ?? 'All Outlet'),
-                    'contract' => 'erp_finance_v8_i07_daily_analytic',
-                ],
+                    'contract' => 'erp_pos_v10_i14_daily_analytic_range',
+                ], $businessMeta),
             ]);
         }
 
-        $reportingSource = $this->service->reportingStatus($outletIds, $date, $timezone);
+        $reportingSource = $this->service->reportingStatusRange($outletIds, $dateFrom, $dateTo, $timezone);
         if (! ($reportingSource['ready'] ?? false)) {
             return ApiResponse::error(
-                'Data Daily Analytic untuk tanggal ini belum selesai dimaterialisasi. Scheduler reporting akan melengkapi coverage tanpa backfill dari request browser.',
+                'Data Daily Analytic untuk business-date range ini belum selesai dimaterialisasi. Scheduler reporting akan melengkapi coverage tanpa backfill dari request browser.',
                 'REPORT_DAILY_SUMMARY_NOT_READY',
                 409,
                 [],
@@ -64,25 +95,30 @@ class OperationalSalesAnalyticController extends Controller
         }
 
         $cacheParams = [
-            'date' => $date,
+            'date_from' => $dateFrom,
+            'date_to' => $dateTo,
             'outlet_filter' => (string) ($scope['value'] ?? FinanceOutletFilter::FILTER_ALL),
             'outlet_ids' => $outletIds,
             'timezone' => $timezone,
+            'business_date_contract' => $businessMeta['business_date_contract'],
         ];
 
         $payload = AnalyticsResponseCache::rememberReporting(
-            'operational-sales-analytic.daily.console-i02',
+            'operational-sales-analytic.daily.v10-i14',
             $cacheParams,
             $reportingSource,
-            fn () => $this->service->daily($outletIds, $date, $timezone, $reportingSource),
+            fn () => $this->service->dailyRange($outletIds, $dateFrom, $dateTo, $timezone, $reportingSource),
             (string) ($request->user()?->getAuthIdentifier() ?? ''),
         );
         $payload['filters'] = [
-            'date' => $date,
+            'date_from' => $dateFrom,
+            'date_to' => $dateTo,
             'outlet_filter' => (string) ($scope['value'] ?? FinanceOutletFilter::FILTER_ALL),
         ];
         $payload['filter_options'] = ['outlet_filters' => $outletOptions];
-        $payload['meta']['outlet_scope_name'] = (string) ($scope['label'] ?? 'All Outlet');
+        $payload['meta'] = array_merge($payload['meta'] ?? [], $businessMeta, [
+            'outlet_scope_name' => (string) ($scope['label'] ?? 'All Outlet'),
+        ]);
 
         return ApiResponse::ok($payload);
     }
@@ -113,12 +149,12 @@ class OperationalSalesAnalyticController extends Controller
                     'outlet_filter' => (string) ($scope['value'] ?? FinanceOutletFilter::FILTER_ALL),
                 ],
                 'filter_options' => ['outlet_filters' => $outletOptions],
-                'meta' => [
+                'meta' => array_merge([
                     'timezone' => $timezone,
                     'current_date' => $currentDate,
                     'outlet_scope_name' => (string) ($scope['label'] ?? 'All Outlet'),
-                    'contract' => 'erp_finance_v8_i08_hourly_comparison',
-                ],
+                    'contract' => 'erp_pos_v10_i14_hourly_comparison',
+                ], $this->businessDateMeta($timezone)),
             ]);
         }
 
@@ -154,7 +190,9 @@ class OperationalSalesAnalyticController extends Controller
             'outlet_filter' => (string) ($scope['value'] ?? FinanceOutletFilter::FILTER_ALL),
         ];
         $payload['filter_options'] = ['outlet_filters' => $outletOptions];
-        $payload['meta']['outlet_scope_name'] = (string) ($scope['label'] ?? 'All Outlet');
+        $payload['meta'] = array_merge($payload['meta'] ?? [], $this->businessDateMeta($timezone), [
+            'outlet_scope_name' => (string) ($scope['label'] ?? 'All Outlet'),
+        ]);
 
         return ApiResponse::ok($payload);
     }
@@ -193,11 +231,11 @@ class OperationalSalesAnalyticController extends Controller
                         'label' => sprintf('%02d:00 - %02d:59', $value, $value),
                     ], range(0, 23)),
                 ],
-                'meta' => [
+                'meta' => array_merge([
                     'timezone' => $timezone,
                     'outlet_scope_name' => (string) ($scope['label'] ?? 'All Outlet'),
-                    'contract' => 'erp_finance_v8_i08_hourly_summary',
-                ],
+                    'contract' => 'erp_pos_v10_i14_hourly_summary',
+                ], $this->businessDateMeta($timezone)),
             ]);
         }
 
@@ -240,9 +278,26 @@ class OperationalSalesAnalyticController extends Controller
                 'label' => sprintf('%02d:00 - %02d:59', $value, $value),
             ], range(0, 23)),
         ];
-        $payload['meta']['outlet_scope_name'] = (string) ($scope['label'] ?? 'All Outlet');
+        $payload['meta'] = array_merge($payload['meta'] ?? [], $this->businessDateMeta($timezone), [
+            'outlet_scope_name' => (string) ($scope['label'] ?? 'All Outlet'),
+        ]);
 
         return ApiResponse::ok($payload);
+    }
+
+    private function businessDateMeta(string $timezone): array
+    {
+        $timezone = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
+        $startHour = TransactionDate::businessDayStartHour($timezone);
+
+        return [
+            'business_date_contract' => 'cashier_aligned_v1',
+            'business_date_source' => 'report_sale_business_dates / TransactionDate exact resolver',
+            'business_timezone' => $timezone,
+            'business_day_start_hour' => $startHour,
+            'business_cutoff_label' => sprintf('%02d:00', $startHour),
+            'business_today' => TransactionDate::businessTodayDateString($timezone),
+        ];
     }
 
     private function scopeOptions(Request $request, array $scope): array

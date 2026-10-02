@@ -5,6 +5,7 @@ namespace App\Services\Operational;
 use App\Services\FinanceNetReadService;
 use App\Services\Reporting\ReportHotWindowReadService;
 use App\Support\TransactionDate;
+use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -18,9 +19,16 @@ class OperationalSalesAnalyticService
 
     public function reportingStatus(array $outletIds, string $date, string $timezone): array
     {
-        $status = $this->hotWindowReadService->readContractStatus($outletIds, $date, $date, $timezone);
-        $status['consumer_contract'] = 'erp_finance_v8_i07_daily_analytic';
+        return $this->reportingStatusRange($outletIds, $date, $date, $timezone);
+    }
+
+    public function reportingStatusRange(array $outletIds, string $dateFrom, string $dateTo, string $timezone): array
+    {
+        $status = $this->hotWindowReadService->readContractStatus($outletIds, $dateFrom, $dateTo, $timezone);
+        $status['consumer_contract'] = 'erp_pos_v10_i14_daily_analytic_range';
         $status['metric_source'] = 'hot_window_read_contract';
+        $status['business_date_contract'] = 'cashier_aligned_v1';
+        $status['business_date_source'] = $status['business_date_source'] ?? 'report_sale_business_dates / TransactionDate exact resolver';
         $status['omzet_formula'] = 'grand_sales_after_approved_void_adjustment';
         $status['basket_size_formula'] = 'omzet / trx_count';
 
@@ -29,8 +37,21 @@ class OperationalSalesAnalyticService
 
     public function daily(array $outletIds, string $date, string $timezone, array $reportingSource): array
     {
+        return $this->dailyRange($outletIds, $date, $date, $timezone, $reportingSource);
+    }
+
+    public function dailyRange(array $outletIds, string $dateFrom, string $dateTo, string $timezone, array $reportingSource): array
+    {
         $outletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
         $timezone = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone());
+        $from = CarbonImmutable::parse($dateFrom, $timezone)->startOfDay();
+        $to = CarbonImmutable::parse($dateTo, $timezone)->startOfDay();
+        if ($to->lessThan($from)) {
+            [$from, $to] = [$to, $from];
+        }
+        $dateFrom = $from->toDateString();
+        $dateTo = $to->toDateString();
+        $rangeDays = (int) $from->diffInDays($to) + 1;
 
         $outletsQuery = DB::table('outlets')
             ->where('type', 'outlet')
@@ -44,7 +65,7 @@ class OperationalSalesAnalyticService
         $dailyRows = $outletIds === []
             ? collect()
             : $this->hotWindowReadService
-                ->salesSummaryQuery($outletIds, $date, $date, $timezone)
+                ->salesSummaryQuery($outletIds, $dateFrom, $dateTo, $timezone)
                 ->selectRaw('rdss.outlet_id')
                 ->selectRaw('COALESCE(SUM(rdss.trx_count), 0) as trx_count')
                 ->selectRaw('COALESCE(SUM(rdss.grand_sales), 0) as grand_sales')
@@ -54,7 +75,7 @@ class OperationalSalesAnalyticService
                 ->get()
                 ->keyBy(fn ($row) => (string) ($row->outlet_id ?? ''));
 
-        $voidAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $date, $date, $timezone);
+        $voidAdjustments = $this->financeNetReadService->approvedVoidAdjustmentsByOutlet($outletIds, $dateFrom, $dateTo, $timezone);
 
         $items = $outlets->map(function ($outlet) use ($dailyRows, $voidAdjustments): array {
             $id = (string) ($outlet->id ?? '');
@@ -109,7 +130,11 @@ class OperationalSalesAnalyticService
 
         return [
             'report' => [
-                'date' => $date,
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+                'range_days' => $rangeDays,
+                'business_day_start_hour' => TransactionDate::businessDayStartHour($timezone),
+                'business_cutoff_label' => sprintf('%02d:00', TransactionDate::businessDayStartHour($timezone)),
                 'report_time' => $generatedAt->format('Y-m-d H:i:s'),
                 'report_time_label' => $generatedAt->format('H:i:s'),
                 'timezone' => $timezone,
@@ -132,11 +157,14 @@ class OperationalSalesAnalyticService
             'meta' => [
                 'generated_at' => $generatedAt->format('Y-m-d H:i:s'),
                 'timezone' => $timezone,
+                'contract' => 'erp_pos_v10_i14_daily_analytic_range',
+                'business_date_contract' => 'cashier_aligned_v1',
+                'business_date_source' => 'report_sale_business_dates / TransactionDate exact resolver',
                 'reporting_source' => $reportingSource,
                 'net_read' => $this->financeNetReadService->adjustmentMeta($voidAdjustments),
                 'definitions' => [
-                    'omzet' => 'Grand Sales: 5 hari terbaru mencoba materialized summary terlebih dahulu; bila coverage belum siap/masih refresh pending, sistem fallback ke transaksi Live. Historical tetap materialized. Setelah itu approved VOID adjustment diterapkan.',
-                    'basket_size' => 'Omzet dibagi jumlah transaksi. Outlet tanpa transaksi tidak masuk ranking basket size.',
+                    'omzet' => 'Grand Sales pada business-date range terpilih. 5 business date terbaru mencoba materialized summary terlebih dahulu; bila coverage belum siap/masih refresh pending, sistem fallback ke transaksi Live. Historical tetap materialized. Setelah itu approved VOID adjustment diterapkan.',
+                    'basket_size' => 'Omzet business-date range dibagi jumlah transaksi pada range yang sama. Outlet tanpa transaksi tidak masuk ranking basket size.',
                 ],
             ],
         ];

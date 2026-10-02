@@ -87,6 +87,7 @@ class ReportSaleBusinessDateIndexService
 
         $outletChunkSize = $this->normalizeOutletChunkSize($options['outlet_chunk'] ?? null);
         $dateChunkDays = $this->normalizeDateChunkDays($options['date_chunk_days'] ?? $options['date_chunk'] ?? null);
+        $progressCallback = is_callable($options['progress_callback'] ?? null) ? $options['progress_callback'] : null;
         $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
         $groupedOutletIds = [];
         foreach ($normalizedOutletIds as $outletId) {
@@ -95,15 +96,122 @@ class ReportSaleBusinessDateIndexService
             $groupedOutletIds[$timezone][] = $outletId;
         }
 
+        $workItems = [];
         foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
             [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $timezone);
             $windows = $this->splitWindowsByDays([[$fromDate, $toDate]], $timezone, $dateChunkDays);
             foreach (array_chunk($tzOutletIds, $outletChunkSize) as $outletChunk) {
                 foreach ($windows as [$windowFrom, $windowTo]) {
-                    $this->rebuildCoverageWindow($outletChunk, $windowFrom, $windowTo, $timezone);
+                    $workItems[] = [$outletChunk, $windowFrom, $windowTo, $timezone];
                 }
             }
         }
+
+        $this->emitProgress($progressCallback, [
+            'phase' => 'business_index',
+            'event' => 'plan',
+            'total' => count($workItems),
+            'forced' => true,
+        ]);
+
+        foreach ($workItems as $index => [$outletChunk, $windowFrom, $windowTo, $timezone]) {
+            $payload = [
+                'phase' => 'business_index',
+                'current' => $index + 1,
+                'total' => count($workItems),
+                'date_from' => $windowFrom,
+                'date_to' => $windowTo,
+                'timezone' => $timezone,
+                'outlet_count' => count($outletChunk),
+                'forced' => true,
+            ];
+            $this->emitProgress($progressCallback, array_merge($payload, ['event' => 'start']));
+            $startedAt = microtime(true);
+            $this->rebuildCoverageWindow($outletChunk, $windowFrom, $windowTo, $timezone);
+            $this->emitProgress($progressCallback, array_merge($payload, [
+                'event' => 'complete',
+                'duration_ms' => (int) round((microtime(true) - $startedAt) * 1000),
+            ]));
+        }
+    }
+
+    /**
+     * Read-only exact source audit used by CLI self-healing verification.
+     * It intentionally uses the same PHP business-date resolver as materialization
+     * so UTC-vs-local historical rows and outlet cutoffs are evaluated consistently.
+     *
+     * @return array<int, array{outlet_id:string,business_date:string,trx_count:int,grand_sales:int}>
+     */
+    public function auditRawExactStats(array $outletIds, ?string $dateFrom, ?string $dateTo, ?string $fallbackTimezone = null): array
+    {
+        $normalizedOutletIds = array_values(array_unique(array_filter(array_map('strval', $outletIds))));
+        sort($normalizedOutletIds);
+
+        if ($normalizedOutletIds === []) {
+            return [];
+        }
+
+        $timezoneMap = $this->resolveTimezoneMap($normalizedOutletIds, $fallbackTimezone);
+        $groupedOutletIds = [];
+        foreach ($normalizedOutletIds as $outletId) {
+            $timezone = $timezoneMap[$outletId] ?? TransactionDate::normalizeTimezone($fallbackTimezone, TransactionDate::appTimezone());
+            $groupedOutletIds[$timezone] ??= [];
+            $groupedOutletIds[$timezone][] = $outletId;
+        }
+
+        $stats = [];
+        foreach ($groupedOutletIds as $timezone => $tzOutletIds) {
+            [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $timezone);
+            $candidateDateTo = TransactionDate::normalizeTimezone($timezone, TransactionDate::appTimezone()) === 'Asia/Makassar'
+                ? CarbonImmutable::parse($toDate, $timezone)->addDay()->toDateString()
+                : $toDate;
+
+            $query = DB::table('sales as s')
+                ->select(['s.id', 's.outlet_id', 's.sale_number', 's.created_at', 's.grand_total'])
+                ->whereNull('s.deleted_at')
+                ->where('s.status', '=', 'PAID')
+                ->whereIn('s.outlet_id', $tzOutletIds);
+
+            $this->applyCashierCandidateScope(
+                $query,
+                's.sale_number',
+                's.created_at',
+                $fromDate,
+                $candidateDateTo,
+                $timezone
+            );
+
+            $query->orderBy('s.id')->chunkById(self::CANDIDATE_SALE_CHUNK_SIZE, function ($chunk) use (&$stats, $fromDate, $toDate, $timezone): void {
+                foreach ($chunk as $sale) {
+                    $businessDate = $this->resolveExactBusinessDate(
+                        $sale->created_at ?? null,
+                        isset($sale->sale_number) ? (string) $sale->sale_number : null,
+                        $timezone
+                    );
+
+                    if (! $businessDate || $businessDate < $fromDate || $businessDate > $toDate) {
+                        continue;
+                    }
+
+                    $outletId = (string) ($sale->outlet_id ?? '');
+                    if ($outletId === '') {
+                        continue;
+                    }
+
+                    $key = $outletId.'#'.$businessDate;
+                    $stats[$key] ??= [
+                        'outlet_id' => $outletId,
+                        'business_date' => $businessDate,
+                        'trx_count' => 0,
+                        'grand_sales' => 0,
+                    ];
+                    $stats[$key]['trx_count']++;
+                    $stats[$key]['grand_sales'] += (int) round((float) ($sale->grand_total ?? 0));
+                }
+            }, 's.id', 'id');
+        }
+
+        return array_values($stats);
     }
 
     public function saleIdsIfCovered(array $outletIds, ?string $dateFrom, ?string $dateTo, bool $markedOnly = false, ?string $fallbackTimezone = null): ?array

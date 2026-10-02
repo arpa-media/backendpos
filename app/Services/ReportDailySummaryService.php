@@ -154,10 +154,12 @@ class ReportDailySummaryService
         [$fromDate, $toDate] = $this->normalizeDateRange($dateFrom, $dateTo, $fallbackTimezone);
         $outletChunkSize = $this->normalizeOutletChunkSize($options['outlet_chunk'] ?? null);
         $dateChunkDays = $this->normalizeDateChunkDays($options['date_chunk_days'] ?? $options['date_chunk'] ?? null);
+        $progressCallback = is_callable($options['progress_callback'] ?? null) ? $options['progress_callback'] : null;
 
         $this->businessDateIndex->refreshExactCoverage($normalizedOutletIds, $fromDate, $toDate, $fallbackTimezone, [
             'outlet_chunk' => $outletChunkSize,
             'date_chunk_days' => $dateChunkDays,
+            'progress_callback' => $progressCallback,
         ]);
 
         $allDates = [];
@@ -165,10 +167,39 @@ class ReportDailySummaryService
             $allDates[] = $cursor->toDateString();
         }
 
+        $workItems = [];
         foreach ($this->batchedWindows($allDates, $fallbackTimezone, $dateChunkDays) as [$windowFrom, $windowTo]) {
             foreach (array_chunk($normalizedOutletIds, $outletChunkSize) as $outletChunk) {
-                $this->rebuildWindow($outletChunk, $windowFrom, $windowTo);
+                $workItems[] = [$outletChunk, $windowFrom, $windowTo];
             }
+        }
+
+        $this->emitProgress($progressCallback, [
+            'phase' => 'daily_summary',
+            'event' => 'plan',
+            'total' => count($workItems),
+            'dates_needing_refresh' => count($allDates),
+            'forced' => true,
+        ]);
+
+        foreach ($workItems as $index => [$outletChunk, $windowFrom, $windowTo]) {
+            $payload = [
+                'phase' => 'daily_summary',
+                'current' => $index + 1,
+                'total' => count($workItems),
+                'date_from' => $windowFrom,
+                'date_to' => $windowTo,
+                'timezone' => $fallbackTimezone,
+                'outlet_count' => count($outletChunk),
+                'forced' => true,
+            ];
+            $this->emitProgress($progressCallback, array_merge($payload, ['event' => 'start']));
+            $startedAt = microtime(true);
+            $this->rebuildWindow($outletChunk, $windowFrom, $windowTo);
+            $this->emitProgress($progressCallback, array_merge($payload, [
+                'event' => 'complete',
+                'duration_ms' => (int) round((microtime(true) - $startedAt) * 1000),
+            ]));
         }
 
         $this->rememberCoverageReady(

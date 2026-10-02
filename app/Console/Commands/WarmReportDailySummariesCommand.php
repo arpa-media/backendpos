@@ -3,9 +3,11 @@
 namespace App\Console\Commands;
 
 use App\Services\ReportDailySummaryService;
+use App\Support\AnalyticsResponseCache;
+use App\Support\Reporting\MaterializationCliSelfHealing;
 use App\Support\Reporting\WarmCommonRangeResolver;
+use Carbon\CarbonImmutable;
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\DB;
 use Symfony\Component\Console\Helper\ProgressBar;
 
 class WarmReportDailySummariesCommand extends Command
@@ -15,15 +17,21 @@ class WarmReportDailySummariesCommand extends Command
         {--month= : Proses satu bulan tertentu, format YYYY-MM; bulan berjalan dipotong sampai hari ini}
         {--from= : Tanggal awal exact range, format YYYY-MM-DD}
         {--to= : Tanggal akhir exact range, format YYYY-MM-DD}
+        {--outlet=* : Filter outlet berdasarkan ID/kode/nama; dapat diulang atau dipisah koma}
         {--mode=normal : Preset chunk: safe, normal, fast}
         {--outlet-chunk=0 : Override jumlah outlet per chunk; 0 memakai preset mode}
-        {--date-chunk=0 : Override jumlah hari per chunk; 0 memakai preset mode}';
+        {--date-chunk=0 : Override jumlah hari per chunk; 0 memakai preset mode}
+        {--adjacent-days=0 : Perluas repair 0-7 hari di kedua sisi range untuk kasus cutoff}
+        {--force : Abaikan ready/stale gate dan rebuild exact Business-Date Index + Daily Summary}
+        {--audit : Read-only integrity audit; tidak mengubah materialization}
+        {--verify : Verifikasi Raw -> Business-Date Index -> Daily setelah warm/repair}';
 
-    protected $description = 'Warm rolling report daily summaries outside HTTP requests with visible chunk progress and coverage.';
+    protected $description = 'Warm/repair Daily materialization with outlet targeting, force rebuild, audit, and integrity verification.';
 
-    public function handle(ReportDailySummaryService $dailySummaryService): int
+    public function handle(ReportDailySummaryService $dailySummaryService, MaterializationCliSelfHealing $selfHealing): int
     {
         $timezone = config('app.timezone', 'Asia/Jakarta');
+
         try {
             [$dateFrom, $dateTo, $resolvedMonth] = WarmCommonRangeResolver::resolveDateRange(
                 $this->option('month'),
@@ -39,42 +47,53 @@ class WarmReportDailySummariesCommand extends Command
             );
         } catch (\InvalidArgumentException $e) {
             $this->error($e->getMessage());
-
             return self::INVALID;
         }
 
-        $days = \Carbon\CarbonImmutable::parse($dateFrom, $timezone)->diffInDays(\Carbon\CarbonImmutable::parse($dateTo, $timezone)) + 1;
-        $outletIds = DB::table('outlets')
-            ->whereRaw('LOWER(COALESCE(type, ?)) = ?', ['outlet', 'outlet'])
-            ->pluck('id')
-            ->map(fn ($id) => (string) $id)
-            ->filter()
-            ->values()
-            ->all();
-
-        if ($outletIds === []) {
-            $this->warn('No outlets found.');
-
-            return self::SUCCESS;
+        $adjacentDays = max(0, min(7, (int) $this->option('adjacent-days')));
+        [$effectiveFrom, $effectiveTo] = $selfHealing->expandDateRange($dateFrom, $dateTo, $adjacentDays, $timezone);
+        $outlets = $selfHealing->resolveOutlets((array) $this->option('outlet'));
+        if ($outlets === []) {
+            $this->error($this->option('outlet') ? 'Outlet filter tidak ditemukan.' : 'No outlets found.');
+            return self::INVALID;
         }
+        $outletIds = array_map(fn ($row) => (string) $row['id'], $outlets);
+        $days = CarbonImmutable::parse($effectiveFrom, $timezone)->diffInDays(CarbonImmutable::parse($effectiveTo, $timezone)) + 1;
+        $force = (bool) $this->option('force');
+        $auditOnly = (bool) $this->option('audit');
+        $verify = (bool) $this->option('verify');
 
         $this->newLine();
-        $this->info('ERP Finance V8 - Daily Summary Warm');
-        $this->line(sprintf('Range        : %s -> %s (%d days)', $dateFrom, $dateTo, $days));
+        $this->info('HF Materialization CLI Self-Healing - Daily');
+        $this->line(sprintf('Requested    : %s -> %s', $dateFrom, $dateTo));
+        if ($effectiveFrom !== $dateFrom || $effectiveTo !== $dateTo) {
+            $this->line(sprintf('Effective    : %s -> %s (%d days; adjacent=%d)', $effectiveFrom, $effectiveTo, $days, $adjacentDays));
+        } else {
+            $this->line(sprintf('Range        : %s -> %s (%d days)', $effectiveFrom, $effectiveTo, $days));
+        }
         if ($resolvedMonth !== null) {
             $this->line(sprintf('Month        : %s', $resolvedMonth));
         }
         $this->line(sprintf('Mode         : %s', strtoupper($mode)));
-        $this->line(sprintf('Outlets      : %d', count($outletIds)));
+        $this->line(sprintf('Operation    : %s', $auditOnly ? 'AUDIT ONLY' : ($force ? 'FORCE EXACT REBUILD' : 'NORMAL WARM')));
+        $this->line(sprintf('Outlets      : %d (%s)', count($outlets), implode(', ', array_map(fn ($row) => $row['code'] ?: $row['id'], $outlets))));
         $this->line(sprintf('Chunk        : %d outlet(s) x %d day(s)', $outletChunk, $dateChunk));
 
-        $before = $this->safeCoverageStatus($dailySummaryService, $outletIds, $dateFrom, $dateTo, $timezone);
+        if ($auditOnly) {
+            $audit = $selfHealing->auditDaily($outlets, $effectiveFrom, $effectiveTo, $timezone, true);
+            $this->renderDailyAudit($audit);
+            return $audit['ok'] ? self::SUCCESS : self::FAILURE;
+        }
+
+        $before = $this->safeCoverageStatus($dailySummaryService, $outletIds, $effectiveFrom, $effectiveTo, $timezone);
         if ($before !== null) {
             $this->line(sprintf(
-                'Coverage     : %s%% (%s/%s outlet-days) before warm',
+                'Coverage     : %s%% (%s/%s outlet-days) before %s | pending refresh: %d',
                 number_format((float) ($before['coverage_percent'] ?? 0), 2),
                 number_format((int) ($before['covered_rows'] ?? 0)),
-                number_format((int) ($before['expected_coverage_rows'] ?? 0))
+                number_format((int) ($before['expected_coverage_rows'] ?? 0)),
+                $force ? 'repair' : 'warm',
+                (int) ($before['pending_refresh_rows'] ?? 0)
             ));
         }
         $this->newLine();
@@ -91,15 +110,13 @@ class WarmReportDailySummariesCommand extends Command
         $progressCallback = function (array $event) use (&$bars, &$phaseFinished, &$phasePlanned, $phaseLabels): void {
             $phase = (string) ($event['phase'] ?? '');
             $kind = (string) ($event['event'] ?? '');
-            if ($phase === '' || ! isset($phaseLabels[$phase])) {
-                return;
-            }
+            if ($phase === '' || ! isset($phaseLabels[$phase])) return;
 
             if ($kind === 'plan') {
                 $total = max(0, (int) ($event['total'] ?? 0));
                 $phasePlanned[$phase] = $total;
-                $this->line(sprintf('%s%s', $phaseLabels[$phase], $total === 0 ? ' - already ready, no rebuild needed.' : ''));
-
+                $forced = (bool) ($event['forced'] ?? false);
+                $this->line(sprintf('%s%s%s', $phaseLabels[$phase], $forced ? ' [FORCE]' : '', $total === 0 ? ' - already ready, no rebuild needed.' : ''));
                 if ($total > 0) {
                     $bar = $this->output->createProgressBar($total);
                     $bar->setFormat(' %current%/%max% [%bar%] %percent:3s%% | %elapsed:6s% elapsed | ETA %estimated:-6s% | %message%');
@@ -108,32 +125,21 @@ class WarmReportDailySummariesCommand extends Command
                     $bar->start();
                     $bars[$phase] = $bar;
                 }
-
                 return;
             }
 
-            if (! isset($bars[$phase])) {
-                return;
-            }
-
+            if (! isset($bars[$phase])) return;
             $from = (string) ($event['date_from'] ?? '?');
             $to = (string) ($event['date_to'] ?? $from);
             $outletCount = (int) ($event['outlet_count'] ?? 0);
-            $timezone = (string) ($event['timezone'] ?? '');
+            $eventTimezone = (string) ($event['timezone'] ?? '');
             $durationMs = (int) ($event['duration_ms'] ?? 0);
             $duration = $durationMs > 0 ? sprintf(' | %.2fs', $durationMs / 1000) : '';
-            $message = sprintf('%s -> %s | %d outlet(s)%s%s', $from, $to, $outletCount, $timezone !== '' ? ' | '.$timezone : '', $duration);
+            $message = sprintf('%s -> %s | %d outlet(s)%s%s', $from, $to, $outletCount, $eventTimezone !== '' ? ' | '.$eventTimezone : '', $duration);
             $bars[$phase]->setMessage($message);
 
             if ($kind === 'complete') {
                 $bars[$phase]->advance();
-
-                if ($this->output->isVeryVerbose()) {
-                    $bars[$phase]->clear();
-                    $this->line(sprintf('  OK %s', $message));
-                    $bars[$phase]->display();
-                }
-
                 $current = (int) ($event['current'] ?? $bars[$phase]->getProgress());
                 $total = max(0, (int) ($event['total'] ?? ($phasePlanned[$phase] ?? 0)));
                 if ($total > 0 && $current >= $total && ! ($phaseFinished[$phase] ?? false)) {
@@ -145,11 +151,27 @@ class WarmReportDailySummariesCommand extends Command
         };
 
         $startedAt = microtime(true);
-        $dailySummaryService->ensureCoverage($outletIds, $dateFrom, $dateTo, $timezone, [
-            'outlet_chunk' => $outletChunk,
-            'date_chunk_days' => $dateChunk,
-            'progress_callback' => $progressCallback,
-        ]);
+        try {
+            $options = [
+                'outlet_chunk' => $outletChunk,
+                'date_chunk_days' => $dateChunk,
+                'progress_callback' => $progressCallback,
+            ];
+            if ($force) {
+                $dailySummaryService->refreshExactCoverage($outletIds, $effectiveFrom, $effectiveTo, $timezone, $options);
+            } else {
+                $dailySummaryService->ensureCoverage($outletIds, $effectiveFrom, $effectiveTo, $timezone, $options);
+            }
+        } catch (\Throwable $e) {
+            foreach ($bars as $phase => $bar) {
+                if (! ($phaseFinished[$phase] ?? false)) {
+                    $bar->finish();
+                    $this->newLine(2);
+                }
+            }
+            $this->error('Daily materialization failed: '.$e->getMessage());
+            return self::FAILURE;
+        }
         $elapsedSeconds = microtime(true) - $startedAt;
 
         foreach ($bars as $phase => $bar) {
@@ -159,7 +181,9 @@ class WarmReportDailySummariesCommand extends Command
             }
         }
 
-        $after = $this->safeCoverageStatus($dailySummaryService, $outletIds, $dateFrom, $dateTo, $timezone);
+        AnalyticsResponseCache::bumpVersion(($force ? 'daily-summary-force:' : 'daily-summary-warm:').count($outletIds).':'.$effectiveFrom.':'.$effectiveTo);
+
+        $after = $this->safeCoverageStatus($dailySummaryService, $outletIds, $effectiveFrom, $effectiveTo, $timezone);
         if ($after !== null) {
             $this->info(sprintf(
                 'Coverage After: %s%% (%s/%s outlet-days)',
@@ -169,37 +193,55 @@ class WarmReportDailySummariesCommand extends Command
             ));
         }
 
-        if (($phasePlanned['business_index'] ?? 0) === 0 && ($phasePlanned['daily_summary'] ?? 0) === 0) {
-            $this->comment('No rebuild was required; requested coverage was already ready.');
+        if ($verify) {
+            $this->newLine();
+            $this->info('Integrity Verification: Raw -> Business-Date Index -> Daily');
+            $audit = $selfHealing->auditDaily($outlets, $effectiveFrom, $effectiveTo, $timezone, false);
+            $this->renderDailyAudit($audit);
+            if (! $audit['ok']) {
+                $this->error(sprintf('Verification FAILED: %d outlet-date mismatch(es). Refresh queue is preserved.', $audit['issues']));
+                return self::FAILURE;
+            }
+
+            if ($force) {
+                $cleared = $selfHealing->clearDailyRefreshQueue($outletIds, $effectiveFrom, $effectiveTo);
+                if ($cleared > 0) {
+                    $this->comment(sprintf('Refresh queue reconciled: %d row(s) cleared after PASS.', $cleared));
+                }
+            }
         }
 
-        $this->info('Report daily summaries warmed successfully.');
-        $this->line(sprintf(
-            'Completed in %s | range: %s to %s | outlet chunk: %d | date chunk: %d',
-            $this->formatDuration($elapsedSeconds),
-            $dateFrom,
-            $dateTo,
-            $outletChunk,
-            $dateChunk
-        ));
+        if (! $force && ($phasePlanned['business_index'] ?? 0) === 0 && ($phasePlanned['daily_summary'] ?? 0) === 0) {
+            $this->comment('No rebuild was required; requested coverage was already ready. Use --force --verify for integrity repair.');
+        }
+
+        $this->info($force ? 'Daily FORCE repair completed.' : 'Report daily summaries warmed successfully.');
+        $this->line(sprintf('Completed in %s | effective range: %s to %s', $this->formatDuration($elapsedSeconds), $effectiveFrom, $effectiveTo));
 
         return self::SUCCESS;
     }
 
-    private function safeCoverageStatus(
-        ReportDailySummaryService $service,
-        array $outletIds,
-        string $dateFrom,
-        string $dateTo,
-        string $timezone
-    ): ?array {
+    private function renderDailyAudit(array $audit): void
+    {
+        $this->table(
+            ['Outlet', 'Date', 'Raw Trx', 'Index Trx', 'Daily Trx', 'Raw Sales', 'Daily Sales', 'Coverage', 'Queue', 'Touch', 'Attempt', 'Status'],
+            array_map(fn ($row) => [
+                $row['outlet'], $row['date'], $row['raw_trx'], $row['index_trx'], $row['daily_trx'],
+                number_format((int) $row['raw_sales']), number_format((int) $row['daily_sales']),
+                $row['coverage'], $row['queue'], $row['touch'], $row['attempt'], $row['status'],
+            ], $audit['rows'])
+        );
+        $audit['ok']
+            ? $this->info('Integrity: PASS')
+            : $this->warn(sprintf('Integrity: MISMATCH (%d row(s)); pending queue: %d.', $audit['issues'], $audit['pending_queue'] ?? 0));
+    }
+
+    private function safeCoverageStatus(ReportDailySummaryService $service, array $outletIds, string $dateFrom, string $dateTo, string $timezone): ?array
+    {
         try {
             return $service->readContractStatus($outletIds, $dateFrom, $dateTo, $timezone);
         } catch (\Throwable $e) {
-            if ($this->output->isVerbose()) {
-                $this->warn('Coverage status unavailable: '.$e->getMessage());
-            }
-
+            if ($this->output->isVerbose()) $this->warn('Coverage status unavailable: '.$e->getMessage());
             return null;
         }
     }
@@ -210,9 +252,6 @@ class WarmReportDailySummariesCommand extends Command
         $hours = intdiv($seconds, 3600);
         $minutes = intdiv($seconds % 3600, 60);
         $remainingSeconds = $seconds % 60;
-
-        return $hours > 0
-            ? sprintf('%02d:%02d:%02d', $hours, $minutes, $remainingSeconds)
-            : sprintf('%02d:%02d', $minutes, $remainingSeconds);
+        return $hours > 0 ? sprintf('%02d:%02d:%02d', $hours, $minutes, $remainingSeconds) : sprintf('%02d:%02d', $minutes, $remainingSeconds);
     }
 }

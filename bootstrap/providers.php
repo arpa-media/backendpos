@@ -9,6 +9,7 @@ return [
     App\Providers\FinanceRouteServiceProvider::class,
     App\Providers\OperationalAnalyticsRouteServiceProvider::class,
     App\Providers\ConsoleRouteServiceProvider::class,
+    App\Providers\GeneralAffairRouteServiceProvider::class,
     App\Providers\HumanResourceSelfServiceRouteServiceProvider::class,
     App\Providers\CogsConsumptionServiceProvider::class,
     App\Providers\CogsVarianceServiceProvider::class,
