@@ -2,6 +2,7 @@
 
 namespace App\Services\Reporting;
 
+use App\Jobs\Reporting\ContinueReportingMaterializationRunJob;
 use App\Jobs\Reporting\ProcessReportingMaterializationChunkJob;
 use App\Services\Operational\ReportHourlySummaryService;
 use App\Services\ReportDailySummaryService;
@@ -92,6 +93,7 @@ class ReportingMaterializationOrchestrator
             if ($this->activeRun()) throw new \RuntimeException('Masih ada Reporting Engine run yang aktif. Pause/Cancel/selesaikan run tersebut terlebih dahulu.');
             return $this->createRunUnlocked($params,$userId,$trigger);
         }, 3);
+        $this->kickRun($runId);
         return $this->runDetail($runId);
     }
 
@@ -114,6 +116,7 @@ class ReportingMaterializationOrchestrator
             $this->lockOrchestratorRow();
             DB::table('report_materialization_runs')->where('id',$runId)->whereIn('status',['paused','pause_requested','waiting_window'])->update(['status'=>'queued','pause_requested_at'=>null,'updated_at'=>now()]);
         },3);
+        $this->kickRun($runId);
         return $this->runDetail($runId);
     }
 
@@ -150,6 +153,7 @@ class ReportingMaterializationOrchestrator
             DB::table('report_materialization_runs')->where('id',$runId)->update(['status'=>'queued','current_stage'=>$first->stage,'finished_at'=>null,'last_error'=>null,'updated_at'=>now()]);
             $this->syncRunProgress($runId);
         },3);
+        $this->kickRun($runId);
         return $this->runDetail($runId);
     }
 
@@ -227,8 +231,109 @@ class ReportingMaterializationOrchestrator
         return $claims;
     }
 
+    /** Lightweight manual kick for the currently active persisted run. */
+    public function kickActiveRun(?int $maxDispatch=null): array
+    {
+        $active=$this->activeRun();
+        if(!$active) return ['processed'=>0,'dispatched'=>0,'state'=>'idle','run_id'=>null,'next_retry_at'=>null];
+        return $this->kickRun((string)$active->id,$maxDispatch);
+    }
+
+    /**
+     * V11 I04: dispatch/continue one persisted run without pretending that an
+     * HTTP request is a scheduler heartbeat. Heavy work still runs only on the
+     * dedicated reporting queue worker.
+     */
+    public function kickRun(string $runId, ?int $maxDispatch=null): array
+    {
+        $claims = DB::transaction(function () use ($runId,$maxDispatch): array {
+            $this->lockOrchestratorRow();
+            // V11 I06: manual/worker continuation is also a recovery boundary.
+            // Do not depend on schedule:run to reclaim an expired worker lease.
+            $this->recoverStaleLeasesLocked();
+            $run=DB::table('report_materialization_runs')->where('id',$runId)->first();
+            if(!$run) return ['claims'=>[],'processed'=>0,'state'=>'missing','run_id'=>$runId,'next_retry_at'=>null];
+            if(in_array((string)$run->status,['completed','completed_with_errors','cancelled','failed'],true)) {
+                return ['claims'=>[],'processed'=>0,'state'=>(string)$run->status,'run_id'=>$runId,'next_retry_at'=>null];
+            }
+            if((string)$run->status==='pause_requested') {
+                DB::table('report_materialization_run_chunks')->where('run_id',$runId)->where('status','dispatched')->update([
+                    'status'=>'queued','dispatch_token'=>null,'dispatched_at'=>null,'lease_expires_at'=>null,'available_at'=>now(),'updated_at'=>now(),
+                ]);
+                if(!$this->hasRunningChunks($runId)) DB::table('report_materialization_runs')->where('id',$runId)->update(['status'=>'paused','current_label'=>null,'updated_at'=>now()]);
+                return ['claims'=>[],'processed'=>0,'state'=>(string)(DB::table('report_materialization_runs')->where('id',$runId)->value('status')??'paused'),'run_id'=>$runId,'next_retry_at'=>null];
+            }
+            if((string)$run->status==='cancel_requested') {
+                DB::table('report_materialization_run_chunks')->where('run_id',$runId)->whereIn('status',['queued','pending_stage','dispatched'])->update([
+                    'status'=>'cancelled','dispatch_token'=>null,'worker_token'=>null,'lease_expires_at'=>null,'finished_at'=>now(),'updated_at'=>now(),
+                ]);
+                if(!$this->hasRunningChunks($runId)) {
+                    DB::table('report_materialization_runs')->where('id',$runId)->update(['status'=>'cancelled','progress_percent'=>100,'finished_at'=>now(),'current_label'=>null,'estimated_seconds_remaining'=>0,'updated_at'=>now()]);
+                    $this->releaseRecoveryRequestsForCancelledRun($runId);
+                    $this->syncRunProgress($runId);
+                }
+                return ['claims'=>[],'processed'=>0,'state'=>(string)(DB::table('report_materialization_runs')->where('id',$runId)->value('status')??'cancelled'),'run_id'=>$runId,'next_retry_at'=>null];
+            }
+            if(in_array((string)$run->status,['paused','waiting_window'],true)) {
+                return ['claims'=>[],'processed'=>0,'state'=>(string)$run->status,'run_id'=>$runId,'next_retry_at'=>null];
+            }
+            if(!$this->insideAllowedWindow($run)) {
+                if((string)$run->trigger==='auto') DB::table('report_materialization_runs')->where('id',$runId)->update(['status'=>'waiting_window','updated_at'=>now()]);
+                return ['claims'=>[],'processed'=>0,'state'=>'waiting_window','run_id'=>$runId,'next_retry_at'=>null];
+            }
+
+            $run=$this->advanceUntilDispatchableLocked($runId);
+            if(!$run || in_array((string)$run->status,['completed','completed_with_errors','cancelled','failed'],true)) {
+                return ['claims'=>[],'processed'=>0,'state'=>$run?->status ?? 'completed','run_id'=>$runId,'next_retry_at'=>null];
+            }
+
+            $settings=$this->settings();
+            $batch=max(1,min(20,(int)($maxDispatch ?? $settings['dispatch_batch'])));
+            $claims=$this->claimDispatchableChunksLocked($run,$batch,(int)$settings['worker_lease_seconds']);
+            if($claims!==[]) {
+                DB::table('report_materialization_runs')->where('id',$runId)->update(['status'=>'running','started_at'=>$run->started_at ?: now(),'updated_at'=>now()]);
+                DB::table('report_materialization_settings')->where('id','default')->update(['last_dispatch_at'=>now(),'updated_at'=>now()]);
+            }
+
+            $inFlight=$this->hasRunningOrDispatchedChunks($runId);
+            $nextRetryAt=null;
+            if($claims===[] && !$inFlight) {
+                $nextRetryAt=DB::table('report_materialization_run_chunks')
+                    ->where('run_id',$runId)->where('stage',(string)$run->current_stage)->where('status','queued')
+                    ->whereNotNull('available_at')->where('available_at','>',now())->min('available_at');
+            }
+            $state=$claims!==[]?'dispatched':($inFlight?'worker_active':($nextRetryAt?'retry_wait':'idle'));
+            return ['claims'=>$claims,'processed'=>count($claims),'state'=>$state,'run_id'=>$runId,'next_retry_at'=>$nextRetryAt];
+        },3);
+
+        $dispatched=0;
+        $dispatchFailed=false;
+        foreach($claims['claims'] as $claim) {
+            try {
+                ProcessReportingMaterializationChunkJob::dispatch($claim['chunk_id'],$claim['dispatch_token']);
+                $dispatched++;
+            } catch(\Throwable $e) {
+                $dispatchFailed=true;
+                DB::table('report_materialization_run_chunks')->where('id',$claim['chunk_id'])->where('dispatch_token',$claim['dispatch_token'])->where('status','dispatched')->update([
+                    'status'=>'queued','dispatch_token'=>null,'dispatched_at'=>null,'lease_expires_at'=>null,'available_at'=>now()->addSeconds(30),'last_error'=>'Queue dispatch failed: '.mb_substr($e->getMessage(),0,4500),'updated_at'=>now(),
+                ]);
+                DB::table('report_materialization_runs')->where('id',$claim['run_id'])->update(['last_error'=>'Queue dispatch failed: '.mb_substr($e->getMessage(),0,4500),'updated_at'=>now()]);
+            }
+        }
+        unset($claims['claims']);
+        $claims['dispatched']=$dispatched;
+
+        if($dispatchFailed) {
+            $this->scheduleRunContinuation($runId,now()->addSeconds(35),'dispatch_retry');
+        } elseif(!empty($claims['next_retry_at'])) {
+            $this->scheduleRunContinuation($runId,CarbonImmutable::parse((string)$claims['next_retry_at'])->addSecond(),'retry_wait');
+        }
+
+        return $claims;
+    }
+
     /** Execute exactly one persisted chunk from the dedicated reporting worker. */
-    public function executeQueuedChunk(string $chunkId,string $dispatchToken): void
+    public function executeQueuedChunk(string $chunkId,string $dispatchToken): ?string
     {
         $context=DB::transaction(function () use ($chunkId,$dispatchToken): ?array {
             $chunk=DB::table('report_materialization_run_chunks')->where('id',$chunkId)->lockForUpdate()->first();
@@ -253,7 +358,7 @@ class ReportingMaterializationOrchestrator
             $freshChunk=DB::table('report_materialization_run_chunks')->where('id',$chunkId)->first();
             return ['run'=>$run,'chunk'=>$freshChunk,'settings'=>$settings,'worker_token'=>$workerToken];
         },3);
-        if(!$context) return;
+        if(!$context) return null;
 
         $run=$context['run']; $chunk=$context['chunk']; $settings=$context['settings']; $workerToken=$context['worker_token']; $started=microtime(true);
         try {
@@ -268,6 +373,7 @@ class ReportingMaterializationOrchestrator
             $this->syncRunProgress((string)$run->id);
             $this->settleRequestedRunState((string)$run->id);
         }
+        return (string)$run->id;
     }
 
     /** Lightweight status for UI polling. Avoids rolling coverage/calendar scans. */
@@ -389,9 +495,10 @@ class ReportingMaterializationOrchestrator
             return $id;
         }, 3);
 
-        // Dispatch immediately when worker capacity exists; scheduler remains the fallback.
-        $settings = $this->settings();
-        $this->tick((int) ($settings['dispatch_batch'] ?? 4));
+        // V11 I04: dispatch immediately without updating scheduler heartbeat.
+        // The web request only kicks persisted queue work; heavy work stays in CLI.
+        $runId=$this->ensureRecoveryRequestAttached($requestId);
+        if($runId) $this->kickRun($runId);
 
         return $this->recoveryRequestDetail($requestId, $pipeline, $ids, $from, $to);
     }
@@ -728,6 +835,49 @@ class ReportingMaterializationOrchestrator
         ]);
     }
 
+    /**
+     * Attach one queued recovery request without invoking scheduler tick().
+     * This keeps browser-triggered recovery from falsifying scheduler health.
+     */
+    private function ensureRecoveryRequestAttached(string $requestId): ?string
+    {
+        return DB::transaction(function () use ($requestId): ?string {
+            $this->lockOrchestratorRow();
+            $request=DB::table('report_materialization_recovery_requests')->where('id',$requestId)->lockForUpdate()->first();
+            if(!$request) return null;
+            if((string)$request->status==='attached' && !empty($request->run_id)) return (string)$request->run_id;
+            if((string)$request->status!=='queued') return null;
+
+            $ids=json_decode((string)$request->outlet_ids,true) ?: [];
+            $active=$this->activeRun();
+            if($active && (string)$active->trigger==='auto' && (string)$active->status==='waiting_window') {
+                $this->preemptWaitingAutoRunForDemandLocked($active);
+                $active=$this->activeRun();
+            }
+            if($active && $this->runCanAbsorbRecovery($active,(string)$request->pipeline,$ids,(string)$request->date_from,(string)$request->date_to)) {
+                $this->prioritizeRunCoverageLocked((string)$active->id,(string)$request->pipeline,$ids,(string)$request->date_from,(string)$request->date_to);
+                DB::table('report_materialization_recovery_requests')->where('id',$requestId)->update([
+                    'status'=>'attached','run_id'=>(string)$active->id,'attached_at'=>now(),'updated_at'=>now(),
+                ]);
+                return (string)$active->id;
+            }
+            if($active) return null;
+
+            $runId=$this->createRunUnlocked([
+                'date_from'=>(string)$request->date_from,
+                'date_to'=>(string)$request->date_to,
+                'outlet_ids'=>$ids,
+                'pipeline'=>(string)$request->pipeline,
+                'mode'=>'missing_only',
+            ],$request->requested_by?(string)$request->requested_by:null,'demand');
+            $this->prioritizeRunCoverageLocked($runId,(string)$request->pipeline,$ids,(string)$request->date_from,(string)$request->date_to);
+            DB::table('report_materialization_recovery_requests')->where('id',$requestId)->update([
+                'status'=>'attached','run_id'=>$runId,'attached_at'=>now(),'updated_at'=>now(),
+            ]);
+            return $runId;
+        },3);
+    }
+
     private function maybeCreateDemandRunUnlocked(): void
     {
         if (! Schema::hasTable('report_materialization_recovery_requests') || $this->activeRun()) return;
@@ -862,6 +1012,19 @@ class ReportingMaterializationOrchestrator
         return ['scheduler_state'=>$schedulerState,'scheduler_tick_age_seconds'=>$tickAge,'worker_state'=>$workerState,'worker_last_activity_age_seconds'=>$workerAge,'running_chunks'=>$running,'dispatched_chunks'=>$dispatched,'stale_leases'=>$stale,'failed_chunks_24h'=>$failed24h,'queue_depth'=>$queueDepth,'queue_connection'=>'reporting','queue_name'=>(string)config('queue.connections.reporting.queue','reporting'),'worker_lease_seconds'=>$settings['worker_lease_seconds'],'max_attempts'=>$settings['max_attempts']];
     }
 
+
+    /** Queue a lightweight CLI wake-up for a retry window. */
+    private function scheduleRunContinuation(string $runId, $when, string $reason): void
+    {
+        try {
+            ContinueReportingMaterializationRunJob::dispatch($runId,$reason)->delay($when);
+        } catch(\Throwable $e) {
+            DB::table('report_materialization_runs')->where('id',$runId)->update([
+                'last_error'=>'Continuation dispatch failed: '.mb_substr($e->getMessage(),0,4500),
+                'updated_at'=>now(),
+            ]);
+        }
+    }
 
     /** Finalize pause/cancel as soon as the last running chunk has stopped. */
     private function settleRequestedRunState(string $runId): void
