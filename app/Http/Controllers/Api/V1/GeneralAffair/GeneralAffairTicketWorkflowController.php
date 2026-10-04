@@ -24,6 +24,9 @@ class GeneralAffairTicketWorkflowController extends Controller
      */
     public function managerStore(Request $request): JsonResponse
     {
+        // I20: GA executor is an operational owner and is mandatory for manager-created tickets.
+        // Target realization and estimate fee intentionally remain optional.
+        $this->validateManagerOperationalFields($request);
         $request->merge(['status' => 'PENINJAUAN']);
         return app(GeneralAffairTicketController::class)->managerStore($request);
     }
@@ -35,6 +38,10 @@ class GeneralAffairTicketWorkflowController extends Controller
      */
     public function managerUpdate(Request $request, string $id): JsonResponse
     {
+        // I20 keeps manager operational edits available after a ticket has entered
+        // Proses Pengerjaan. Requester edits remain locked by requesterUpdate().
+        $this->validateManagerOperationalFields($request);
+
         return DB::transaction(function () use ($request, $id): JsonResponse {
             $ticket = Ticket::query()->lockForUpdate()->find($id);
             if (! $ticket) return ApiResponse::error('Ticket tidak ditemukan.', 'NOT_FOUND', 404);
@@ -162,6 +169,17 @@ class GeneralAffairTicketWorkflowController extends Controller
 
             $from = (string) $ticket->status;
             $to = (string) $data['target_status'];
+
+            // I20 backfills the mandatory-executor contract for legacy/requester-created tickets.
+            // A ticket may stay/re-enter Pending without an executor, but it cannot progress into
+            // the operational workflow until GA assigns one.
+            if (in_array($to, ['PENGAJUAN', 'PROSES_PENGERJAAN', 'REPORT', 'SELESAI'], true)
+                && blank($ticket->executor_name)) {
+                throw \Illuminate\Validation\ValidationException::withMessages([
+                    'executor_name' => ['Eksekutor wajib diisi sebelum ticket dilanjutkan ke status operasional.'],
+                ]);
+            }
+
             $this->workflow->assertTransitionAllowed($ticket, $to);
 
             // Clone the framework request so validation/container/user resolvers remain intact.
@@ -246,4 +264,29 @@ class GeneralAffairTicketWorkflowController extends Controller
         $decoded = $response->getData(true);
         return is_array($decoded['data'] ?? null) ? $decoded['data'] : [];
     }
+    /**
+     * I20 operational ticket contract.
+     *
+     * Executor is mandatory for GA manager create/edit. Target realization and
+     * estimate fee remain explicitly nullable so operational tickets can be
+     * assigned first and scheduled/costed later.
+     */
+    private function validateManagerOperationalFields(Request $request): void
+    {
+        $request->merge([
+            'executor_name' => trim((string) $request->input('executor_name', '')),
+        ]);
+
+        $request->validate([
+            'executor_name' => ['required', 'string', 'max:180'],
+            'target_realization_at' => ['nullable', 'date'],
+            'estimate_fee' => ['nullable', 'numeric', 'min:0', 'max:9999999999999999.99'],
+        ], [
+            'executor_name.required' => 'Eksekutor wajib diisi.',
+            'target_realization_at.date' => 'Target realisasi harus berupa tanggal dan waktu yang valid.',
+            'estimate_fee.numeric' => 'Estimate fee harus berupa angka.',
+            'estimate_fee.min' => 'Estimate fee tidak boleh kurang dari 0.',
+        ]);
+    }
+
 }

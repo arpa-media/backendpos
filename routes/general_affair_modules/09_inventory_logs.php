@@ -9,4 +9,5 @@ Route::prefix('api/v1/general-affair/inventory-logs')->middleware(['api', 'auth:
     Route::get('/', [GeneralAffairInventoryLogController::class, 'index'])->middleware('permission_or_snapshot:ga.inventory_log.view');
     Route::get('/{id}', [GeneralAffairInventoryLogController::class, 'show'])->middleware('permission_or_snapshot:ga.inventory_log.view');
     Route::post('/', [GeneralAffairInventoryLogController::class, 'store'])->middleware('permission_or_snapshot:ga.inventory_log.create');
+    Route::post('/{id}/return', [GeneralAffairInventoryLogController::class, 'returnLoan'])->middleware('permission_or_snapshot:ga.inventory_log.create');
 });

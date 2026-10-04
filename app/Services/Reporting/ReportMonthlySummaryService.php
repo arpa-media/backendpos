@@ -8,6 +8,8 @@ use Illuminate\Support\Facades\Schema;
 
 class ReportMonthlySummaryService
 {
+    public function __construct(private readonly ReportReadinessService $readinessService) {}
+
     private const FAMILIES = [
         'sales' => [
             'daily' => 'report_daily_sales_summaries', 'monthly' => 'report_monthly_sales_summaries',
@@ -40,9 +42,20 @@ class ReportMonthlySummaryService
         if ($outletIds === [] || !$this->tablesReady()) return ['outlets'=>0,'business_month'=>$from,'coverage_rows'=>0];
 
         $expectedDaily = count($outletIds) * $month->daysInMonth;
-        $dailyCoverage = DB::table('report_daily_summary_coverage')->whereIn('outlet_id',$outletIds)->whereBetween('business_date',[$from,$to])->count();
-        if ($dailyCoverage < $expectedDaily) {
-            throw new \RuntimeException("Daily coverage incomplete for {$from}: {$dailyCoverage}/{$expectedDaily} outlet-days.");
+        $dailyReadiness = $this->readinessService->dailyMatrixStatus(
+            $outletIds,
+            $from,
+            $to,
+            (string) config('app.timezone', 'Asia/Jakarta'),
+        );
+        if (! (bool) ($dailyReadiness['ready'] ?? false)) {
+            $readyRows = (int) ($dailyReadiness['ready_rows'] ?? 0);
+            $pending = (int) ($dailyReadiness['effective_pending_refresh_rows'] ?? 0);
+            $premature = (int) ($dailyReadiness['premature_rows'] ?? 0);
+            throw new \RuntimeException(
+                "Daily readiness incomplete for {$from}: {$readyRows}/{$expectedDaily} outlet-days; "
+                . "effective pending={$pending}; premature={$premature}."
+            );
         }
 
         $now = now()->format('Y-m-d H:i:s');
@@ -95,38 +108,102 @@ class ReportMonthlySummaryService
 
     public function readContractStatus(array $outletIds, string $businessMonth): array
     {
-        $outletIds=$this->normalizeOutletIds($outletIds); $month=CarbonImmutable::parse($businessMonth)->startOfMonth(); $from=$month->toDateString(); $to=$month->endOfMonth()->toDateString(); $expected=count($outletIds);
-        if ($expected===0 || !$this->tablesReady()) return ['ready'=>false,'coverage_percent'=>0.0,'ready_rows'=>0,'expected_rows'=>$expected,'business_month'=>$from];
-        $dailyExpected=$expected*$month->daysInMonth;
-        $dailyRows=DB::table('report_daily_summary_coverage')->whereIn('outlet_id',$outletIds)->whereBetween('business_date',[$from,$to])->count();
+        $outletIds = $this->normalizeOutletIds($outletIds);
+        $month = CarbonImmutable::parse($businessMonth)->startOfMonth();
+        $from = $month->toDateString();
+        $to = $month->endOfMonth()->toDateString();
+        $expected = count($outletIds);
+
+        if ($expected === 0 || ! $this->tablesReady()) {
+            return [
+                'contract' => 'erp_pos_v11_i01_monthly_real_readiness',
+                'ready' => false,
+                'coverage_percent' => 0.0,
+                'readiness_percent' => 0.0,
+                'physical_coverage_percent' => 0.0,
+                'ready_rows' => 0,
+                'expected_rows' => $expected,
+                'business_month' => $from,
+            ];
+        }
+
+        $daily = $this->readinessService->dailyMatrixStatus(
+            $outletIds,
+            $from,
+            $to,
+            (string) config('app.timezone', 'Asia/Jakarta'),
+        );
+        $dailyExpected = (int) ($daily['expected_rows'] ?? ($expected * $month->daysInMonth));
+        $dailyReadyRows = (int) ($daily['ready_rows'] ?? 0);
+        $dirtyOutletIds = array_values(array_map('strval', $daily['dirty_outlet_ids'] ?? []));
+
         $hasGeneration = Schema::hasColumn('report_daily_summary_coverage', 'generation_ulid')
             && Schema::hasColumn('report_monthly_summary_coverage', 'source_daily_generation_ulid');
-        $readyRowsQuery=DB::table('report_monthly_summary_coverage as m')->whereIn('m.outlet_id',$outletIds)->where('m.business_month',$from);
-        $readyRowsQuery->whereNotExists(function($q) use($from,$to,$hasGeneration): void {
+
+        $physicalMonthlyRows = DB::table('report_monthly_summary_coverage')
+            ->whereIn('outlet_id', $outletIds)
+            ->where('business_month', $from)
+            ->count();
+
+        $readyRowsQuery = DB::table('report_monthly_summary_coverage as m')
+            ->whereIn('m.outlet_id', $outletIds)
+            ->where('m.business_month', $from);
+
+        if ($dirtyOutletIds !== []) {
+            $readyRowsQuery->whereNotIn('m.outlet_id', $dirtyOutletIds);
+        }
+
+        $readyRowsQuery->whereNotExists(function ($q) use ($from, $to, $hasGeneration): void {
             $q->selectRaw('1')
                 ->from('report_daily_summary_coverage as d')
-                ->whereColumn('d.outlet_id','m.outlet_id')
-                ->whereBetween('d.business_date',[$from,$to])
-                ->where(function($stale) use($hasGeneration): void {
+                ->whereColumn('d.outlet_id', 'm.outlet_id')
+                ->whereBetween('d.business_date', [$from, $to])
+                ->where(function ($stale) use ($hasGeneration): void {
                     if ($hasGeneration) {
-                        $stale->where(function($generation): void {
+                        $stale->where(function ($generation): void {
                             $generation->whereNotNull('d.generation_ulid')
-                                ->where(function($compare): void {
+                                ->where(function ($compare): void {
                                     $compare->whereNull('m.source_daily_generation_ulid')
-                                        ->orWhereColumn('d.generation_ulid','>','m.source_daily_generation_ulid');
+                                        ->orWhereColumn('d.generation_ulid', '>', 'm.source_daily_generation_ulid');
                                 });
-                        })->orWhere(function($legacy): void {
+                        })->orWhere(function ($legacy): void {
                             $legacy->whereNull('d.generation_ulid')
-                                ->whereColumn('d.synced_at','>','m.source_daily_max_synced_at');
+                                ->whereColumn('d.synced_at', '>', 'm.source_daily_max_synced_at');
                         });
                     } else {
-                        $stale->whereColumn('d.synced_at','>','m.source_daily_max_synced_at');
+                        $stale->whereColumn('d.synced_at', '>', 'm.source_daily_max_synced_at');
                     }
                 });
         });
-        $readyRows=$readyRowsQuery->count();
-        $ready=$dailyRows===$dailyExpected && $readyRows===$expected;
-        return ['contract'=>'erp_finance_v8_i10_monthly','freshness'=>$hasGeneration?'generation_ulid':'timestamp_fallback','ready'=>$ready,'business_month'=>$from,'expected_rows'=>$expected,'ready_rows'=>$readyRows,'daily_expected_rows'=>$dailyExpected,'daily_ready_rows'=>$dailyRows,'coverage_percent'=>$expected>0?round(($readyRows/$expected)*100,2):100.0];
+
+        $readyRows = $readyRowsQuery->count();
+        $dailyReady = (bool) ($daily['ready'] ?? false);
+        $ready = $dailyReady && $readyRows === $expected;
+        $readinessPercent = $expected > 0 ? round(($readyRows / $expected) * 100, 2) : 100.0;
+        $physicalPercent = $expected > 0 ? round((min($expected, $physicalMonthlyRows) / $expected) * 100, 2) : 100.0;
+
+        return [
+            'contract' => 'erp_pos_v11_i01_monthly_real_readiness',
+            'freshness' => $hasGeneration ? 'generation_ulid+daily_real_readiness' : 'timestamp_fallback+daily_real_readiness',
+            'ready' => $ready,
+            'state' => $ready ? 'ready' : (! $dailyReady ? 'daily_not_ready' : 'monthly_not_fresh'),
+            'business_month' => $from,
+            'expected_rows' => $expected,
+            'ready_rows' => $readyRows,
+            'missing_rows' => max(0, $expected - $readyRows),
+            'daily_expected_rows' => $dailyExpected,
+            'daily_ready_rows' => $dailyReadyRows,
+            'daily_ready' => $dailyReady,
+            'coverage_percent' => $readinessPercent,
+            'readiness_percent' => $readinessPercent,
+            'physical_monthly_rows' => $physicalMonthlyRows,
+            'physical_coverage_percent' => $physicalPercent,
+            'effective_pending_refresh_rows' => (int) ($daily['effective_pending_refresh_rows'] ?? 0),
+            'raw_pending_refresh_rows' => (int) ($daily['raw_pending_refresh_rows'] ?? 0),
+            'stale_refresh_flag_rows' => (int) ($daily['stale_refresh_flag_rows'] ?? 0),
+            'premature_rows' => (int) ($daily['premature_rows'] ?? 0),
+            'dirty_outlet_ids' => $dirtyOutletIds,
+        ];
     }
 
     public function staleMonths(string $fromDate, string $toDate, array $outletIds): array

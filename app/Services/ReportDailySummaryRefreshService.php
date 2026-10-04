@@ -186,12 +186,14 @@ class ReportDailySummaryRefreshService
                 'processed_windows' => 0,
                 'processed_rows' => 0,
                 'failed_rows' => 0,
+                'race_changed_rows' => 0,
             ];
         }
 
         $processedWindows = 0;
         $processedRows = 0;
         $failedRows = 0;
+        $raceChangedRows = 0;
 
         $groups = $this->groupClaimedRows($claimed, $dateChunk);
         foreach (array_chunk($groups, $outletChunk) as $groupChunk) {
@@ -207,20 +209,24 @@ class ReportDailySummaryRefreshService
                         'date_chunk_days' => $dateChunk,
                     ]);
 
-                    DB::table('report_daily_summary_refresh_queue')
-                        ->whereIn(DB::raw("CONCAT(outlet_id, '#', business_date)"), $group['queue_keys'])
-                        ->delete();
-
-                    $processedRows += count($group['queue_keys']);
+                    foreach ($group['queue_snapshots'] as $snapshot) {
+                        if ($this->deleteClaimedSnapshotIfUnchanged($snapshot)) {
+                            $processedRows++;
+                        } else {
+                            // A sale mutation may have re-touched the same outlet/date
+                            // while this worker was rebuilding. Never delete that newer
+                            // signal; leave it pending for the next pass.
+                            $raceChangedRows++;
+                        }
+                    }
                 } catch (\Throwable $e) {
-                    $failedRows += count($group['queue_keys']);
-                    DB::table('report_daily_summary_refresh_queue')
-                        ->whereIn(DB::raw("CONCAT(outlet_id, '#', business_date)"), $group['queue_keys'])
-                        ->update([
-                            'status' => 'pending',
-                            'last_error' => substr($e->getMessage(), 0, 1000),
-                            'updated_at' => now(),
-                        ]);
+                    foreach ($group['queue_snapshots'] as $snapshot) {
+                        if ($this->releaseClaimedSnapshotIfUnchanged($snapshot, $e->getMessage())) {
+                            $failedRows++;
+                        } else {
+                            $raceChangedRows++;
+                        }
+                    }
                 }
             }
         }
@@ -234,6 +240,7 @@ class ReportDailySummaryRefreshService
             'processed_windows' => $processedWindows,
             'processed_rows' => $processedRows,
             'failed_rows' => $failedRows,
+            'race_changed_rows' => $raceChangedRows,
         ];
     }
 
@@ -252,15 +259,19 @@ class ReportDailySummaryRefreshService
                 return collect();
             }
 
-            $keys = $rows->map(fn ($row) => sprintf('%s#%s', (string) ($row->outlet_id ?? ''), (string) ($row->business_date ?? '')))->all();
-            DB::table('report_daily_summary_refresh_queue')
-                ->whereIn(DB::raw("CONCAT(outlet_id, '#', business_date)"), $keys)
-                ->update([
-                    'status' => 'processing',
-                    'last_attempted_at' => now(),
-                    'updated_at' => now(),
-                    'attempt_count' => DB::raw('attempt_count + 1'),
-                ]);
+            foreach ($rows as $row) {
+                DB::table('report_daily_summary_refresh_queue')
+                    ->where('outlet_id', (string) ($row->outlet_id ?? ''))
+                    ->where('business_date', (string) ($row->business_date ?? ''))
+                    ->where('status', 'pending')
+                    ->where('touch_count', (int) ($row->touch_count ?? 0))
+                    ->update([
+                        'status' => 'processing',
+                        'last_attempted_at' => now(),
+                        'updated_at' => now(),
+                        'attempt_count' => DB::raw('attempt_count + 1'),
+                    ]);
+            }
 
             return $rows;
         }, 3);
@@ -279,6 +290,12 @@ class ReportDailySummaryRefreshService
             $bucketed[$timezone][$outletId][] = [
                 'date' => $date,
                 'key' => sprintf('%s#%s', $outletId, $date),
+                'snapshot' => [
+                    'outlet_id' => $outletId,
+                    'business_date' => $date,
+                    'touch_count' => (int) ($row->touch_count ?? 0),
+                    'last_touched_at' => $row->last_touched_at ?? null,
+                ],
             ];
         }
 
@@ -288,6 +305,7 @@ class ReportDailySummaryRefreshService
                 usort($items, fn ($a, $b) => strcmp($a['date'], $b['date']));
                 $windowDates = [];
                 $windowKeys = [];
+                $windowSnapshots = [];
                 $prev = null;
                 foreach ($items as $item) {
                     $curr = CarbonImmutable::parse($item['date'], $timezone);
@@ -299,12 +317,15 @@ class ReportDailySummaryRefreshService
                             'date_from' => $windowDates[0],
                             'date_to' => end($windowDates),
                             'queue_keys' => $windowKeys,
+                            'queue_snapshots' => $windowSnapshots,
                         ];
                         $windowDates = [];
                         $windowKeys = [];
+                        $windowSnapshots = [];
                     }
                     $windowDates[] = $item['date'];
                     $windowKeys[] = $item['key'];
+                    $windowSnapshots[] = $item['snapshot'];
                     $prev = $curr;
                 }
                 if ($windowDates !== []) {
@@ -314,12 +335,54 @@ class ReportDailySummaryRefreshService
                         'date_from' => $windowDates[0],
                         'date_to' => end($windowDates),
                         'queue_keys' => $windowKeys,
+                        'queue_snapshots' => $windowSnapshots,
                     ];
                 }
             }
         }
 
         return $groups;
+    }
+
+
+    /** V11 I02: only acknowledge the exact queue version that was claimed. */
+    private function deleteClaimedSnapshotIfUnchanged(array $snapshot): bool
+    {
+        $query = DB::table('report_daily_summary_refresh_queue')
+            ->where('outlet_id', (string) $snapshot['outlet_id'])
+            ->where('business_date', (string) $snapshot['business_date'])
+            ->where('status', 'processing')
+            ->where('touch_count', (int) $snapshot['touch_count']);
+
+        if (($snapshot['last_touched_at'] ?? null) === null) {
+            $query->whereNull('last_touched_at');
+        } else {
+            $query->where('last_touched_at', $snapshot['last_touched_at']);
+        }
+
+        return $query->delete() === 1;
+    }
+
+    /** V11 I02: do not overwrite a newer pending marker after a failed rebuild. */
+    private function releaseClaimedSnapshotIfUnchanged(array $snapshot, string $error): bool
+    {
+        $query = DB::table('report_daily_summary_refresh_queue')
+            ->where('outlet_id', (string) $snapshot['outlet_id'])
+            ->where('business_date', (string) $snapshot['business_date'])
+            ->where('status', 'processing')
+            ->where('touch_count', (int) $snapshot['touch_count']);
+
+        if (($snapshot['last_touched_at'] ?? null) === null) {
+            $query->whereNull('last_touched_at');
+        } else {
+            $query->where('last_touched_at', $snapshot['last_touched_at']);
+        }
+
+        return $query->update([
+            'status' => 'pending',
+            'last_error' => substr($error, 0, 1000),
+            'updated_at' => now(),
+        ]) === 1;
     }
 
     private function resolveBusinessDate(mixed $createdAt, ?string $saleNumber, ?string $timezone = null): string

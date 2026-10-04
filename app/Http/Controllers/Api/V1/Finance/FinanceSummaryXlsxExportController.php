@@ -19,6 +19,10 @@ final class FinanceSummaryXlsxExportController extends Controller
             'sheet_name' => ['nullable', 'string', 'max:80'],
             'title' => ['nullable', 'string', 'max:120'],
             'freeze_row' => ['nullable', 'integer', 'min:0', 'max:100'],
+            // V10 I26: optional explicit zero-based columns that must be emitted
+            // as native Excel time cells (numeric serial + hh:mm:ss format).
+            'native_time_columns' => ['nullable', 'array', 'max:60'],
+            'native_time_columns.*' => ['integer', 'min:0', 'max:59', 'distinct'],
             'rows' => ['required', 'array', 'max:100000'],
         ]);
 

@@ -73,8 +73,8 @@ class ReportingControlCenterController extends Controller
     public function runEngineNow(Request $request): JsonResponse
     {
         $this->authorizeCapability($request, 'console.control_center.run', 'can_create');
-        $result=$this->orchestrator->tick(4);
-        return response()->json(['data'=>$result,'message'=>'Satu Reporting Engine tick dijalankan. Ini tidak menyalakan scheduler permanen; service scheduler tetap harus aktif di server.']);
+        $result=$this->orchestrator->kickActiveRun(4);
+        return response()->json(['data'=>$result,'message'=>'Proses background aktif diperiksa/dilanjutkan melalui queue reporting. Aksi web ini tidak dihitung sebagai heartbeat scheduler OS.']);
     }
 
     public function testWorker(Request $request): JsonResponse

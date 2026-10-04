@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api\V1\Support;
 
 use App\Http\Controllers\Controller;
+use App\Rules\XlsxUpload;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\Spreadsheet\SpreadsheetTransferBatchService;
 use Illuminate\Http\Request;
@@ -23,7 +24,12 @@ final class SpreadsheetTransferBatchController extends Controller
             'chunk_size' => ['nullable', 'integer', 'min:1', 'max:5000'],
             'metadata' => ['nullable'],
         ];
-        if ($operation === 'IMPORT') $rules['file'] = ['required', 'file', 'mimes:xlsx', 'max:20480'];
+        if ($operation === 'IMPORT') {
+            $moduleKey = trim((string) $request->input('module_key', ''));
+            $rules['file'] = in_array($moduleKey, ['ga.asset', 'ga.inventory'], true)
+                ? ['required', 'file', 'max:20480', new XlsxUpload()]
+                : ['required', 'file', 'mimes:xlsx', 'max:20480'];
+        }
         $validator = Validator::make($request->all(), $rules);
         if ($validator->fails()) return ApiResponse::error('Batch spreadsheet tidak valid.', 'SPREADSHEET_BATCH_VALIDATION', 422, $validator->errors()->toArray());
 

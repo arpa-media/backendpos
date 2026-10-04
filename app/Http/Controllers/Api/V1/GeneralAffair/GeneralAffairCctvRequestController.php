@@ -10,17 +10,21 @@ use App\Models\GeneralAffair\CctvRequestAttachment;
 use App\Models\GeneralAffair\CctvRequestEvent;
 use App\Models\Outlet;
 use App\Models\User;
+use App\Services\GeneralAffair\GeneralAffairMediaUrlService;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 
 class GeneralAffairCctvRequestController extends Controller
 {
+    public function __construct(private readonly GeneralAffairMediaUrlService $media)
+    {
+    }
+
     private const STATUSES = [
         'DIAJUKAN' => 'Diajukan',
         'PENINJAUAN' => 'Peninjauan',
@@ -509,14 +513,13 @@ class GeneralAffairCctvRequestController extends Controller
 
     private function serializeAttachment(CctvRequestAttachment $row): array
     {
-        $storageUrl = Storage::disk((string) $row->disk)->url((string) $row->path);
         return [
             'id' => (string) $row->id,
             'kind' => (string) $row->kind,
             'original_name' => $row->original_name,
             'mime_type' => $row->mime_type,
             'size_bytes' => (int) $row->size_bytes,
-            'url' => Str::startsWith($storageUrl, ['http://', 'https://']) ? $storageUrl : url($storageUrl),
+            'url' => $this->media->url((string) $row->disk, (string) $row->path),
             'created_at' => $row->created_at?->toIso8601String(),
         ];
     }

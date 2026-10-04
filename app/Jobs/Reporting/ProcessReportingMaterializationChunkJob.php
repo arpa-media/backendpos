@@ -27,6 +27,12 @@ class ProcessReportingMaterializationChunkJob implements ShouldQueue
 
     public function handle(ReportingMaterializationOrchestrator $orchestrator): void
     {
-        $orchestrator->executeQueuedChunk($this->chunkId, $this->dispatchToken);
+        $runId = $orchestrator->executeQueuedChunk($this->chunkId, $this->dispatchToken);
+
+        // V11 I04: each completed/failed chunk wakes the same persisted run so
+        // the next batch/stage can be dispatched without waiting for scheduler.
+        if ($runId) {
+            $orchestrator->kickRun($runId);
+        }
     }
 }

@@ -17,6 +17,19 @@ class InventoryMovement extends Model
         return $this->belongsTo(User::class, 'created_by_user_id');
     }
 
+    public function loanParent()
+    {
+        return $this->belongsTo(self::class, 'loan_parent_id');
+    }
+
+    public function loanReturns()
+    {
+        return $this->hasMany(self::class, 'loan_parent_id')
+            ->where('movement_status', 'KEMBALI')
+            ->orderBy('movement_at')
+            ->orderBy('created_at');
+    }
+
     protected $casts = [
         'movement_at' => 'datetime',
         'quantity' => 'decimal:3',

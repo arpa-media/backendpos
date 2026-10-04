@@ -9,6 +9,10 @@ use Illuminate\Support\Str;
 
 class InventoryAuditPhotoService
 {
+    public function __construct(private readonly GeneralAffairMediaUrlService $media)
+    {
+    }
+
     public function store(UploadedFile $file, string $auditNumber, string $itemCode): array
     {
         $disk = 'public';
@@ -33,7 +37,6 @@ class InventoryAuditPhotoService
     public function url(InventoryAuditLine $line): ?string
     {
         if (! $line->photo_path) return null;
-        try { return Storage::disk($line->photo_disk ?: 'public')->url($line->photo_path); }
-        catch (\Throwable) { return null; }
+        return $this->media->url((string) ($line->photo_disk ?: 'public'), (string) $line->photo_path);
     }
 }

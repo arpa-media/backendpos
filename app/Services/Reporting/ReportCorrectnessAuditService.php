@@ -68,6 +68,32 @@ class ReportCorrectnessAuditService
             ];
         }
 
+        $comparison = $this->compareRawToDailyDay($outletIds, $businessDate);
+
+        return [
+            'ready' => (bool) ($comparison['match'] ?? false),
+            'business_date' => $businessDate,
+            'coverage' => $coverage,
+            'families' => $comparison['families'] ?? [],
+        ];
+    }
+
+    /**
+     * V11 I02 verification path. This deliberately bypasses the readiness gate so
+     * an effective refresh marker can be checked against raw canonical sales before
+     * deciding whether the marker really needs a rebuild. No data is mutated here.
+     */
+    public function compareRawToDailyDay(array $outletIds, string $businessDate): array
+    {
+        $outletIds = $this->normalizeOutletIds($outletIds);
+        if ($outletIds === []) {
+            return [
+                'match' => true,
+                'business_date' => $businessDate,
+                'families' => [],
+            ];
+        }
+
         $families = [];
         foreach (array_keys(self::SPECS) as $family) {
             $raw = $this->normalizeRows($family, $this->rawFamilyQuery($family, $outletIds, $businessDate)->get()->all());
@@ -76,10 +102,52 @@ class ReportCorrectnessAuditService
         }
 
         return [
-            'ready' => collect($families)->every(fn (array $result) => $result['match']),
+            'match' => collect($families)->every(fn (array $result) => $result['match']),
             'business_date' => $businessDate,
-            'coverage' => $coverage,
+            'outlet_ids' => $outletIds,
             'families' => $families,
+        ];
+    }
+
+    /**
+     * Same correctness proof as compareRawToDailyDay(), but executes each report
+     * family only once for all requested outlets and then splits comparison in PHP.
+     * This keeps a 17-outlet x 30-day reconciliation bounded to ~12 queries/day
+     * instead of running the full audit independently for every outlet-day.
+     */
+    public function compareRawToDailyDayByOutlet(array $outletIds, string $businessDate): array
+    {
+        $outletIds = $this->normalizeOutletIds($outletIds);
+        $outlets = [];
+        foreach ($outletIds as $outletId) {
+            $outlets[$outletId] = [
+                'match' => true,
+                'families' => [],
+            ];
+        }
+
+        foreach (array_keys(self::SPECS) as $family) {
+            $rawRows = $this->rawFamilyQuery($family, $outletIds, $businessDate)->get()->all();
+            $dailyRows = $this->dailyFamilyQuery($family, $outletIds, $businessDate)->get()->all();
+            $rawByOutlet = $this->groupRowsByOutlet($rawRows);
+            $dailyByOutlet = $this->groupRowsByOutlet($dailyRows);
+
+            foreach ($outletIds as $outletId) {
+                $raw = $this->normalizeRows($family, $rawByOutlet[$outletId] ?? []);
+                $daily = $this->normalizeRows($family, $dailyByOutlet[$outletId] ?? []);
+                $comparison = $this->compareNormalized($raw, $daily, 'raw', 'daily');
+                $outlets[$outletId]['families'][$family] = $comparison;
+                if (! ($comparison['match'] ?? false)) {
+                    $outlets[$outletId]['match'] = false;
+                }
+            }
+        }
+
+        return [
+            'match' => collect($outlets)->every(fn (array $result) => (bool) ($result['match'] ?? false)),
+            'business_date' => $businessDate,
+            'outlet_ids' => $outletIds,
+            'outlets' => $outlets,
         ];
     }
 
@@ -337,6 +405,19 @@ class ReportCorrectnessAuditService
             ->whereIn('rsbd.outlet_id', $outletIds)
             ->whereBetween('rsbd.business_date', [$from, $to])
             ->selectRaw('rsbd.sale_id, rsbd.outlet_id, rsbd.business_date, rsbd.business_timezone, COALESCE(CAST(rsbd.marking AS SIGNED),0) as marking');
+    }
+
+    private function groupRowsByOutlet(array $rows): array
+    {
+        $grouped = [];
+        foreach ($rows as $row) {
+            $outletId = (string) ($row->outlet_id ?? '');
+            if ($outletId === '') {
+                continue;
+            }
+            $grouped[$outletId][] = $row;
+        }
+        return $grouped;
     }
 
     private function normalizeRows(string $family, array $rows): array

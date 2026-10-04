@@ -908,23 +908,77 @@ class ReportingMaterializationOrchestrator
     private function insideAllowedWindow(object $run): bool { if($run->trigger!=='auto') return true; return $this->insideWindowNow($this->settings()); }
     private function insideWindowNow(array $s): bool { $now=now($s['timezone'])->format('H:i'); $start=$s['window_start']; $end=$s['window_end']; return $start<=$end ? ($now>=$start && $now<=$end) : ($now>=$start || $now<=$end); }
 
-    private function dailyCoverage(array $ids,string $from,string $to): array { return $this->daily->readContractStatus($ids,$from,$to,config('app.timezone','Asia/Jakarta')); }
+    private function dailyCoverage(array $ids,string $from,string $to): array
+    {
+        return $this->daily->readContractStatus($ids,$from,$to,config('app.timezone','Asia/Jakarta'));
+    }
+
     private function hourlyCoverage(array $ids,string $from,string $to): array
     {
         $expected=count($ids)*(CarbonImmutable::parse($from)->diffInDays(CarbonImmutable::parse($to))+1);
-        if(!Schema::hasTable('report_hourly_summary_coverage') || !Schema::hasTable('report_daily_summary_coverage')) return ['ready'=>false,'expected_rows'=>$expected,'ready_rows'=>0,'missing_rows'=>$expected,'coverage_percent'=>0.0];
-        $ready=DB::table('report_daily_summary_coverage as d')->leftJoin('report_hourly_summary_coverage as h',function($j): void {$j->on('h.outlet_id','=','d.outlet_id')->on('h.business_date','=','d.business_date');})
-            ->whereIn('d.outlet_id',$ids)->whereBetween('d.business_date',[$from,$to])->whereNotNull('h.outlet_id')->whereNotNull('h.source_daily_synced_at')->whereColumn('h.source_daily_synced_at','>=','d.synced_at')->count();
-        return ['ready'=>$ready===$expected,'expected_rows'=>$expected,'ready_rows'=>$ready,'missing_rows'=>max(0,$expected-$ready),'coverage_percent'=>$expected?round($ready/$expected*100,2):100.0];
+        if(!Schema::hasTable('report_hourly_summary_coverage') || !Schema::hasTable('report_daily_summary_coverage')) {
+            return ['ready'=>false,'expected_rows'=>$expected,'ready_rows'=>0,'missing_rows'=>$expected,'coverage_percent'=>0.0,'readiness_percent'=>0.0,'physical_coverage_percent'=>0.0];
+        }
+
+        $physicalReady=DB::table('report_daily_summary_coverage as d')
+            ->leftJoin('report_hourly_summary_coverage as h',function($j): void {
+                $j->on('h.outlet_id','=','d.outlet_id')->on('h.business_date','=','d.business_date');
+            })
+            ->whereIn('d.outlet_id',$ids)
+            ->whereBetween('d.business_date',[$from,$to])
+            ->whereNotNull('h.outlet_id')
+            ->whereNotNull('h.source_daily_synced_at')
+            ->whereColumn('h.source_daily_synced_at','>=','d.synced_at')
+            ->count();
+
+        // Real hourly readiness can never exceed the freshness of its daily source.
+        // Using the minimum keeps the range query bounded while eliminating false 100%.
+        $daily=$this->dailyCoverage($ids,$from,$to);
+        $dailyReadyRows=(int)($daily['covered_rows']??0);
+        $readyRows=min($physicalReady,$dailyReadyRows);
+        $physicalPercent=$expected?round(min($expected,$physicalReady)/$expected*100,2):100.0;
+        $readinessPercent=$expected?round(min($expected,$readyRows)/$expected*100,2):100.0;
+
+        return [
+            'contract'=>'erp_pos_v11_i01_hourly_range_readiness',
+            'ready'=>(bool)($daily['ready']??false) && $physicalReady===$expected,
+            'expected_rows'=>$expected,
+            'ready_rows'=>$readyRows,
+            'physical_ready_rows'=>$physicalReady,
+            'missing_rows'=>max(0,$expected-$readyRows),
+            'coverage_percent'=>$readinessPercent,
+            'readiness_percent'=>$readinessPercent,
+            'physical_coverage_percent'=>$physicalPercent,
+            'effective_pending_refresh_rows'=>(int)($daily['effective_pending_refresh_rows']??0),
+        ];
     }
+
     private function monthlyCoverage(array $ids,string $from,string $to): array
     {
         $months=$this->fullMonths($from,$to); $expected=count($ids)*count($months);
-        if($expected===0) return ['ready'=>true,'expected_rows'=>0,'ready_rows'=>0,'missing_rows'=>0,'coverage_percent'=>100.0];
-        if(!Schema::hasTable('report_monthly_summary_coverage')) return ['ready'=>false,'expected_rows'=>$expected,'ready_rows'=>0,'missing_rows'=>$expected,'coverage_percent'=>0.0];
-        $ready=0; foreach($months as $month) $ready+=(int)($this->monthly->readContractStatus($ids,$month)['ready_rows']??0);
-        return ['ready'=>$ready===$expected,'expected_rows'=>$expected,'ready_rows'=>$ready,'missing_rows'=>max(0,$expected-$ready),'coverage_percent'=>$expected?round($ready/$expected*100,2):100.0];
+        if($expected===0) return ['ready'=>true,'expected_rows'=>0,'ready_rows'=>0,'missing_rows'=>0,'coverage_percent'=>100.0,'readiness_percent'=>100.0];
+        if(!Schema::hasTable('report_monthly_summary_coverage')) return ['ready'=>false,'expected_rows'=>$expected,'ready_rows'=>0,'missing_rows'=>$expected,'coverage_percent'=>0.0,'readiness_percent'=>0.0];
+        $ready=0;
+        $physical=0;
+        foreach($months as $month) {
+            $status=$this->monthly->readContractStatus($ids,$month);
+            $ready+=(int)($status['ready_rows']??0);
+            $physical+=(int)($status['physical_monthly_rows']??0);
+        }
+        $readinessPercent=$expected?round(min($expected,$ready)/$expected*100,2):100.0;
+        return [
+            'contract'=>'erp_pos_v11_i01_monthly_range_readiness',
+            'ready'=>$ready===$expected,
+            'expected_rows'=>$expected,
+            'ready_rows'=>$ready,
+            'physical_ready_rows'=>$physical,
+            'missing_rows'=>max(0,$expected-$ready),
+            'coverage_percent'=>$readinessPercent,
+            'readiness_percent'=>$readinessPercent,
+            'physical_coverage_percent'=>$expected?round(min($expected,$physical)/$expected*100,2):100.0,
+        ];
     }
+
     private function calendarCoverage(array $ids,string $from,string $to): array
     {
         $rows=[];
@@ -934,14 +988,32 @@ class ReportingMaterializationOrchestrator
             $closed=$m->endOfMonth()->lt($today);
             $end=$closed ? $m->endOfMonth()->toDateString() : $today->toDateString();
             $daily=$this->dailyCoverage($ids,$start,$end);
+            $hourly=$this->hourlyCoverage($ids,$start,$end);
             $dailyPercent=(float)($daily['coverage_percent']??0);
-            $monthlyReady=$closed ? (bool)($this->monthly->readContractStatus($ids,$start)['ready']??false) : false;
-            $status=$closed ? (($dailyPercent>=100 && $monthlyReady)?'READY':'NEEDS_PREPARATION') : 'LIVE';
-            $overall=$closed ? round(($dailyPercent + ($monthlyReady?100:0))/2,2) : $dailyPercent;
+            $hourlyPercent=(float)($hourly['coverage_percent']??0);
+            $monthlyStatus=$closed ? $this->monthly->readContractStatus($ids,$start) : null;
+            $monthlyReady=$closed ? (bool)($monthlyStatus['ready']??false) : false;
+            $monthlyPercent=$closed ? (float)($monthlyStatus['coverage_percent']??0.0) : null;
+
+            // V11 I01: no averaging. One unhealthy materialization layer must pull the
+            // displayed readiness below 100 so READY has one unambiguous meaning.
+            $overall=$closed
+                ? min($dailyPercent,$hourlyPercent,(float)($monthlyPercent??0.0))
+                : min($dailyPercent,$hourlyPercent);
+            $ready=$closed
+                ? ((bool)($daily['ready']??false) && (bool)($hourly['ready']??false) && $monthlyReady)
+                : ((bool)($daily['ready']??false) && (bool)($hourly['ready']??false));
+            $status=$closed ? ($ready?'READY':'NEEDS_PREPARATION') : ($ready?'LIVE':'LIVE_SYNCING');
+
             $rows[]=[
                 'month'=>$m->format('Y-m'),'label'=>$m->locale('id')->translatedFormat('F Y'),'is_current'=>!$closed,
-                'status'=>$status,'overall_percent'=>$overall,'daily_percent'=>$dailyPercent,
-                'monthly_percent'=>$closed?($monthlyReady?100.0:0.0):null,'monthly_ready'=>$monthlyReady,
+                'status'=>$status,'overall_percent'=>$overall,'readiness_percent'=>$overall,
+                'daily_percent'=>$dailyPercent,'hourly_percent'=>$hourlyPercent,
+                'monthly_percent'=>$monthlyPercent,'monthly_ready'=>$monthlyReady,
+                'effective_pending_refresh_rows'=>(int)($daily['effective_pending_refresh_rows']??0),
+                'raw_pending_refresh_rows'=>(int)($daily['raw_pending_refresh_rows']??0),
+                'stale_refresh_flag_rows'=>(int)($daily['stale_refresh_flag_rows']??0),
+                'physical_daily_percent'=>(float)($daily['physical_coverage_percent']??$dailyPercent),
                 'date_from'=>$start,'date_to'=>$end,
             ];
         }
@@ -961,57 +1033,71 @@ class ReportingMaterializationOrchestrator
         $ids=$this->resolveOutletIds($requestedOutletIds);
         $daily=$this->dailyCoverage($ids,$from,$to);
         $hourly=$this->hourlyCoverage($ids,$from,$to);
-        $monthly=$closed?$this->monthlyCoverage($ids,$from,$to):['ready'=>false,'expected_rows'=>0,'ready_rows'=>0,'missing_rows'=>0,'coverage_percent'=>null];
+        $monthly=$closed?$this->monthlyCoverage($ids,$from,$to):['ready'=>false,'expected_rows'=>0,'ready_rows'=>0,'missing_rows'=>0,'coverage_percent'=>null,'readiness_percent'=>null];
 
         $days=CarbonImmutable::parse($from)->diffInDays(CarbonImmutable::parse($to))+1;
         $outletMap=DB::table('outlets')->whereIn('id',$ids)->get(['id','code','name'])->keyBy(fn($o)=>(string)$o->id);
-        $dailyByOutlet=Schema::hasTable('report_daily_summary_coverage')
-            ? DB::table('report_daily_summary_coverage')->whereIn('outlet_id',$ids)->whereBetween('business_date',[$from,$to])
-                ->select('outlet_id')->selectRaw('COUNT(*) ready_rows')->selectRaw('MAX(synced_at) max_synced_at')
-                ->when(Schema::hasColumn('report_daily_summary_coverage','generation_ulid'),fn($q)=>$q->selectRaw('MAX(generation_ulid) max_generation_ulid'))
-                ->groupBy('outlet_id')->get()->keyBy(fn($r)=>(string)$r->outlet_id)
-            : collect();
         $hourlyByOutlet=(Schema::hasTable('report_hourly_summary_coverage') && Schema::hasTable('report_daily_summary_coverage'))
             ? DB::table('report_daily_summary_coverage as d')->leftJoin('report_hourly_summary_coverage as h',function($j): void {$j->on('h.outlet_id','=','d.outlet_id')->on('h.business_date','=','d.business_date');})
                 ->whereIn('d.outlet_id',$ids)->whereBetween('d.business_date',[$from,$to])
                 ->whereNotNull('h.outlet_id')->whereNotNull('h.source_daily_synced_at')->whereColumn('h.source_daily_synced_at','>=','d.synced_at')
                 ->select('d.outlet_id')->selectRaw('COUNT(*) ready_rows')->groupBy('d.outlet_id')->get()->keyBy(fn($r)=>(string)$r->outlet_id)
             : collect();
+
         $outletRows=[];
         foreach($ids as $id) {
-            $d=$dailyByOutlet->get($id); $h=$hourlyByOutlet->get($id);
-            $dailyRows=(int)($d->ready_rows??0); $hourlyRows=(int)($h->ready_rows??0);
-            $dailyPercent=$days?round(min($days,$dailyRows)/$days*100,2):100.0;
-            $hourlyPercent=$days?round(min($days,$hourlyRows)/$days*100,2):100.0;
+            $dailyStatus=$this->daily->readContractStatus([(string)$id],$from,$to,$settings['timezone']);
+            $dailyPercent=(float)($dailyStatus['coverage_percent']??0.0);
+            $h=$hourlyByOutlet->get($id);
+            $hourlyPhysicalRows=(int)($h->ready_rows??0);
+            $hourlyPhysicalPercent=$days?round(min($days,$hourlyPhysicalRows)/$days*100,2):100.0;
+            $hourlyPercent=min($hourlyPhysicalPercent,$dailyPercent);
 
-            // I01: use the exact same monthly readiness contract for the aggregate card
-            // and every outlet row. The previous duplicated generation/timestamp logic
-            // could disagree with ReportMonthlySummaryService (especially mixed legacy
-            // coverage rows created before generation_ulid existed), showing global 100%
-            // while each outlet still displayed 0%.
-            $monthlyStatus=$closed
-                ? $this->monthly->readContractStatus([(string)$id],$from)
-                : null;
+            $monthlyStatus=$closed ? $this->monthly->readContractStatus([(string)$id],$from) : null;
             $monthlyReady=$closed && (bool)($monthlyStatus['ready']??false);
             $monthlyPercent=$closed?(float)($monthlyStatus['coverage_percent']??0.0):null;
-            $ready=$closed ? ($dailyPercent>=100 && $monthlyReady) : $dailyPercent>=100;
+            $ready=$closed
+                ? ((bool)($dailyStatus['ready']??false) && $hourlyPercent>=100 && $monthlyReady)
+                : ((bool)($dailyStatus['ready']??false) && $hourlyPercent>=100);
             $o=$outletMap->get($id);
             $outletRows[]=[
                 'id'=>$id,'code'=>(string)($o->code??''),'name'=>(string)($o->name??$id),
                 'daily_percent'=>$dailyPercent,'hourly_percent'=>$hourlyPercent,'monthly_percent'=>$monthlyPercent,
+                'physical_daily_percent'=>(float)($dailyStatus['physical_coverage_percent']??$dailyPercent),
+                'effective_pending_refresh_rows'=>(int)($dailyStatus['effective_pending_refresh_rows']??0),
+                'raw_pending_refresh_rows'=>(int)($dailyStatus['raw_pending_refresh_rows']??0),
+                'stale_refresh_flag_rows'=>(int)($dailyStatus['stale_refresh_flag_rows']??0),
                 'status'=>$closed?($ready?'READY':'NEEDS_PREPARATION'):($ready?'LIVE':'LIVE_SYNCING'),
             ];
         }
+
         $active=$this->activeRun();
         $activeForMonth=$active && (string)$active->date_from <= $to && (string)$active->date_to >= $from;
         $dailyPercent=(float)($daily['coverage_percent']??0);
+        $hourlyPercent=(float)($hourly['coverage_percent']??0);
         $monthlyPercent=$closed?(float)($monthly['coverage_percent']??0):null;
-        $ready=$closed?($dailyPercent>=100 && $monthlyPercent>=100):$dailyPercent>=100;
+        $ready=$closed
+            ? ((bool)($daily['ready']??false) && (bool)($hourly['ready']??false) && (bool)($monthly['ready']??false))
+            : ((bool)($daily['ready']??false) && (bool)($hourly['ready']??false));
+        $overall=$closed ? min($dailyPercent,$hourlyPercent,(float)($monthlyPercent??0)) : min($dailyPercent,$hourlyPercent);
+
+        $issues=[];
+        if((int)($daily['physical_missing_rows']??0)>0) $issues[]=['code'=>'MISSING_DAILY_COVERAGE','count'=>(int)$daily['physical_missing_rows'],'message'=>'Data harian belum lengkap.'];
+        if((int)($daily['premature_rows']??0)>0) $issues[]=['code'=>'PREMATURE_DAILY_COVERAGE','count'=>(int)$daily['premature_rows'],'message'=>'Sebagian data harian dibuat sebelum business day valid.'];
+        if((int)($daily['effective_pending_refresh_rows']??0)>0) $issues[]=['code'=>'EFFECTIVE_REFRESH_PENDING','count'=>(int)$daily['effective_pending_refresh_rows'],'message'=>'Ada perubahan transaksi yang lebih baru daripada materialisasi.'];
+        if((int)($daily['stale_refresh_flag_rows']??0)>0) $issues[]=['code'=>'STALE_REFRESH_FLAGS','count'=>(int)$daily['stale_refresh_flag_rows'],'blocking'=>false,'message'=>'Ada flag pending lama yang lebih tua daripada materialisasi; tidak memblokir readiness dan akan direkonsiliasi pada I02.'];
+        if(!(bool)($hourly['ready']??false)) $issues[]=['code'=>'HOURLY_NOT_READY','count'=>(int)($hourly['missing_rows']??0),'message'=>'Data per jam belum sepenuhnya siap.'];
+        if($closed && !(bool)($monthly['ready']??false)) $issues[]=['code'=>'MONTHLY_NOT_READY','count'=>(int)($monthly['missing_rows']??0),'message'=>'Ringkasan bulanan belum fresh terhadap data harian.'];
+
         return [
+            'contract'=>'erp_pos_v11_i01_console_real_readiness',
             'month'=>$month,'label'=>$m->locale('id')->translatedFormat('F Y'),'is_current'=>!$closed,'date_from'=>$from,'date_to'=>$to,
             'status'=>$activeForMonth?'PROCESSING':($closed?($ready?'READY':'NEEDS_PREPARATION'):($ready?'LIVE':'LIVE_SYNCING')),
+            'ready'=>$ready,
             'daily'=>$daily,'hourly'=>$hourly,'monthly'=>$monthly,
-            'overall_percent'=>$closed?round(($dailyPercent+($monthlyPercent??0))/2,2):$dailyPercent,
+            'overall_percent'=>$overall,'readiness_percent'=>$overall,
+            'issues'=>$issues,
+            'recommended_action'=>$ready?null:((int)($daily['effective_pending_refresh_rows']??0)>0?'RECONCILE_PENDING':'PREPARE_MATERIALIZATION'),
             'recommended_pipeline'=>$closed?'full':'hourly','can_monthly'=>$closed,
             'outlets'=>$outletRows,'active_run'=>$activeForMonth?$this->runDetail((string)$active->id):null,
         ];

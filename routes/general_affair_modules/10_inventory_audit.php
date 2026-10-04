@@ -7,6 +7,7 @@ Route::prefix('api/v1/general-affair/inventory-audit')->middleware(['api', 'auth
     Route::get('/meta', [GeneralAffairInventoryAuditController::class, 'meta'])->middleware('permission_or_snapshot:ga.inventory_audit.view');
     Route::get('/', [GeneralAffairInventoryAuditController::class, 'index'])->middleware('permission_or_snapshot:ga.inventory_audit.view');
     Route::post('/start', [GeneralAffairInventoryAuditController::class, 'start'])->middleware('permission_or_snapshot:ga.inventory_audit.create');
+    Route::post('/{id}/re-audit', [GeneralAffairInventoryAuditController::class, 'reAudit'])->middleware('permission_or_snapshot:ga.inventory_audit.create');
     Route::get('/{id}', [GeneralAffairInventoryAuditController::class, 'show'])->middleware('permission_or_snapshot:ga.inventory_audit.view');
     Route::get('/{id}/lines', [GeneralAffairInventoryAuditController::class, 'lines'])->middleware('permission_or_snapshot:ga.inventory_audit.view');
     Route::post('/{id}/lines/{lineId}', [GeneralAffairInventoryAuditController::class, 'updateLine'])->middleware('permission_or_snapshot:ga.inventory_audit.update');

@@ -10,17 +10,20 @@ use App\Models\GeneralAffair\CostingRequestAttachment;
 use App\Models\GeneralAffair\CostingRequestEvent;
 use App\Models\Outlet;
 use App\Services\GeneralAffair\CostingPurchasingBridgeService;
+use App\Services\GeneralAffair\GeneralAffairMediaUrlService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 
 class GeneralAffairCostingController extends Controller
 {
-    public function __construct(private readonly CostingPurchasingBridgeService $bridge) {}
+    public function __construct(
+        private readonly CostingPurchasingBridgeService $bridge,
+        private readonly GeneralAffairMediaUrlService $media,
+    ) {}
 
     public function meta(Request $request): JsonResponse
     {
@@ -296,7 +299,7 @@ class GeneralAffairCostingController extends Controller
             'purchasing_path'=>$row->purchasing_order_kind === 'PURCHASE_ORDER' ? '/purchasing/purchase-orders' : ($row->purchasing_order_kind === 'REIMBURSE_ORDER' ? '/purchasing/reimburse-orders' : null),
             'created_at'=>$row->created_at?->toIso8601String(), 'updated_at'=>$row->updated_at?->toIso8601String(),
             'attachments'=>$row->relationLoaded('attachments') ? $row->attachments->map(fn ($a) => [
-                'id'=>(string)$a->id,'kind'=>$a->kind,'url'=>Storage::disk($a->disk)->url($a->path),'original_name'=>$a->original_name,'size_bytes'=>(int)$a->size_bytes,
+                'id'=>(string)$a->id,'kind'=>$a->kind,'url'=>$this->media->url((string)$a->disk, (string)$a->path),'original_name'=>$a->original_name,'size_bytes'=>(int)$a->size_bytes,
             ])->values() : [],
         ];
         if (! $detail) return $base;

@@ -10,6 +10,10 @@ use Illuminate\Support\Str;
 
 class InventoryMovementPhotoService
 {
+    public function __construct(private readonly GeneralAffairMediaUrlService $media)
+    {
+    }
+
     public function store(UploadedFile $file, string $movementNumber, string $itemCode, string $itemName, CarbonInterface $movementAt): array
     {
         $disk = 'public';
@@ -43,7 +47,6 @@ class InventoryMovementPhotoService
     {
         $path = trim((string) ($movement->photo_path ?? ''));
         if ($path === '') return null;
-        try { return Storage::disk((string) ($movement->photo_disk ?: 'public'))->url($path); }
-        catch (\Throwable) { return null; }
+        return $this->media->url((string) ($movement->photo_disk ?: 'public'), $path);
     }
 }

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api\V1\GeneralAffair;
 
 use App\Http\Controllers\Controller;
+use App\Rules\XlsxUpload;
 use App\Models\GeneralAffair\Asset;
 use App\Models\Outlet;
 use App\Services\GeneralAffair\AssetInventoryPhotoService;
@@ -102,7 +103,7 @@ class GeneralAffairAssetController extends Controller
     public function import(Request $request): JsonResponse
     {
         $data = $request->validate([
-            'file'=>['required','file','mimes:xlsx','max:20480'],
+            'file'=>['required','file','max:20480', new XlsxUpload()],
             'chunk_offset'=>['nullable','integer','min:0'],
             'chunk_size'=>['nullable','integer','min:1','max:100'],
         ]);

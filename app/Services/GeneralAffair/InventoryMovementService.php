@@ -17,7 +17,8 @@ use Illuminate\Validation\ValidationException;
 class InventoryMovementService
 {
     public const ITEM_TYPES = ['ASSET', 'INVENTORY'];
-    public const STATUSES = ['PINDAH', 'MASUK', 'KELUAR', 'PINJAM'];
+    public const STATUSES = ['PINDAH', 'MASUK', 'KELUAR', 'PINJAM', 'KEMBALI'];
+    public const CREATE_STATUSES = ['PINDAH', 'MASUK', 'KELUAR', 'PINJAM'];
     public const LOCATION_TYPES = ['OUTLET', 'WAREHOUSE', 'HEADQUARTER', 'OTHER'];
     public const CONDITIONS = ['Baru', 'Bekas Baru', 'Baik', 'Sedikit Rusak', 'Rusak'];
 
@@ -146,6 +147,136 @@ class InventoryMovementService
         }
     }
 
+    public function returnLoan(InventoryMovement $loan, array $data, ?string $userId): InventoryMovement
+    {
+        return DB::transaction(function () use ($loan, $data, $userId): InventoryMovement {
+            $lockedLoan = InventoryMovement::query()->whereKey($loan->id)->lockForUpdate()->firstOrFail();
+            if ((string) $lockedLoan->movement_status !== 'PINJAM') {
+                throw ValidationException::withMessages(['loan' => 'Tombol Kembali hanya berlaku untuk transaksi PINJAM.']);
+            }
+
+            $returnAt = Carbon::parse((string) $data['return_at']);
+            if ($returnAt->lt($lockedLoan->movement_at)) {
+                throw ValidationException::withMessages(['return_at' => 'Tanggal kembali tidak boleh lebih awal dari tanggal peminjaman.']);
+            }
+
+            $qty = round((float) $data['quantity'], 3);
+            if ($qty <= 0) {
+                throw ValidationException::withMessages(['quantity' => 'Qty kembali harus lebih besar dari 0.']);
+            }
+
+            $returnedQty = round((float) InventoryMovement::query()
+                ->where('loan_parent_id', $lockedLoan->id)
+                ->where('movement_status', 'KEMBALI')
+                ->sum('quantity'), 3);
+            $outstandingQty = round(max(0, (float) $lockedLoan->quantity - $returnedQty), 3);
+            if ($outstandingQty <= 0.000001) {
+                throw ValidationException::withMessages(['loan' => 'Pinjaman ini sudah dikembalikan seluruhnya.']);
+            }
+            if ($qty > $outstandingQty + 0.000001) {
+                throw ValidationException::withMessages(['quantity' => 'Qty kembali melebihi sisa pinjaman. Sisa: '.$outstandingQty.'.']);
+            }
+
+            $itemType = strtoupper((string) $lockedLoan->item_type);
+            $itemId = $itemType === 'ASSET' ? (string) $lockedLoan->asset_id : (string) $lockedLoan->inventory_item_id;
+            $item = $this->lockedItem($itemType, $itemId);
+            $this->ensureInitialBalance($itemType, $item, $userId);
+
+            if ($itemType === 'ASSET' && abs($qty - round($qty)) > 0.00001) {
+                throw ValidationException::withMessages(['quantity' => 'Qty kembali Asset harus berupa bilangan bulat.']);
+            }
+            if ($itemType === 'ASSET' && filled($item->serial_number) && abs($qty - 1) > 0.00001) {
+                throw ValidationException::withMessages(['quantity' => 'Asset dengan Serial Number hanya dapat dikembalikan 1 unit.']);
+            }
+
+            $loanDestinationKey = trim((string) $lockedLoan->destination_balance_key);
+            if ($loanDestinationKey === '') {
+                $loanDestinationKey = $this->locationKey(
+                    (string) $lockedLoan->destination_type,
+                    (string) ($lockedLoan->destination_outlet_id ?? ''),
+                    (string) $lockedLoan->destination_label,
+                    $this->nullable($lockedLoan->destination_detail),
+                    (string) $lockedLoan->condition,
+                );
+            }
+
+            $source = $this->lockedBalanceByKey($itemType, $itemId, $loanDestinationKey);
+            $sourceQtyBefore = round((float) $source->quantity, 3);
+            if ($sourceQtyBefore + 0.000001 < $qty) {
+                throw ValidationException::withMessages([
+                    'quantity' => 'Saldo pada lokasi peminjaman tidak mencukupi untuk qty kembali. Saldo tersedia: '.$sourceQtyBefore.'. Barang mungkin sudah dipindahkan oleh transaksi lain.',
+                ]);
+            }
+            $source->quantity = round($sourceQtyBefore - $qty, 3);
+            $source->updated_by_user_id = $userId;
+            $source->save();
+            $sourceQtyAfter = round((float) $source->quantity, 3);
+            $sourceSnapshot = $this->snapshotFromBalance($source);
+
+            $destinationSnapshot = [
+                'type' => (string) $lockedLoan->source_type,
+                'outlet_id' => $lockedLoan->source_outlet_id ? (string) $lockedLoan->source_outlet_id : null,
+                'label' => (string) $lockedLoan->source_label,
+                'detail' => $this->nullable($lockedLoan->source_detail),
+            ];
+            if (! in_array($destinationSnapshot['type'], self::LOCATION_TYPES, true) || trim($destinationSnapshot['label']) === '') {
+                throw ValidationException::withMessages(['loan' => 'Lokasi asal transaksi PINJAM tidak lengkap. Data lama perlu diperiksa sebelum pengembalian.']);
+            }
+
+            $itemQtyBefore = round((float) $item->quantity, 3);
+            $destinationState = $this->addDestinationBalance(
+                $itemType,
+                $itemId,
+                $destinationSnapshot,
+                $qty,
+                (string) $data['condition'],
+                $userId,
+            );
+
+            $this->syncMaster($itemType, $item, $userId);
+            $item->refresh();
+            $itemQtyAfter = round((float) $item->quantity, 3);
+            $movementNumber = 'GA-RET-'.$returnAt->format('Ymd-His').'-'.strtoupper(substr((string) Str::ulid(), -6));
+            $reason = trim((string) ($data['reason'] ?? ''));
+            if ($reason === '') {
+                $reason = 'Pengembalian pinjaman '.$lockedLoan->movement_number;
+            }
+
+            return InventoryMovement::query()->create([
+                'id' => (string) Str::ulid(),
+                'movement_number' => $movementNumber,
+                'item_type' => $itemType,
+                'asset_id' => $itemType === 'ASSET' ? $itemId : null,
+                'inventory_item_id' => $itemType === 'INVENTORY' ? $itemId : null,
+                'item_code_snapshot' => $lockedLoan->item_code_snapshot,
+                'item_name_snapshot' => $lockedLoan->item_name_snapshot,
+                'movement_at' => $returnAt,
+                'movement_status' => 'KEMBALI',
+                'loan_parent_id' => (string) $lockedLoan->id,
+                'quantity' => $qty,
+                'item_qty_before' => $itemQtyBefore,
+                'item_qty_after' => $itemQtyAfter,
+                'source_qty_before' => $sourceQtyBefore,
+                'source_qty_after' => $sourceQtyAfter,
+                'destination_qty_before' => $destinationState['before'],
+                'destination_qty_after' => $destinationState['after'],
+                'condition' => (string) $data['condition'],
+                'source_type' => $sourceSnapshot['type'],
+                'source_outlet_id' => $sourceSnapshot['outlet_id'],
+                'source_label' => $sourceSnapshot['label'],
+                'source_detail' => $sourceSnapshot['detail'],
+                'source_balance_key' => $source->location_key,
+                'destination_type' => $destinationSnapshot['type'],
+                'destination_outlet_id' => $destinationSnapshot['outlet_id'],
+                'destination_label' => $destinationSnapshot['label'],
+                'destination_detail' => $destinationSnapshot['detail'],
+                'destination_balance_key' => $destinationState['key'],
+                'reason' => $reason,
+                'created_by_user_id' => $userId,
+            ])->fresh();
+        }, 5);
+    }
+
     public function ensureAndBalances(string $itemType, string $itemId, ?string $userId = null): array
     {
         $itemType = strtoupper($itemType);
@@ -204,6 +335,17 @@ class InventoryMovementService
         $balance = $query->whereKey($balanceId)->where($fk, $itemId)->lockForUpdate()->first();
         if (! $balance || (float) $balance->quantity <= 0) {
             throw ValidationException::withMessages(['source_balance_id' => 'Saldo lokasi asal tidak tersedia. Muat ulang data item.']);
+        }
+        return $balance;
+    }
+
+    private function lockedBalanceByKey(string $itemType, string $itemId, string $locationKey): AssetLocationBalance|InventoryLocationBalance
+    {
+        $query = $itemType === 'ASSET' ? AssetLocationBalance::query() : InventoryLocationBalance::query();
+        $fk = $itemType === 'ASSET' ? 'asset_id' : 'inventory_item_id';
+        $balance = $query->where($fk, $itemId)->where('location_key', $locationKey)->lockForUpdate()->first();
+        if (! $balance || (float) $balance->quantity <= 0) {
+            throw ValidationException::withMessages(['loan' => 'Saldo aktif pada lokasi peminjaman tidak tersedia. Muat ulang data dan periksa history perpindahan barang.']);
         }
         return $balance;
     }

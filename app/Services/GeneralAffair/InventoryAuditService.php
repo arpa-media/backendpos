@@ -18,35 +18,61 @@ class InventoryAuditService
         return DB::transaction(function () use ($data, $userId): InventoryAudit {
             $outlet = Outlet::query()->lockForUpdate()->findOrFail((string) $data['outlet_id']);
             $year = (int) $data['audit_year'];
-            $existing = InventoryAudit::query()->where('outlet_id', $outlet->id)->where('audit_year', $year)->lockForUpdate()->first();
+            $month = (int) $data['audit_month'];
+
+            $existing = InventoryAudit::query()
+                ->where('outlet_id', $outlet->id)
+                ->where('audit_year', $year)
+                ->where('audit_month', $month)
+                ->lockForUpdate()
+                ->first();
             if ($existing) {
-                throw ValidationException::withMessages(['outlet_id' => 'Outlet ini sudah memiliki audit inventory tahun '.$year.'. Buka audit yang sudah ada.']);
+                throw ValidationException::withMessages([
+                    'outlet_id' => sprintf('Outlet ini sudah memiliki audit inventory periode %02d/%d. Gunakan Re-Audit jika audit terakhir sudah selesai.', $month, $year),
+                ]);
             }
 
-            $started = now();
-            $id = (string) Str::ulid();
-            $code = strtoupper((string) ($outlet->code ?: Str::substr((string) $outlet->id, -6)));
-            $code = preg_replace('/[^A-Z0-9]+/', '', $code) ?: 'OUTLET';
-            $audit = InventoryAudit::query()->create([
-                'id' => $id,
-                'audit_number' => 'GA-AUD-'.$year.'-'.$code,
-                'outlet_id' => (string) $outlet->id,
-                'outlet_code_snapshot' => $outlet->code,
-                'outlet_name_snapshot' => $outlet->name,
-                'audit_year' => $year,
-                'audit_month' => (int) $started->month,
-                'status' => 'IN_PROGRESS',
-                'auditor_name' => trim((string) $data['auditor_name']),
-                'auditor_nisj' => $this->nullable($data['auditor_nisj'] ?? null),
-                'notes' => $this->nullable($data['notes'] ?? null),
-                'started_at' => $started,
-                'started_by_user_id' => $userId,
-            ]);
+            return $this->createAudit($outlet, $data, $userId, 1, null);
+        }, 5);
+    }
 
-            $this->snapshotAssets($audit);
-            $this->snapshotInventory($audit);
-            $this->refreshCounts($audit);
-            return $audit->fresh();
+    public function reAudit(InventoryAudit $source, array $data, ?string $userId): InventoryAudit
+    {
+        return DB::transaction(function () use ($source, $data, $userId): InventoryAudit {
+            $lockedSource = InventoryAudit::query()->whereKey($source->id)->lockForUpdate()->firstOrFail();
+            if ($lockedSource->status !== 'COMPLETED') {
+                throw ValidationException::withMessages(['audit' => 'Re-Audit hanya dapat dibuat dari audit yang sudah selesai.']);
+            }
+
+            $outlet = Outlet::query()->lockForUpdate()->findOrFail((string) $lockedSource->outlet_id);
+            $latest = InventoryAudit::query()
+                ->where('outlet_id', $lockedSource->outlet_id)
+                ->where('audit_year', $lockedSource->audit_year)
+                ->where('audit_month', $lockedSource->audit_month)
+                ->orderByDesc('audit_sequence')
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            if ((string) $latest->id !== (string) $lockedSource->id) {
+                throw ValidationException::withMessages(['audit' => 'Audit ini bukan audit terakhir pada periode tersebut. Buka audit terakhir untuk melakukan Re-Audit.']);
+            }
+            if ($latest->status !== 'COMPLETED') {
+                throw ValidationException::withMessages(['audit' => 'Masih ada audit periode ini yang sedang berjalan.']);
+            }
+
+            $payload = $data + [
+                'outlet_id' => (string) $lockedSource->outlet_id,
+                'audit_year' => (int) $lockedSource->audit_year,
+                'audit_month' => (int) $lockedSource->audit_month,
+            ];
+
+            return $this->createAudit(
+                $outlet,
+                $payload,
+                $userId,
+                ((int) $latest->audit_sequence) + 1,
+                (string) $lockedSource->id,
+            );
         }, 5);
     }
 
@@ -106,10 +132,9 @@ class InventoryAuditService
                 throw ValidationException::withMessages(['lines' => 'Masih ada '.$unchecked.' item yang belum dicek. Selesaikan seluruh line sebelum finalisasi.']);
             }
             $this->refreshCounts($locked);
-            $completed = now();
             $locked->status = 'COMPLETED';
-            $locked->audit_month = (int) $completed->month;
-            $locked->completed_at = $completed;
+            // audit_year/audit_month adalah periode laporan dan tidak boleh berubah saat finalisasi.
+            $locked->completed_at = now();
             $locked->completed_by_user_id = $userId;
             if ($this->nullable($notes) !== null) $locked->notes = trim((string) $notes);
             $locked->save();
@@ -126,6 +151,39 @@ class InventoryAuditService
             'discrepancy_line_count' => (clone $base)->where('has_discrepancy', true)->count(),
             'updated_at' => now(),
         ]);
+    }
+
+    private function createAudit(Outlet $outlet, array $data, ?string $userId, int $sequence, ?string $reAuditOfId): InventoryAudit
+    {
+        $year = (int) $data['audit_year'];
+        $month = (int) $data['audit_month'];
+        $started = now();
+        $code = strtoupper((string) ($outlet->code ?: Str::substr((string) $outlet->id, -6)));
+        $code = preg_replace('/[^A-Z0-9]+/', '', $code) ?: 'OUTLET';
+
+        $audit = InventoryAudit::query()->create([
+            'id' => (string) Str::ulid(),
+            'audit_number' => sprintf('GA-AUD-%04d%02d-%s-R%02d', $year, $month, $code, $sequence),
+            'outlet_id' => (string) $outlet->id,
+            'outlet_code_snapshot' => $outlet->code,
+            'outlet_name_snapshot' => $outlet->name,
+            'audit_year' => $year,
+            'audit_month' => $month,
+            'audit_date' => (string) $data['audit_date'],
+            'audit_sequence' => $sequence,
+            're_audit_of_id' => $reAuditOfId,
+            'status' => 'IN_PROGRESS',
+            'auditor_name' => trim((string) $data['auditor_name']),
+            'auditor_nisj' => $this->nullable($data['auditor_nisj'] ?? null),
+            'notes' => $this->nullable($data['notes'] ?? null),
+            'started_at' => $started,
+            'started_by_user_id' => $userId,
+        ]);
+
+        $this->snapshotAssets($audit);
+        $this->snapshotInventory($audit);
+        $this->refreshCounts($audit);
+        return $audit->fresh();
     }
 
     private function snapshotAssets(InventoryAudit $audit): void

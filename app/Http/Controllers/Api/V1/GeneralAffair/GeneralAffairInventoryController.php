@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api\V1\GeneralAffair;
 
 use App\Http\Controllers\Controller;
+use App\Rules\XlsxUpload;
 use App\Models\GeneralAffair\InventoryItem;
 use App\Models\Outlet;
 use App\Services\GeneralAffair\AssetInventoryPhotoService;
@@ -95,7 +96,7 @@ class GeneralAffairInventoryController extends Controller
     }
     public function import(Request $request): JsonResponse
     {
-        $data = $request->validate(['file'=>['required','file','mimes:xlsx','max:20480'],'chunk_offset'=>['nullable','integer','min:0'],'chunk_size'=>['nullable','integer','min:1','max:100']]);
+        $data = $request->validate(['file'=>['required','file','max:20480', new XlsxUpload()],'chunk_offset'=>['nullable','integer','min:0'],'chunk_size'=>['nullable','integer','min:1','max:100']]);
         $result = $this->sheet->importInventoryChunk($request->file('file'), (int)($data['chunk_offset'] ?? 0), (int)($data['chunk_size'] ?? 30), $request->user()?->id);
         return response()->json(['data'=>$result,'message'=>$result['error_count'] ? 'Import inventory selesai dengan catatan.' : 'Import inventory berhasil.']);
     }

@@ -23,12 +23,23 @@ class GeneralAffairInventoryAuditController extends Controller
     public function meta(Request $request): JsonResponse
     {
         $year = (int) ($request->integer('year') ?: now()->year);
-        $auditedIds = InventoryAudit::query()->where('audit_year', $year)->pluck('outlet_id')->map(fn ($v) => (string) $v)->all();
+        $month = (int) ($request->integer('month') ?: now()->month);
+        $auditedIds = InventoryAudit::query()
+            ->where('audit_year', $year)
+            ->where('audit_month', $month)
+            ->pluck('outlet_id')
+            ->map(fn ($v) => (string) $v)
+            ->unique()
+            ->all();
+
         return response()->json(['data' => [
             'outlets' => Outlet::query()->orderBy('name')->get(['id', 'code', 'name']),
             'unaudited_outlets' => Outlet::query()->whereNotIn('id', $auditedIds)->orderBy('name')->get(['id', 'code', 'name']),
             'conditions' => InventoryAuditService::CONDITIONS,
             'current_year' => now()->year,
+            'current_month' => now()->month,
+            'selected_year' => $year,
+            'selected_month' => $month,
         ]]);
     }
 
@@ -41,36 +52,53 @@ class GeneralAffairInventoryAuditController extends Controller
             'status' => ['nullable', Rule::in(['NOT_AUDITED', 'IN_PROGRESS', 'COMPLETED'])],
         ]);
         $year = (int) ($data['year'] ?? now()->year);
-        $outlets = Outlet::query()->when($data['outlet_id'] ?? null, fn ($q, $id) => $q->whereKey($id))->orderBy('name')->get(['id', 'code', 'name']);
-        $audits = InventoryAudit::query()->where('audit_year', $year)->whereIn('outlet_id', $outlets->pluck('id'))
-            ->get()->keyBy(fn (InventoryAudit $a) => (string) $a->outlet_id);
+        $month = (int) ($data['month'] ?? now()->month);
+        $outlets = Outlet::query()
+            ->when($data['outlet_id'] ?? null, fn ($q, $id) => $q->whereKey($id))
+            ->orderBy('name')
+            ->get(['id', 'code', 'name']);
 
-        $rows = $outlets->map(function ($outlet) use ($audits, $year) {
-            $audit = $audits->get((string) $outlet->id);
+        $audits = InventoryAudit::query()
+            ->where('audit_year', $year)
+            ->where('audit_month', $month)
+            ->whereIn('outlet_id', $outlets->pluck('id'))
+            ->orderBy('audit_sequence')
+            ->get()
+            ->groupBy(fn (InventoryAudit $a) => (string) $a->outlet_id);
+
+        $rows = $outlets->map(function ($outlet) use ($audits, $year, $month) {
+            $history = $audits->get((string) $outlet->id, collect())->values();
+            /** @var InventoryAudit|null $latest */
+            $latest = $history->last();
             return [
                 'outlet' => ['id' => (string) $outlet->id, 'code' => $outlet->code, 'name' => $outlet->name],
                 'year' => $year,
-                'status' => $audit?->status ?: 'NOT_AUDITED',
-                'audit' => $audit ? $this->serializeAudit($audit) : null,
+                'month' => $month,
+                'status' => $latest?->status ?: 'NOT_AUDITED',
+                'audit' => $latest ? $this->serializeAudit($latest) : null,
+                'audit_count' => $history->count(),
+                'can_reaudit' => $latest?->status === 'COMPLETED',
+                'audits' => $history->map(fn (InventoryAudit $audit) => $this->serializeAudit($audit))->values(),
             ];
         });
-        if (filled($data['month'] ?? null) && ($data['status'] ?? '') !== 'NOT_AUDITED') {
-            $month = (int) $data['month'];
-            $rows = $rows->filter(fn ($row) => $row['audit'] && (int) $row['audit']['audit_month'] === $month)->values();
-        }
+
         if (filled($data['status'] ?? null)) {
             $status = (string) $data['status'];
             $rows = $rows->filter(fn ($row) => $row['status'] === $status)->values();
         }
 
-        $all = collect($outlets)->map(fn ($o) => $audits->get((string) $o->id));
+        $latestAudits = $outlets->map(function ($outlet) use ($audits) {
+            return $audits->get((string) $outlet->id, collect())->last();
+        });
+
         return response()->json(['data' => [
             'items' => $rows->values(),
+            'period' => ['year' => $year, 'month' => $month],
             'summary' => [
                 'outlets' => $outlets->count(),
-                'completed' => $all->filter(fn ($a) => $a?->status === 'COMPLETED')->count(),
-                'in_progress' => $all->filter(fn ($a) => $a?->status === 'IN_PROGRESS')->count(),
-                'not_audited' => $all->filter(fn ($a) => ! $a)->count(),
+                'completed' => $latestAudits->filter(fn ($a) => $a?->status === 'COMPLETED')->count(),
+                'in_progress' => $latestAudits->filter(fn ($a) => $a?->status === 'IN_PROGRESS')->count(),
+                'not_audited' => $latestAudits->filter(fn ($a) => ! $a)->count(),
             ],
         ]]);
     }
@@ -80,12 +108,33 @@ class GeneralAffairInventoryAuditController extends Controller
         $data = $request->validate([
             'outlet_id' => ['required', 'string', 'exists:outlets,id'],
             'audit_year' => ['required', 'integer', 'min:2020', 'max:2100'],
+            'audit_month' => ['required', 'integer', 'min:1', 'max:12'],
+            'audit_date' => ['required', 'date_format:Y-m-d'],
             'auditor_name' => ['required', 'string', 'max:180'],
             'auditor_nisj' => ['nullable', 'string', 'max:80'],
             'notes' => ['nullable', 'string', 'max:3000'],
         ]);
         $audit = $this->service->start($data, $request->user()?->id);
-        return response()->json(['data' => $this->serializeAudit($audit), 'message' => 'Audit dimulai. Snapshot Asset dan Inventory outlet sudah dikunci sebagai baseline.'], 201);
+        return response()->json([
+            'data' => $this->serializeAudit($audit),
+            'message' => 'Audit bulanan dimulai. Snapshot Asset dan Inventory outlet sudah dikunci sebagai baseline.',
+        ], 201);
+    }
+
+    public function reAudit(Request $request, string $id): JsonResponse
+    {
+        $data = $request->validate([
+            'audit_date' => ['required', 'date_format:Y-m-d'],
+            'auditor_name' => ['required', 'string', 'max:180'],
+            'auditor_nisj' => ['nullable', 'string', 'max:80'],
+            'notes' => ['nullable', 'string', 'max:3000'],
+        ]);
+        $source = InventoryAudit::query()->findOrFail($id);
+        $audit = $this->service->reAudit($source, $data, $request->user()?->id);
+        return response()->json([
+            'data' => $this->serializeAudit($audit),
+            'message' => 'Re-Audit dibuat sebagai snapshot baru. Audit sebelumnya tetap tersimpan dan tidak diubah.',
+        ], 201);
     }
 
     public function show(string $id): JsonResponse
@@ -167,13 +216,26 @@ class GeneralAffairInventoryAuditController extends Controller
     private function serializeAudit(InventoryAudit $audit): array
     {
         return [
-            'id' => (string) $audit->id, 'audit_number' => $audit->audit_number,
-            'outlet_id' => (string) $audit->outlet_id, 'outlet_code' => $audit->outlet_code_snapshot, 'outlet_name' => $audit->outlet_name_snapshot,
-            'audit_year' => (int) $audit->audit_year, 'audit_month' => (int) $audit->audit_month, 'status' => $audit->status,
-            'auditor_name' => $audit->auditor_name, 'auditor_nisj' => $audit->auditor_nisj, 'notes' => $audit->notes,
-            'snapshot_line_count' => (int) $audit->snapshot_line_count, 'checked_line_count' => (int) $audit->checked_line_count,
+            'id' => (string) $audit->id,
+            'audit_number' => $audit->audit_number,
+            'outlet_id' => (string) $audit->outlet_id,
+            'outlet_code' => $audit->outlet_code_snapshot,
+            'outlet_name' => $audit->outlet_name_snapshot,
+            'audit_year' => (int) $audit->audit_year,
+            'audit_month' => (int) $audit->audit_month,
+            'audit_date' => $audit->audit_date?->format('Y-m-d'),
+            'audit_sequence' => (int) ($audit->audit_sequence ?: 1),
+            're_audit_of_id' => $audit->re_audit_of_id ? (string) $audit->re_audit_of_id : null,
+            'is_reaudit' => filled($audit->re_audit_of_id) || (int) ($audit->audit_sequence ?: 1) > 1,
+            'status' => $audit->status,
+            'auditor_name' => $audit->auditor_name,
+            'auditor_nisj' => $audit->auditor_nisj,
+            'notes' => $audit->notes,
+            'snapshot_line_count' => (int) $audit->snapshot_line_count,
+            'checked_line_count' => (int) $audit->checked_line_count,
             'discrepancy_line_count' => (int) $audit->discrepancy_line_count,
-            'started_at' => $audit->started_at?->toIso8601String(), 'completed_at' => $audit->completed_at?->toIso8601String(),
+            'started_at' => $audit->started_at?->toIso8601String(),
+            'completed_at' => $audit->completed_at?->toIso8601String(),
             'started_by' => $audit->relationLoaded('startedBy') && $audit->startedBy ? ['name' => $audit->startedBy->name, 'nisj' => $audit->startedBy->nisj] : null,
             'completed_by' => $audit->relationLoaded('completedBy') && $audit->completedBy ? ['name' => $audit->completedBy->name, 'nisj' => $audit->completedBy->nisj] : null,
         ];

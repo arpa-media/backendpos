@@ -28,6 +28,7 @@ class GeneralAffairInventoryLogController extends Controller
             'outlets' => Outlet::query()->orderBy('name')->get(['id', 'code', 'name']),
             'item_types' => InventoryMovementService::ITEM_TYPES,
             'statuses' => InventoryMovementService::STATUSES,
+            'create_statuses' => InventoryMovementService::CREATE_STATUSES,
             'location_types' => InventoryMovementService::LOCATION_TYPES,
             'conditions' => InventoryMovementService::CONDITIONS,
             'warehouse_presets' => ['Warehouse Penataran 41', 'Warehouse Penataran 43', 'Warehouse Waringin'],
@@ -103,7 +104,11 @@ class GeneralAffairInventoryLogController extends Controller
         ]);
 
         $query = $this->filtered($filters);
-        $page = (clone $query)->with('actor:id,name,nisj')->orderByDesc('movement_at')->orderByDesc('created_at')->paginate((int) ($filters['per_page'] ?? 25));
+        $page = (clone $query)->with([
+            'actor:id,name,nisj',
+            'loanReturns.actor:id,name,nisj',
+            'loanParent:id,movement_number',
+        ])->orderByDesc('movement_at')->orderByDesc('created_at')->paginate((int) ($filters['per_page'] ?? 25));
         $summaryBase = $this->filtered($filters);
         $statusCounts = (clone $summaryBase)->selectRaw('movement_status, COUNT(*) as total')->groupBy('movement_status')->pluck('total', 'movement_status');
 
@@ -123,7 +128,11 @@ class GeneralAffairInventoryLogController extends Controller
 
     public function show(string $id): JsonResponse
     {
-        $row = InventoryMovement::query()->with('actor:id,name,nisj')->findOrFail($id);
+        $row = InventoryMovement::query()->with([
+            'actor:id,name,nisj',
+            'loanReturns.actor:id,name,nisj',
+            'loanParent:id,movement_number',
+        ])->findOrFail($id);
         return response()->json(['data' => $this->serialize($row)]);
     }
 
@@ -133,7 +142,7 @@ class GeneralAffairInventoryLogController extends Controller
             'item_type' => ['required', Rule::in(InventoryMovementService::ITEM_TYPES)],
             'item_id' => ['required', 'string', 'max:64'],
             'movement_at' => ['required', 'date'],
-            'movement_status' => ['required', Rule::in(InventoryMovementService::STATUSES)],
+            'movement_status' => ['required', Rule::in(InventoryMovementService::CREATE_STATUSES)],
             'quantity' => ['required', 'numeric', 'gt:0', 'max:999999999'],
             'condition' => ['required', Rule::in(InventoryMovementService::CONDITIONS)],
             'source_balance_id' => ['nullable', 'string', 'max:64'],
@@ -162,6 +171,27 @@ class GeneralAffairInventoryLogController extends Controller
         return response()->json(['data' => $this->serialize($movement), 'message' => 'Perpindahan barang berhasil diposting dan saldo lokasi diperbarui.'], 201);
     }
 
+    public function returnLoan(Request $request, string $id): JsonResponse
+    {
+        $loan = InventoryMovement::query()->findOrFail($id);
+        $data = $request->validate([
+            'return_at' => ['required', 'date'],
+            'quantity' => ['required', 'numeric', 'gt:0', 'max:999999999'],
+            'condition' => ['required', Rule::in(InventoryMovementService::CONDITIONS)],
+            'reason' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $movement = $this->movementService->returnLoan($loan, $data, $request->user()?->id);
+        $movement->load(['actor:id,name,nisj', 'loanParent:id,movement_number']);
+
+        $loan->refresh()->load(['actor:id,name,nisj', 'loanReturns.actor:id,name,nisj']);
+
+        return response()->json(['data' => [
+            'return_movement' => $this->serialize($movement),
+            'loan' => $this->serialize($loan),
+        ], 'message' => 'Pengembalian berhasil diposting. Qty kembali dan saldo lokasi sudah diperbarui.'], 201);
+    }
+
     private function filtered(array $filters): Builder
     {
         $q = InventoryMovement::query();
@@ -186,6 +216,44 @@ class GeneralAffairInventoryLogController extends Controller
 
     private function serialize(InventoryMovement $row): array
     {
+        $loanLifecycle = null;
+        if ((string) $row->movement_status === 'PINJAM') {
+            $returns = $row->relationLoaded('loanReturns')
+                ? $row->loanReturns
+                : $row->loanReturns()->with('actor:id,name,nisj')->get();
+            $returnedQty = round((float) $returns->sum(fn (InventoryMovement $return) => (float) $return->quantity), 3);
+            $loanQty = round((float) $row->quantity, 3);
+            $outstandingQty = round(max(0, $loanQty - $returnedQty), 3);
+            $state = $returnedQty <= 0.000001
+                ? 'DIPINJAM'
+                : ($outstandingQty <= 0.000001 ? 'SUDAH_KEMBALI' : 'SEBAGIAN_KEMBALI');
+            $loanLifecycle = [
+                'status' => $state,
+                'status_label' => match ($state) {
+                    'SUDAH_KEMBALI' => 'Sudah Kembali',
+                    'SEBAGIAN_KEMBALI' => 'Sebagian Kembali',
+                    default => 'Dipinjam',
+                },
+                'loan_quantity' => $loanQty,
+                'returned_quantity' => min($loanQty, $returnedQty),
+                'outstanding_quantity' => $outstandingQty,
+                'last_return_at' => $returns->max(fn (InventoryMovement $return) => $return->movement_at?->toIso8601String()),
+                'returns' => $returns->map(fn (InventoryMovement $return) => [
+                    'id' => (string) $return->id,
+                    'movement_number' => $return->movement_number,
+                    'return_at' => $return->movement_at?->toIso8601String(),
+                    'quantity' => (float) $return->quantity,
+                    'condition' => $return->condition,
+                    'reason' => $return->reason,
+                    'actor' => $return->actor ? [
+                        'id' => (string) $return->actor->id,
+                        'name' => $return->actor->name,
+                        'nisj' => $return->actor->nisj,
+                    ] : null,
+                ])->values(),
+            ];
+        }
+
         return [
             'id' => (string) $row->id,
             'movement_number' => $row->movement_number,
@@ -195,6 +263,11 @@ class GeneralAffairInventoryLogController extends Controller
             'item_name' => $row->item_name_snapshot,
             'movement_at' => $row->movement_at?->toIso8601String(),
             'movement_status' => $row->movement_status,
+            'loan_parent' => $row->loanParent ? [
+                'id' => (string) $row->loanParent->id,
+                'movement_number' => $row->loanParent->movement_number,
+            ] : null,
+            'loan' => $loanLifecycle,
             'quantity' => (float) $row->quantity,
             'state' => [
                 'item_qty_before' => (float) $row->item_qty_before,

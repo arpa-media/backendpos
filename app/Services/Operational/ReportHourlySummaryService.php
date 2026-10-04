@@ -3,6 +3,7 @@
 namespace App\Services\Operational;
 
 use App\Support\TransactionDate;
+use App\Services\Reporting\ReportReadinessService;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -10,6 +11,8 @@ use Illuminate\Support\Facades\Schema;
 
 class ReportHourlySummaryService
 {
+    public function __construct(private readonly ReportReadinessService $readinessService) {}
+
     public function refreshDate(array $outletIds, string $businessDate): array
     {
         $outletIds = $this->normalizeOutletIds($outletIds);
@@ -84,7 +87,7 @@ class ReportHourlySummaryService
         $expected = count($outletIds);
         if ($expected === 0 || ! $this->tablesReady() || ! Schema::hasTable('report_daily_summary_coverage')) {
             return [
-                'contract' => 'erp_finance_v8_i08_hourly_materialized',
+                'contract' => 'erp_pos_v11_i01_hourly_real_readiness',
                 'source' => 'report_hourly_sales_summaries + report_hourly_product_summaries',
                 'business_date' => $businessDate,
                 'date_from' => $businessDate,
@@ -100,9 +103,19 @@ class ReportHourlySummaryService
                 'ready_rows' => 0,
                 'missing_rows' => $expected,
                 'coverage_percent' => 0.0,
+                'readiness_percent' => 0.0,
+                'physical_coverage_percent' => 0.0,
                 'http_backfill' => false,
             ];
         }
+
+        $daily = $this->readinessService->dailyMatrixStatus(
+            $outletIds,
+            $businessDate,
+            $businessDate,
+            (string) config('app.timezone', 'Asia/Jakarta'),
+        );
+        $dirtyOutletIds = array_values(array_map('strval', $daily['dirty_outlet_ids'] ?? []));
 
         $row = DB::table('report_daily_summary_coverage as d')
             ->leftJoin('report_hourly_summary_coverage as h', function ($join): void {
@@ -112,18 +125,35 @@ class ReportHourlySummaryService
             ->whereIn('d.outlet_id', $outletIds)
             ->where('d.business_date', $businessDate)
             ->selectRaw('COUNT(DISTINCT d.outlet_id) as daily_rows')
-            ->selectRaw('SUM(CASE WHEN h.outlet_id IS NOT NULL AND h.source_daily_synced_at IS NOT NULL AND h.source_daily_synced_at >= d.synced_at THEN 1 ELSE 0 END) as ready_rows')
+            ->selectRaw('SUM(CASE WHEN h.outlet_id IS NOT NULL AND h.source_daily_synced_at IS NOT NULL AND h.source_daily_synced_at >= d.synced_at THEN 1 ELSE 0 END) as physical_ready_rows')
             ->selectRaw('MIN(h.synced_at) as oldest_hourly_synced_at')
             ->selectRaw('MAX(h.synced_at) as latest_hourly_synced_at')
             ->first();
 
         $dailyRows = (int) ($row->daily_rows ?? 0);
-        $readyRows = (int) ($row->ready_rows ?? 0);
-        $ready = $dailyRows === $expected && $readyRows === $expected;
+        $physicalReadyRows = (int) ($row->physical_ready_rows ?? 0);
+
+        $readyRowsQuery = DB::table('report_daily_summary_coverage as d')
+            ->join('report_hourly_summary_coverage as h', function ($join): void {
+                $join->on('h.outlet_id', '=', 'd.outlet_id')
+                    ->on('h.business_date', '=', 'd.business_date');
+            })
+            ->whereIn('d.outlet_id', $outletIds)
+            ->where('d.business_date', $businessDate)
+            ->whereNotNull('h.source_daily_synced_at')
+            ->whereColumn('h.source_daily_synced_at', '>=', 'd.synced_at');
+        if ($dirtyOutletIds !== []) {
+            $readyRowsQuery->whereNotIn('d.outlet_id', $dirtyOutletIds);
+        }
+        $readyRows = (int) $readyRowsQuery->count();
+
+        $ready = (bool) ($daily['ready'] ?? false) && $readyRows === $expected;
         $missing = max(0, $expected - $readyRows);
+        $readinessPercent = $expected > 0 ? round(($readyRows / $expected) * 100, 2) : 100.0;
+        $physicalPercent = $expected > 0 ? round((min($expected, $physicalReadyRows) / $expected) * 100, 2) : 100.0;
 
         return [
-            'contract' => 'erp_finance_v8_i08_hourly_materialized',
+            'contract' => 'erp_pos_v11_i01_hourly_real_readiness',
             'source' => 'report_hourly_sales_summaries + report_hourly_product_summaries',
             'business_date' => $businessDate,
             'date_from' => $businessDate,
@@ -134,14 +164,21 @@ class ReportHourlySummaryService
             'timezone' => (string) config('app.timezone', 'Asia/Jakarta'),
             'recovery_pipeline' => 'hourly',
             'expected_rows' => $expected,
-            'daily_ready_rows' => $dailyRows,
+            'daily_ready_rows' => (int) ($daily['ready_rows'] ?? 0),
+            'physical_daily_rows' => $dailyRows,
             'ready_rows' => $readyRows,
+            'physical_ready_rows' => $physicalReadyRows,
             'missing_rows' => $missing,
-            'coverage_percent' => $expected > 0 ? round(($readyRows / $expected) * 100, 2) : 100.0,
+            'coverage_percent' => $readinessPercent,
+            'readiness_percent' => $readinessPercent,
+            'physical_coverage_percent' => $physicalPercent,
+            'effective_pending_refresh_rows' => (int) ($daily['effective_pending_refresh_rows'] ?? 0),
+            'raw_pending_refresh_rows' => (int) ($daily['raw_pending_refresh_rows'] ?? 0),
+            'stale_refresh_flag_rows' => (int) ($daily['stale_refresh_flag_rows'] ?? 0),
             'oldest_synced_at' => $row->oldest_hourly_synced_at ?? null,
             'latest_synced_at' => $row->latest_hourly_synced_at ?? null,
             'ready' => $ready,
-            'state' => $ready ? 'ready' : 'warming',
+            'state' => $ready ? 'ready' : (! (bool) ($daily['ready'] ?? false) ? 'daily_not_ready' : 'warming'),
             'http_backfill' => false,
         ];
     }

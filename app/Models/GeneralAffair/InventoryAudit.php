@@ -14,7 +14,8 @@ class InventoryAudit extends Model
     protected $table = 'ga_inventory_audits';
     protected $guarded = [];
     protected $casts = [
-        'audit_year' => 'integer', 'audit_month' => 'integer', 'snapshot_line_count' => 'integer',
+        'audit_year' => 'integer', 'audit_month' => 'integer', 'audit_sequence' => 'integer',
+        'audit_date' => 'date:Y-m-d', 'snapshot_line_count' => 'integer',
         'checked_line_count' => 'integer', 'discrepancy_line_count' => 'integer',
         'started_at' => 'datetime', 'completed_at' => 'datetime',
     ];
@@ -23,4 +24,6 @@ class InventoryAudit extends Model
     public function lines() { return $this->hasMany(InventoryAuditLine::class, 'audit_id'); }
     public function startedBy() { return $this->belongsTo(User::class, 'started_by_user_id'); }
     public function completedBy() { return $this->belongsTo(User::class, 'completed_by_user_id'); }
+    public function reAuditOf() { return $this->belongsTo(self::class, 're_audit_of_id'); }
+    public function reAudits() { return $this->hasMany(self::class, 're_audit_of_id'); }
 }

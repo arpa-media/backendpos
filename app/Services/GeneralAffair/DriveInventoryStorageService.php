@@ -24,6 +24,8 @@ class DriveInventoryStorageService
     private const LIST_LIMIT = 10000;
     private const SUMMARY_MAX_ENTRIES = 30000;
     private const SUMMARY_MAX_SECONDS = 2.0;
+    private const GLOBAL_SEARCH_MAX_ENTRIES = 50000;
+    private const GLOBAL_SEARCH_MAX_SECONDS = 2.5;
 
     public const INITIAL_FOLDERS = [
         '00 Office',
@@ -77,37 +79,26 @@ class DriveInventoryStorageService
         $page = max(1, (int) ($options['page'] ?? 1));
         $perPage = min(200, max(20, (int) ($options['per_page'] ?? 80)));
 
+        if ($search !== '') {
+            return $this->browseGlobalSearch($path, $search, $page, $perPage);
+        }
+
         $entries = [];
         $matchedTotal = 0;
         $listingTruncated = false;
         foreach (new \DirectoryIterator($absolute) as $entry) {
             if ($entry->isDot() || $entry->isLink()) continue;
             $name = $entry->getFilename();
-            if ($search !== '' && ! str_contains(mb_strtolower($name), $search)) continue;
             $matchedTotal++;
             if (count($entries) >= self::LIST_LIMIT) {
                 $listingTruncated = true;
                 continue;
             }
             $relative = $this->joinPath($path, $name);
-            $isDirectory = $entry->isDir();
-            $entries[] = [
-                'name' => $name,
-                'path' => $relative,
-                'type' => $isDirectory ? 'folder' : 'file',
-                'size_bytes' => $isDirectory ? null : max(0, (int) $entry->getSize()),
-                'extension' => $isDirectory ? null : strtolower((string) pathinfo($name, PATHINFO_EXTENSION)),
-                'modified_at' => $entry->getMTime() ? date(DATE_ATOM, $entry->getMTime()) : null,
-                'downloadable' => ! $isDirectory,
-                'mapped_outlet' => $isDirectory ? $this->mappingAtPath($relative) : null,
-                'protected' => $this->hasProtectedReference($relative),
-            ];
+            $entries[] = $this->entryPayload($relative, $name, $entry->isDir(), $entry->isDir() ? null : max(0, (int) $entry->getSize()), $entry->getMTime());
         }
 
-        usort($entries, static function (array $a, array $b): int {
-            if ($a['type'] !== $b['type']) return $a['type'] === 'folder' ? -1 : 1;
-            return strnatcasecmp((string) $a['name'], (string) $b['name']);
-        });
+        $this->sortEntries($entries);
 
         $visibleTotal = count($entries);
         $offset = ($page - 1) * $perPage;
@@ -128,9 +119,210 @@ class DriveInventoryStorageService
                 'listing_truncated' => $listingTruncated,
                 'list_limit' => self::LIST_LIMIT,
             ],
+            'search' => ['query' => '', 'scope' => 'folder', 'scanned_entries' => $matchedTotal, 'partial' => $listingTruncated],
             'summary' => $this->summary($absolute, $path),
             'recent_activity' => $this->recentActivity(),
         ];
+    }
+
+    private function browseGlobalSearch(string $currentPath, string $search, int $page, int $perPage): array
+    {
+        $root = $this->rootAbsolute();
+        $started = microtime(true);
+        $matches = [];
+        $scanned = 0;
+        $scannedFiles = 0;
+        $scannedFolders = 0;
+        $scannedBytes = 0;
+        $partial = false;
+
+        try {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($root, \FilesystemIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::SELF_FIRST,
+                RecursiveIteratorIterator::CATCH_GET_CHILD
+            );
+            foreach ($iterator as $entry) {
+                if ($entry->isLink()) continue;
+                $scanned++;
+                if ($scanned > self::GLOBAL_SEARCH_MAX_ENTRIES || (microtime(true) - $started) > self::GLOBAL_SEARCH_MAX_SECONDS) {
+                    $partial = true;
+                    break;
+                }
+
+                if ($entry->isDir()) $scannedFolders++;
+                elseif ($entry->isFile()) { $scannedFiles++; $scannedBytes += max(0, (int) $entry->getSize()); }
+
+                $name = (string) $entry->getFilename();
+                if (! str_contains(mb_strtolower($name), $search)) continue;
+                if (count($matches) >= self::LIST_LIMIT) {
+                    $partial = true;
+                    break;
+                }
+
+                $relative = str_replace('\\', '/', substr($entry->getPathname(), strlen($root) + 1));
+                if ($relative === '') continue;
+                $matches[] = [
+                    'name' => $name,
+                    'path' => $relative,
+                    'type' => $entry->isDir() ? 'folder' : 'file',
+                    'size_bytes' => $entry->isDir() ? null : max(0, (int) $entry->getSize()),
+                    'modified_time' => $entry->getMTime() ?: null,
+                ];
+            }
+        } catch (\Throwable) {
+            $partial = true;
+        }
+
+        $this->sortEntries($matches);
+        $matchedTotal = count($matches);
+        $offset = ($page - 1) * $perPage;
+        $visible = $this->enrichGlobalSearchEntries(array_slice($matches, $offset, $perPage));
+
+        return [
+            'root_label' => 'Profile Inventory',
+            'root_storage_path' => self::ROOT,
+            'current' => [
+                'path' => $currentPath,
+                'breadcrumbs' => $this->breadcrumbs($currentPath),
+            ],
+            'entries' => $visible,
+            'pagination' => [
+                'page' => $page,
+                'per_page' => $perPage,
+                'total' => $matchedTotal,
+                'matched_total' => $matchedTotal,
+                'last_page' => max(1, (int) ceil($matchedTotal / $perPage)),
+                'listing_truncated' => $partial,
+                'list_limit' => self::LIST_LIMIT,
+            ],
+            'search' => [
+                'query' => $search,
+                'scope' => 'global',
+                'scanned_entries' => $scanned,
+                'partial' => $partial,
+                'max_entries' => self::GLOBAL_SEARCH_MAX_ENTRIES,
+            ],
+            'summary' => [
+                'file_count' => $scannedFiles,
+                'folder_count' => $scannedFolders,
+                'total_bytes' => $scannedBytes,
+                'scanned_entries' => $scanned,
+                'partial' => $partial,
+                'path' => '',
+            ],
+            'recent_activity' => $this->recentActivity(),
+        ];
+    }
+
+
+    private function enrichGlobalSearchEntries(array $entries): array
+    {
+        if ($entries === []) return [];
+
+        $folderPaths = array_values(array_map(
+            fn (array $entry): string => (string) $entry['path'],
+            array_filter($entries, fn (array $entry): bool => ($entry['type'] ?? '') === 'folder')
+        ));
+        $allPaths = array_values(array_map(fn (array $entry): string => (string) $entry['path'], $entries));
+
+        $mappingRows = collect();
+        if ($folderPaths !== [] && DB::getSchemaBuilder()->hasTable('ga_inventory_drive_folder_mappings')) {
+            $mappingRows = InventoryDriveFolderMapping::query()
+                ->where('is_active', true)
+                ->whereIn('folder_path', $folderPaths)
+                ->get(['folder_path','outlet_id','outlet_code_snapshot','outlet_name_snapshot'])
+                ->keyBy('folder_path');
+        }
+        $protected = $this->protectedPathLookup($allPaths);
+
+        return array_map(function (array $entry) use ($mappingRows, $protected): array {
+            $relative = (string) $entry['path'];
+            $isDirectory = ($entry['type'] ?? '') === 'folder';
+            $parentPath = str_contains($relative, '/') ? substr($relative, 0, (int) strrpos($relative, '/')) : '';
+            $mapping = $isDirectory ? $mappingRows->get($relative) : null;
+            return [
+                'name' => (string) $entry['name'],
+                'path' => $relative,
+                'parent_path' => $parentPath,
+                'display_path' => $relative,
+                'type' => $isDirectory ? 'folder' : 'file',
+                'size_bytes' => $isDirectory ? null : max(0, (int) ($entry['size_bytes'] ?? 0)),
+                'extension' => $isDirectory ? null : strtolower((string) pathinfo((string) $entry['name'], PATHINFO_EXTENSION)),
+                'modified_at' => ! empty($entry['modified_time']) ? date(DATE_ATOM, (int) $entry['modified_time']) : null,
+                'downloadable' => ! $isDirectory,
+                'mapped_outlet' => $mapping ? [
+                    'outlet_id' => (string) $mapping->outlet_id,
+                    'code' => $mapping->outlet_code_snapshot,
+                    'name' => $mapping->outlet_name_snapshot,
+                ] : null,
+                'protected' => isset($protected[$relative]),
+            ];
+        }, $entries);
+    }
+
+    /** @return array<string,true> */
+    private function protectedPathLookup(array $paths): array
+    {
+        $paths = array_values(array_unique(array_filter($paths, fn ($path) => is_string($path) && $path !== '')));
+        if ($paths === []) return [];
+        $protected = [];
+
+        if (DB::getSchemaBuilder()->hasTable('ga_inventory_drive_folder_mappings')) {
+            $references = InventoryDriveFolderMapping::query()->where('is_active', true)->pluck('folder_path')->all();
+            foreach ($paths as $path) {
+                foreach ($references as $reference) {
+                    $reference = (string) $reference;
+                    if ($reference === $path || str_starts_with($reference, $path.'/')) { $protected[$path] = true; break; }
+                }
+            }
+        }
+
+        foreach ([['table' => 'ga_assets', 'model' => Asset::class], ['table' => 'ga_inventory_items', 'model' => InventoryItem::class]] as $source) {
+            if (! DB::getSchemaBuilder()->hasTable($source['table'])) continue;
+            $query = $source['model']::withTrashed()->where(function ($query) use ($paths): void {
+                foreach ($paths as $path) {
+                    $prefix = self::ROOT.'/'.$path;
+                    $query->orWhere('photo_path', $prefix)->orWhere('photo_path', 'like', $prefix.'/%');
+                }
+            });
+            foreach ($query->pluck('photo_path')->all() as $photoPath) {
+                $photoPath = (string) $photoPath;
+                foreach ($paths as $path) {
+                    $prefix = self::ROOT.'/'.$path;
+                    if ($photoPath === $prefix || str_starts_with($photoPath, $prefix.'/')) $protected[$path] = true;
+                }
+            }
+        }
+
+        return $protected;
+    }
+
+    private function entryPayload(string $relative, string $name, bool $isDirectory, ?int $sizeBytes, int|false|null $modifiedTime): array
+    {
+        $parentPath = str_contains($relative, '/') ? substr($relative, 0, (int) strrpos($relative, '/')) : '';
+        return [
+            'name' => $name,
+            'path' => $relative,
+            'parent_path' => $parentPath,
+            'display_path' => $relative,
+            'type' => $isDirectory ? 'folder' : 'file',
+            'size_bytes' => $isDirectory ? null : max(0, (int) ($sizeBytes ?? 0)),
+            'extension' => $isDirectory ? null : strtolower((string) pathinfo($name, PATHINFO_EXTENSION)),
+            'modified_at' => $modifiedTime ? date(DATE_ATOM, (int) $modifiedTime) : null,
+            'downloadable' => ! $isDirectory,
+            'mapped_outlet' => $isDirectory ? $this->mappingAtPath($relative) : null,
+            'protected' => $this->hasProtectedReference($relative),
+        ];
+    }
+
+    private function sortEntries(array &$entries): void
+    {
+        usort($entries, static function (array $a, array $b): int {
+            if (($a['type'] ?? '') !== ($b['type'] ?? '')) return ($a['type'] ?? '') === 'folder' ? -1 : 1;
+            $byName = strnatcasecmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? ''));
+            return $byName !== 0 ? $byName : strnatcasecmp((string) ($a['path'] ?? ''), (string) ($b['path'] ?? ''));
+        });
     }
 
     public function meta(): array

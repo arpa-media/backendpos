@@ -49,7 +49,7 @@ final class FinanceSummaryXlsxExportService
             $normalizedRows = [['Tidak ada data']];
         }
 
-        $styledRows = $this->styleRows($normalizedRows);
+        $styledRows = $this->styleRows($normalizedRows, $this->nativeTimeColumns($payload));
         $widths = $this->columnWidths($normalizedRows, $maxColumns);
         $merges = $this->mergeRanges($normalizedRows, $maxColumns);
 
@@ -68,6 +68,24 @@ final class FinanceSummaryXlsxExportService
         return ['path' => $path, 'filename' => $filename, 'row_count' => count($normalizedRows)];
     }
 
+    /** @return array<int,int> */
+    private function nativeTimeColumns(array $payload): array
+    {
+        $raw = $payload['native_time_columns'] ?? [];
+        if (! is_array($raw)) return [];
+
+        $columns = [];
+        foreach ($raw as $value) {
+            if (! is_int($value) && ! (is_string($value) && ctype_digit($value))) continue;
+            $column = (int) $value;
+            if ($column < 0 || $column >= self::MAX_COLUMNS) continue;
+            $columns[$column] = $column;
+        }
+
+        ksort($columns);
+        return array_values($columns);
+    }
+
     private function normalizeValue(mixed $value): mixed
     {
         if ($value === null || is_bool($value) || is_int($value) || is_float($value)) return $value;
@@ -83,12 +101,16 @@ final class FinanceSummaryXlsxExportService
         return $text;
     }
 
-    /** @param array<int,array<int,mixed>> $rows */
-    private function styleRows(array $rows): array
+    /**
+     * @param array<int,array<int,mixed>> $rows
+     * @param array<int,int> $nativeTimeColumns zero-based column indexes
+     */
+    private function styleRows(array $rows, array $nativeTimeColumns = []): array
     {
         $result = [];
         $metadataPhase = true;
         $columnTypes = [];
+        $explicitTypes = array_fill_keys($nativeTimeColumns, 'time');
         foreach ($rows as $index => $row) {
             $nonEmpty = array_values(array_filter($row, fn ($v) => $v !== null && $v !== ''));
             $isBlank = $nonEmpty === [];
@@ -111,7 +133,7 @@ final class FinanceSummaryXlsxExportService
             if ($isHeader) {
                 $columnTypes = [];
                 foreach ($row as $column => $heading) {
-                    $columnTypes[$column] = $this->semanticColumnType($heading);
+                    $columnTypes[$column] = $explicitTypes[$column] ?? $this->semanticColumnType($heading);
                 }
             }
 
