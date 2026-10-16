@@ -29,7 +29,7 @@ class OwnerOverviewController extends Controller
         }
 
         $payload = AnalyticsResponseCache::rememberReporting(
-            'owner-overview.console-i02.index',
+            'owner-overview.v12-i01.index',
             $params,
             $reportingSource,
             fn () => $this->service->overview($params, $reportingSource),

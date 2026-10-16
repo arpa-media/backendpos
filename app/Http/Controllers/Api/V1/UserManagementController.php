@@ -22,6 +22,7 @@ use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use Spatie\Permission\Models\Permission;
+use Spatie\Permission\Models\Role as SpatieRole;
 
 class UserManagementController extends Controller
 {
@@ -31,7 +32,29 @@ class UserManagementController extends Controller
 
     public function overview(Request $request)
     {
-        $this->userManagement->ensureMasters();
+        // Avoid repeated updateOrCreate/catalog synchronization on every filter/page.
+        $this->userManagement->ensureMastersReady();
+
+        // V12 I02: old clients retain their full overview by default.
+        // The backoffice explicitly requests the lightweight catalog-only bootstrap.
+        $includeUsers = ! $request->has('include_users') || $request->boolean('include_users');
+        $includeCatalog = ! $request->has('include_catalog') || $request->boolean('include_catalog');
+
+        if (! $includeUsers) {
+            $masters = $this->buildMasters();
+            $matrix = $this->buildMatrix();
+
+            return ApiResponse::ok([
+                'users_loaded' => false,
+                'active_filters' => [],
+                'summary' => $this->overviewSummary($masters, $matrix, null),
+                'pagination' => ['current_page' => 1, 'last_page' => 1, 'per_page' => 10, 'total' => 0],
+                'masters' => $masters,
+                'matrix' => $matrix,
+                'users' => [],
+                'audit_logs' => $this->recentAccessAuditLogs(),
+            ], 'OK');
+        }
 
         $q = trim((string) $request->string('q', ''));
         $perPage = max(1, min(100, (int) $request->integer('per_page', 10)));
@@ -39,7 +62,11 @@ class UserManagementController extends Controller
         $outletId = trim((string) $request->string('outlet_id', ''));
         // ERP POS FINAL I07 — server-side User Management filters.
         // Keep parameter names stable for the existing I07 frontend contract.
+        // Accept both the legacy `assignment` and the current Vue filter name.
         $assignment = trim((string) $request->string('assignment', ''));
+        if ($assignment === '') {
+            $assignment = trim((string) $request->string('assignment_role_title', ''));
+        }
         $accessRoleId = trim((string) $request->string('access_role_id', ''));
         $accessLevelId = trim((string) $request->string('access_level_id', ''));
 
@@ -78,7 +105,7 @@ class UserManagementController extends Controller
 
         if ($assignment !== '') {
             $usersQuery->whereHas('employee.assignment', function ($assignmentQuery) use ($assignment) {
-                $assignmentQuery->where('role_title', $assignment);
+                $assignmentQuery->whereRaw('TRIM(assignments.role_title) = ?', [$assignment]);
             });
         }
 
@@ -110,8 +137,10 @@ class UserManagementController extends Controller
             'reportOutletAssignments.outlet',
         ]);
 
-        $masters = $this->buildMasters();
-        $matrix = $this->buildMatrix();
+        // Filter / pagination requests need user rows, not the full permission catalog.
+        // Legacy callers that omit include_catalog keep the original payload shape.
+        $masters = $includeCatalog ? $this->buildMasters() : null;
+        $matrix = $includeCatalog ? $this->buildMatrix() : null;
 
         $provisionControlRows = PosProvisionControl::query()
             ->whereIn('user_id', $users->pluck('id')->all())
@@ -193,50 +222,23 @@ class UserManagementController extends Controller
             ];
         })->values()->all();
 
-        $auditLogs = [];
-        if (Schema::hasTable('user_access_assignment_audits')) {
-            $auditLogs = DB::table('user_access_assignment_audits as a')
-                ->leftJoin('users as actor', 'actor.id', '=', 'a.actor_user_id')
-                ->leftJoin('users as target', 'target.id', '=', 'a.subject_user_id')
-                ->orderByDesc('a.created_at')
-                ->limit(30)
-                ->get([
-                    'a.id', 'a.batch_id', 'a.event', 'a.created_at',
-                    'actor.name as actor_name', 'actor.nisj as actor_nisj',
-                    'target.name as target_name', 'target.nisj as target_nisj',
-                ])
-                ->map(fn ($row) => [
-                    'id' => (string) $row->id,
-                    'batch_id' => (string) $row->batch_id,
-                    'action' => (string) $row->event,
-                    'actor_name' => $row->actor_name,
-                    'actor_nisj' => $row->actor_nisj,
-                    'target_name' => $row->target_name,
-                    'target_nisj' => $row->target_nisj,
-                    'created_at' => $row->created_at,
-                ])->all();
-        }
+        $auditLogs = $includeCatalog ? $this->recentAccessAuditLogs() : null;
 
         return ApiResponse::ok([
             'active_filters' => [
                 'q' => $q !== '' ? $q : null,
                 'outlet_id' => $outletId !== '' ? $outletId : null,
                 'assignment' => $assignment !== '' ? $assignment : null,
+                'assignment_role_title' => $assignment !== '' ? $assignment : null,
                 'access_role_id' => $accessRoleId !== '' ? $accessRoleId : null,
                 'access_level_id' => $accessLevelId !== '' ? $accessLevelId : null,
             ],
-            'summary' => [
-                'users' => User::query()
+            'users_loaded' => true,
+            'summary' => $includeCatalog
+                ? $this->overviewSummary($masters, $matrix, User::query()
                     ->when(Schema::hasColumn('users', 'hr_retired_at'), fn ($query) => $query->whereNull('users.hr_retired_at'))
-                    ->count(),
-                'roles' => count($masters['roles']),
-                'levels' => count($masters['levels']),
-                'portals' => count($masters['portals']),
-                'menus' => count($masters['menus']),
-                'portal_permissions' => count($matrix['portal_permissions']),
-                'menu_permissions' => count($matrix['menu_permissions']),
-                'spatie_permissions' => Permission::query()->count(),
-            ],
+                    ->count())
+                : ['users' => $paginator->total()],
             'pagination' => [
                 'current_page' => $paginator->currentPage(),
                 'last_page' => $paginator->lastPage(),
@@ -248,6 +250,53 @@ class UserManagementController extends Controller
             'users' => $payloadUsers,
             'audit_logs' => $auditLogs,
         ], 'OK');
+    }
+
+    /**
+     * The catalog bootstrap deliberately avoids a users count or pagination scan.
+     * When fetching actual users, the paginator total supplies the filtered count.
+     */
+    private function overviewSummary(array $masters, array $matrix, ?int $usersTotal = null): array
+    {
+        return [
+            'users' => $usersTotal,
+            'roles' => count($masters['roles']),
+            'levels' => count($masters['levels']),
+            'portals' => count($masters['portals']),
+            'menus' => count($masters['menus']),
+            'portal_permissions' => count($matrix['portal_permissions']),
+            'menu_permissions' => count($matrix['menu_permissions']),
+            'spatie_permissions' => Permission::query()->count(),
+        ];
+    }
+
+    /** Light recent activity; independent from the paginated users query. */
+    private function recentAccessAuditLogs(): array
+    {
+        if (! Schema::hasTable('user_access_assignment_audits')) {
+            return [];
+        }
+
+        return DB::table('user_access_assignment_audits as a')
+            ->leftJoin('users as actor', 'actor.id', '=', 'a.actor_user_id')
+            ->leftJoin('users as target', 'target.id', '=', 'a.subject_user_id')
+            ->orderByDesc('a.created_at')
+            ->limit(30)
+            ->get([
+                'a.id', 'a.batch_id', 'a.event', 'a.created_at',
+                'actor.name as actor_name', 'actor.nisj as actor_nisj',
+                'target.name as target_name', 'target.nisj as target_nisj',
+            ])
+            ->map(fn ($row) => [
+                'id' => (string) $row->id,
+                'batch_id' => (string) $row->batch_id,
+                'action' => (string) $row->event,
+                'actor_name' => $row->actor_name,
+                'actor_nisj' => $row->actor_nisj,
+                'target_name' => $row->target_name,
+                'target_nisj' => $row->target_nisj,
+                'created_at' => $row->created_at,
+            ])->all();
     }
 
     public function storeRole(Request $request)
@@ -1020,6 +1069,12 @@ class UserManagementController extends Controller
 
         $roles = AccessRole::query()->with('userType')->orderBy('name')->get()->map(fn (AccessRole $item) => $this->serializeRole($item))->values()->all();
         $levels = AccessLevel::query()->orderBy('name')->get()->map(fn (AccessLevel $item) => $this->serializeLevel($item))->values()->all();
+        $spatieRoles = SpatieRole::query()->withCount('permissions')->orderBy('name')->get()
+            ->map(fn (SpatieRole $item) => [
+                'name' => (string) $item->name,
+                'guard_name' => (string) $item->guard_name,
+                'permission_count' => (int) $item->permissions_count,
+            ])->values()->all();
         $portals = AccessPortal::query()->orderBy('sort_order')->orderBy('name')->get()->map(fn (AccessPortal $item) => $this->serializePortal($item))->values()->all();
         $menus = AccessMenu::query()->with('portal')->orderBy('sort_order')->orderBy('name')->get()->map(fn (AccessMenu $item) => $this->serializeMenu($item))->values()->all();
 
@@ -1064,12 +1119,14 @@ class UserManagementController extends Controller
         return [
             'user_types' => $userTypes,
             'roles' => $roles,
+            'spatie_roles' => $spatieRoles,
             'levels' => $levels,
             'portals' => $portals,
             'menus' => $menus,
             'outlets' => $outlets,
             // I07 canonical current-assignment dropdown values.
             'assignments' => $assignments,
+            'assignment_roles' => array_map(fn (string $title) => ['value' => $title, 'name' => $title], $assignments),
             'spatie_permissions' => Permission::query()->orderBy('name')->pluck('name')->values()->all(),
         ];
     }

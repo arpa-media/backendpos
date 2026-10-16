@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api\V1\HumanResource;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\HumanResource\HrAttendanceBackofficeScopeService;
+use App\Services\HumanResource\HrAttendanceCheckoutResetService;
 use App\Services\HumanResource\HrAttendancePresentationService;
 use App\Services\Support\SimpleXlsxService;
 use Carbon\CarbonImmutable;
@@ -23,6 +24,7 @@ class HrAttendanceDataController extends Controller
         private readonly HrAttendanceBackofficeScopeService $scope,
         private readonly HrAttendancePresentationService $presentation,
         private readonly SimpleXlsxService $xlsx,
+        private readonly HrAttendanceCheckoutResetService $checkoutReset,
     ) {}
 
     public function options(Request $request)
@@ -55,7 +57,11 @@ class HrAttendanceDataController extends Controller
         $paginator = $query->paginate($perPage);
 
         return ApiResponse::ok([
-            'items' => collect($paginator->items())->map(fn ($row) => $this->presentation->row($row))->values(),
+            'items' => collect($paginator->items())->map(function ($row) {
+                $payload = $this->presentation->row($row);
+                $payload['checkout_at_utc'] = $row->checkout_at ? (string) $row->checkout_at : null;
+                return $payload;
+            })->values(),
             'pagination' => [
                 'page' => $paginator->currentPage(),
                 'per_page' => $paginator->perPage(),
@@ -66,6 +72,32 @@ class HrAttendanceDataController extends Controller
             ],
             'filters' => $data,
         ], 'OK');
+    }
+
+    /** Reset only Absen Pulang. Absen Datang and approval are immutable in this action. */
+    public function resetCheckout(Request $request, string $attendanceId)
+    {
+        if (! Schema::hasTable('HR_attendances') || ! Schema::hasTable('HR_attendance_checkout_reset_logs')) {
+            return ApiResponse::error('Migration reset Absen Pulang belum dijalankan.', 'HR_CHECKOUT_RESET_SCHEMA_MISSING', 503);
+        }
+
+        $data = $request->validate([
+            'reason' => ['required', 'string', 'min:10', 'max:1000'],
+            'expected_checkout_at_utc' => ['required', 'date_format:Y-m-d H:i:s'],
+        ]);
+
+        if (mb_strlen(trim($data['reason'])) < 10) {
+            return ApiResponse::error('Alasan reset minimal 10 karakter non-spasi.', 'HR_CHECKOUT_RESET_REASON_REQUIRED', 422);
+        }
+
+        $result = $this->checkoutReset->reset(
+            $request,
+            $attendanceId,
+            trim($data['reason']),
+            $data['expected_checkout_at_utc']
+        );
+
+        return ApiResponse::ok($result, 'Absen Pulang berhasil di-reset. Absen Datang tetap tersimpan.');
     }
 
     public function export(Request $request)

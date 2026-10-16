@@ -8,6 +8,7 @@ use App\Support\DeliveryNoTaxReadModel;
 use App\Support\ReportPortalMarkedScopeVersion;
 use App\Support\TransactionDate;
 use App\Services\Reporting\ReportHotWindowReadService;
+use App\Services\Reporting\ReportExactSaleScopeService;
 use App\Models\Sale;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
@@ -25,6 +26,7 @@ class ReportPortalAnalyticsService
         private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
         private readonly FinanceNetReadService $financeNetReadService,
         private readonly ReportHotWindowReadService $hotWindowReadService,
+        private readonly ReportExactSaleScopeService $exactSaleScopeService,
     ) {
     }
 
@@ -312,7 +314,7 @@ class ReportPortalAnalyticsService
                 'revenue' => (int) round((float) ($row->revenue ?? 0)),
             ])->values()->all();
 
-        $recentSaleIds = $this->hotWindowReadService->recentSaleIds(
+        $recentSaleIds = $this->exactSaleScopeService->recentSaleIds(
             $outletIds,
             $from->toDateString(),
             $to->toDateString(),
@@ -776,29 +778,21 @@ class ReportPortalAnalyticsService
         ];
     }
 
-    public function saleDetail(array $scope, string $saleId): array
+    public function saleDetail(array $scope, string $saleId, array $params = []): array
     {
         $this->setScopeTimezone($scope);
-        $params = [
-            'date_from' => request('date_from'),
-            'date_to' => request('date_to'),
-        ];
-        $saleScope = $this->resolveEligibleSalesScope($scope, $params);
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+        $outletIds = $this->effectiveScopeOutletIds($scope);
+        $markedOnly = ! empty($scope['marked_only']);
 
-        if (! ($saleScope['has_rows'] ?? false)) {
-            return [
-                'ok' => false,
-                'status' => 404,
-                'message' => 'Transaksi tidak ditemukan pada scope report ini.',
-                'error_code' => 'REPORT_SALE_NOT_FOUND',
-            ];
-        }
-
-        $visible = DB::table('report_sale_scope_cache as rssc_visible')
-            ->where('rssc_visible.scope_key', (string) $saleScope['scope_key'])
-            ->where('rssc_visible.sale_id', $saleId)
-            ->where('rssc_visible.expires_at', '>', now())
-            ->exists();
+        $visible = $this->exactSaleScopeService->saleExists(
+            $outletIds,
+            $params['date_from'] ?? null,
+            $params['date_to'] ?? null,
+            $timezone,
+            $saleId,
+            $markedOnly,
+        );
 
         if (! $visible) {
             return [
@@ -868,14 +862,20 @@ class ReportPortalAnalyticsService
         [$from, $to] = $this->resolveRange($params['date_from'] ?? null, $params['date_to'] ?? null);
         $perPage = max(1, min(100, (int) ($params['per_page'] ?? $defaultPerPage)));
         $page = max(1, (int) ($params['page'] ?? 1));
-        $saleScope = $this->resolveEligibleSalesScope($scope, $params);
-        $scopeKey = (string) ($saleScope['scope_key'] ?? '');
+        $outletIds = $this->effectiveScopeOutletIds($scope);
+        $timezone = (string) ($this->contextTimezone ?: config('app.timezone', 'Asia/Jakarta'));
+        $markedOnly = ! empty($scope['marked_only']);
+        $exactScope = $this->exactSaleScopeService->scopeQuery(
+            $outletIds,
+            $from->toDateString(),
+            $to->toDateString(),
+            $timezone,
+            $markedOnly,
+        );
 
         $query = DB::table('sales as s')
-            ->joinSub($this->scopeSalesSubquery($scopeKey), 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
+            ->joinSub($exactScope, 'scope_sales', fn ($join) => $join->on('scope_sales.sale_id', '=', 's.id'))
             ->join('outlets as o', 'o.id', '=', 's.outlet_id')
-            ->leftJoinSub($this->paymentSummarySubquery($scopeKey), 'payments', fn ($join) => $join->on('payments.sale_id', '=', 's.id'))
-            ->leftJoinSub($this->channelMapSubquery($scopeKey), 'channel_map', fn ($join) => $join->on('channel_map.sale_id', '=', 's.id'))
             ->whereNull('s.deleted_at')
             ->where('s.status', '=', 'PAID');
 
@@ -897,6 +897,7 @@ class ReportPortalAnalyticsService
                 's.outlet_id',
                 's.sale_number',
                 's.channel',
+                's.online_order_source',
                 's.payment_method_name',
                 's.payment_method_type',
                 's.subtotal',
@@ -912,14 +913,15 @@ class ReportPortalAnalyticsService
                 'o.code as outlet_code',
                 'o.name as outlet_name',
                 'o.timezone as outlet_timezone',
-                DB::raw("COALESCE(NULLIF(channel_map.display_channel, ''), UPPER(COALESCE(s.channel, ''))) as display_channel"),
-                DB::raw("COALESCE(NULLIF(payments.payment_method_display, ''), NULLIF(payments.payment_method_names, ''), NULLIF(s.payment_method_name, ''), '-') as payment_method_display"),
+                DB::raw("UPPER(COALESCE(s.channel, '')) as display_channel"),
+                DB::raw("COALESCE(NULLIF(s.payment_method_name, ''), '-') as payment_method_display"),
             ])
             ->orderByDesc('s.created_at')
             ->orderByDesc('s.id');
 
         $paginator = $this->paginate($query, $perPage, $page);
-        $items = collect($paginator->items())->map(fn ($row) => $this->mapSaleListRow($row))->values()->all();
+        $pageRows = $this->enrichSaleListingRows(collect($paginator->items()));
+        $items = $pageRows->map(fn ($row) => $this->mapSaleListRow($row))->values()->all();
 
         return [
             'scope' => $this->scopeMeta($scope),
@@ -930,6 +932,57 @@ class ReportPortalAnalyticsService
             'data' => $items,
             'meta' => $this->paginationMeta($paginator),
         ];
+    }
+
+    private function enrichSaleListingRows(\Illuminate\Support\Collection $rows): \Illuminate\Support\Collection
+    {
+        $saleIds = $rows->pluck('sale_id')->map(fn ($id) => (string) $id)->filter()->unique()->values()->all();
+        if ($saleIds === []) {
+            return $rows;
+        }
+
+        $payments = DB::table('sale_payments as sp')
+            ->join('sales as pay_s', 'pay_s.id', '=', 'sp.sale_id')
+            ->leftJoin('payment_methods as pm', 'pm.id', '=', 'sp.payment_method_id')
+            ->whereIn('sp.sale_id', $saleIds)
+            ->selectRaw('sp.sale_id')
+            ->selectRaw("GROUP_CONCAT(DISTINCT NULLIF(TRIM(pm.name), '') ORDER BY pm.name SEPARATOR ', ') as payment_method_names")
+            ->selectRaw("GROUP_CONCAT(CONCAT(COALESCE(NULLIF(TRIM(pm.name), ''), NULLIF(TRIM(pay_s.payment_method_name), ''), 'Payment'), CASE WHEN COALESCE(sp.amount, 0) > 0 THEN CONCAT(' (', sp.amount, ')') ELSE '' END) ORDER BY sp.created_at, sp.id SEPARATOR ', ') as payment_method_display")
+            ->groupBy('sp.sale_id')
+            ->get()
+            ->keyBy(fn ($row) => (string) ($row->sale_id ?? ''));
+
+        $itemChannels = DB::table('sale_items as si')
+            ->whereIn('si.sale_id', $saleIds)
+            ->whereNull('si.voided_at')
+            ->selectRaw('si.sale_id')
+            ->selectRaw("GROUP_CONCAT(DISTINCT si.channel ORDER BY FIELD(si.channel, 'DINE_IN', 'TAKEAWAY', 'DELIVERY'), si.channel SEPARATOR ' + ') as channel_display")
+            ->groupBy('si.sale_id')
+            ->get()
+            ->keyBy(fn ($row) => (string) ($row->sale_id ?? ''));
+
+        return $rows->map(function ($row) use ($payments, $itemChannels) {
+            $saleId = (string) ($row->sale_id ?? '');
+            $payment = $payments->get($saleId);
+            $channel = strtoupper(trim((string) ($row->channel ?? '')));
+            $onlineSource = trim((string) ($row->online_order_source ?? ''));
+            $mixedChannels = trim((string) ($itemChannels->get($saleId)->channel_display ?? ''));
+
+            if ($channel === 'DELIVERY' && $onlineSource !== '') {
+                $row->display_channel = strtolower($onlineSource);
+            } elseif ($channel === 'MIXED' && $mixedChannels !== '') {
+                $row->display_channel = $mixedChannels;
+            } else {
+                $row->display_channel = $channel;
+            }
+
+            $row->payment_method_display = trim((string) ($payment->payment_method_display ?? ''))
+                ?: trim((string) ($payment->payment_method_names ?? ''))
+                ?: trim((string) ($row->payment_method_name ?? ''))
+                ?: '-';
+
+            return $row;
+        });
     }
 
     private function resolveRange(?string $dateFrom, ?string $dateTo): array

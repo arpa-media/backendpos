@@ -11,6 +11,10 @@ Route::get('/attendance-data', [HrAttendanceDataController::class, 'index'])
     ->middleware('permission_or_snapshot:hr.attendance.data.view')->name('hr.attendance-data.index');
 
 
+// V12 I06: mutate only checkout; permission is configured as Data Absen -> Edit.
+Route::post('/attendance-data/{attendanceId}/reset-checkout', [HrAttendanceDataController::class, 'resetCheckout'])
+    ->middleware('permission_or_snapshot:hr.attendance.data.reset_checkout')->name('hr.attendance-data.reset-checkout');
+
 Route::get('/attendance-approvals/manual/options', [HrManualAttendanceController::class, 'options'])
     ->middleware('permission_or_snapshot:hr.attendance.approval.view')->name('hr.attendance-approvals.manual.options');
 Route::get('/attendance-approvals/manual/context', [HrManualAttendanceController::class, 'context'])

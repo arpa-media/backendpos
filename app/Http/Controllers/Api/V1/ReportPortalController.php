@@ -18,7 +18,7 @@ class ReportPortalController extends Controller
     {
         $validated = method_exists($request, 'validated') ? $request->validated() : $request->all();
         $cacheParams = array_merge($validated, [
-            '_calc_version' => 'portal-exact-v3',
+            '_calc_version' => 'portal-exact-v12-i01',
             '_scope_mode' => (string) ($scope['mode'] ?? ''),
             '_scope_filter' => (string) ($scope['filter_value'] ?? ''),
             '_scope_selected_outlet' => (string) ($scope['selected_outlet_id'] ?? ''),

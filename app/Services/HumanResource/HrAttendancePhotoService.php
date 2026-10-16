@@ -12,6 +12,8 @@ class HrAttendancePhotoService
     private const MAX_FALLBACK_BYTES = 1_500_000;
     private const MAX_DIMENSION = 960;
     private const JPEG_QUALITY = 62;
+    private const MAX_FAST_JPEG_BYTES = 350_000;
+    private const MAX_PIXELS = 16_000_000;
 
     public function storeBase64(?string $dataUri, string $prefix): ?string
     {
@@ -37,12 +39,45 @@ class HrAttendancePhotoService
             throw new RuntimeException('File foto absensi bukan gambar yang valid.');
         }
 
+        $width = (int) $info[0];
+        $height = (int) $info[1];
+        if ($width > self::MAX_PIXELS / $height) {
+            throw new RuntimeException('Resolusi foto absensi terlalu besar untuk diproses.');
+        }
+
+        // Match decoded content type against the data URI, not only its label.
+        $sourceType = strtolower((string) ($matches[1] ?? 'jpeg'));
+        $expectedMime = match ($sourceType) {
+            'png' => 'image/png',
+            'webp' => 'image/webp',
+            default => 'image/jpeg',
+        };
+        if (strtolower((string) ($info['mime'] ?? '')) !== $expectedMime) {
+            throw new RuntimeException('Jenis file foto absensi tidak sesuai dengan kontennya.');
+        }
+
         $basePath = 'attendance_photos/'.$prefix.'_'.now()->format('Ymd_His').'_'.Str::lower(Str::random(10));
-        $compressed = $this->compressWithGd($binary, (int) $info[0], (int) $info[1]);
+
+        // Browser canvas.toBlob() emits already-compressed, metadata-free JPEG.
+        // Keep small, correctly framed JPEGs as-is; avoid decoding and re-encoding
+        // each photo in GD on the synchronous check-in/check-out request.
+        if ($expectedMime === 'image/jpeg'
+            && strlen($binary) <= self::MAX_FAST_JPEG_BYTES
+            && max($width, $height) <= self::MAX_DIMENSION
+            && str_starts_with($binary, "\xFF\xD8\xFF")
+            && str_ends_with($binary, "\xFF\xD9")
+            && ! str_contains($binary, "Exif\x00\x00")
+        ) {
+            $path = $basePath.'.jpg';
+            $this->putOrFail($path, $binary);
+            return $path;
+        }
+
+        $compressed = $this->compressWithGd($binary, $width, $height);
 
         if ($compressed !== null) {
             $path = $basePath.'.jpg';
-            Storage::disk('public')->put($path, $compressed);
+            $this->putOrFail($path, $compressed);
             return $path;
         }
 
@@ -52,15 +87,21 @@ class HrAttendancePhotoService
 
         // Browser Iterasi 02 sends JPEG after client compression, but the API also
         // accepts validated PNG/WebP. Preserve the real extension when GD is absent.
-        $sourceType = strtolower((string) ($matches[1] ?? 'jpeg'));
         $extension = match ($sourceType) {
             'png' => 'png',
             'webp' => 'webp',
             default => 'jpg',
         };
         $path = $basePath.'.'.$extension;
-        Storage::disk('public')->put($path, $binary);
+        $this->putOrFail($path, $binary);
         return $path;
+    }
+
+    private function putOrFail(string $path, string $contents): void
+    {
+        if (Storage::disk('public')->put($path, $contents) === false) {
+            throw new RuntimeException('Gagal menyimpan foto absensi ke storage.');
+        }
     }
 
     private function compressWithGd(string $binary, int $width, int $height): ?string

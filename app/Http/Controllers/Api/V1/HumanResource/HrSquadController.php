@@ -7,6 +7,7 @@ use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Models\User;
 use App\Services\HrSquadUserWiringService;
 use App\Services\HumanResource\HrSquadLifecycleService;
+use App\Services\HumanResource\HrSquadAssignmentSyncService;
 use App\Services\Support\SimpleXlsxService;
 use App\Services\UserManagementService;
 use Illuminate\Http\Request;
@@ -32,6 +33,7 @@ class HrSquadController extends Controller
         private readonly HrSquadUserWiringService $squadWiring,
         private readonly SimpleXlsxService $xlsx,
         private readonly HrSquadLifecycleService $lifecycle,
+        private readonly HrSquadAssignmentSyncService $assignmentSync,
     ) {
     }
 
@@ -396,16 +398,26 @@ class HrSquadController extends Controller
             $payload['photo_path'] = $request->file('photo')->store('hr/squads', 'public');
         }
 
-        DB::transaction(function () use ($item, $payload) {
+        $assignmentChanged = trim((string) ($item->assignment ?? '')) !== trim((string) ($payload['assignment'] ?? ''))
+            || trim((string) ($item->position_name ?? '')) !== trim((string) ($payload['position_name'] ?? ''));
+        $assignmentResult = null;
+        DB::transaction(function () use ($item, $payload, $assignmentChanged, &$assignmentResult) {
             DB::table(self::TABLE)->where('id', $item->id)->update(array_merge($payload, [
                 'updated_at' => Carbon::now(),
             ]));
-            // Update Squad tidak mengubah Data User. Hanya reference teknis dipasang ulang berdasarkan NISJ.
             $this->squadWiring->wireSquadByNisj($item->id);
+            if ($assignmentChanged) {
+                // Satu transaksi: rollback Data Squad jika outlet/identity ambigu.
+                // No mutation to user credentials / Spatie access matrix.
+                $assignmentResult = $this->assignmentSync->synchronize($item->id, true, true);
+            }
         });
 
         $fresh = DB::table(self::TABLE)->where('id', $item->id)->first();
-        return ApiResponse::ok($this->formatSquad($fresh), 'Data squad berhasil diperbarui. Data User existing tidak diubah.');
+        return ApiResponse::ok([
+            ...$this->formatSquad($fresh),
+            'personalia_assignment_sync' => $assignmentResult,
+        ], 'Data squad berhasil diperbarui; perubahan Penugasan/Jabatan disinkronkan ke Personalia Assignment.');
     }
 
     public function destroy(Request $request, string $id)

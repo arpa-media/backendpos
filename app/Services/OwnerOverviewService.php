@@ -6,6 +6,7 @@ use App\Http\Resources\Api\V1\Sales\SaleDetailResource;
 use App\Services\CashierAlignedSaleScopeService;
 use App\Models\Sale;
 use App\Services\Reporting\ReportHotWindowReadService;
+use App\Services\Reporting\ReportExactSaleScopeService;
 use App\Support\FinanceOutletFilter;
 use App\Support\TransactionDate;
 use Carbon\CarbonInterface;
@@ -20,6 +21,7 @@ class OwnerOverviewService
         private readonly ReportSaleScopeCacheService $reportSaleScopeCache,
         private readonly ReportSaleBusinessDateIndexService $businessDateIndex,
         private readonly ReportHotWindowReadService $hotWindowReadService,
+        private readonly ReportExactSaleScopeService $exactSaleScopeService,
         private readonly FinanceNetReadService $financeNetReadService,
     ) {
     }
@@ -38,22 +40,6 @@ class OwnerOverviewService
         }
 
         $timezone = $this->resolveTimezone($scope['selected_outlet_id'] ?? null);
-        $reportingSource = $this->hotWindowReadService->readContractStatus(
-            $scope['allowed_outlet_ids'],
-            $params['date_from'] ?? null,
-            $params['date_to'] ?? null,
-            $timezone
-        );
-        if (! ($reportingSource['ready'] ?? false)) {
-            return [
-                'ok' => false,
-                'status' => 409,
-                'message' => 'Data Owner Overview untuk rentang tanggal ini belum selesai dimaterialisasi. Proses warm berjalan melalui scheduler; coba lagi setelah coverage siap.',
-                'error_code' => 'REPORT_DAILY_SUMMARY_NOT_READY',
-                'data' => ['reporting_source' => $reportingSource],
-            ];
-        }
-
         $visible = $this->saleExistsWithinBusinessDateCoverage(
             $scope['allowed_outlet_ids'],
             $params['date_from'] ?? null,
@@ -547,12 +533,13 @@ class OwnerOverviewService
             return false;
         }
 
-        return $this->hotWindowReadService->saleExists(
+        return $this->exactSaleScopeService->saleExists(
             $outletIds,
             $dateFrom,
             $dateTo,
             $timezone,
             $saleId,
+            false,
         );
     }
 
@@ -562,12 +549,13 @@ class OwnerOverviewService
             return [];
         }
 
-        return $this->hotWindowReadService->recentSaleIds(
+        return $this->exactSaleScopeService->recentSaleIds(
             $outletIds,
             $dateFrom,
             $dateTo,
             $timezone,
             $recentLimit,
+            false,
         );
     }
 
