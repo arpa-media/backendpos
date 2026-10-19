@@ -927,6 +927,20 @@ class UserManagementService
     public function createUser(User $actor, array $payload): array
     {
         return DB::transaction(function () use ($actor, $payload) {
+            $targetNisj = $this->nullableString($payload['nisj'] ?? null);
+            $matchingEmployee = $targetNisj !== null
+                ? Employee::query()->whereRaw('LOWER(TRIM(`nisj`)) = ?', [mb_strtolower(trim($targetNisj))])->lockForUpdate()->first()
+                : null;
+            if ($matchingEmployee && $matchingEmployee->user_id) {
+                // An employee cannot be silently transferred between login accounts.
+                // Callers must wire the existing user via NISJ instead.
+                $owner = User::query()->find((string) $matchingEmployee->user_id);
+                if ($owner) {
+                    throw ValidationException::withMessages([
+                        'nisj' => ['Employee/NISJ sudah dimiliki akun '.($owner->username ?: $owner->id).'. Hubungkan user existing, jangan membuat employee kedua.'],
+                    ]);
+                }
+            }
             $subject = User::query()->create([
                 'name' => trim((string) ($payload['name'] ?? '')),
                 'email' => strtolower(trim((string) ($payload['email'] ?? ''))),
@@ -940,30 +954,61 @@ class UserManagementService
             $employee = null;
             $assignmentTitle = $this->nullableString($payload['assignment_role_title'] ?? null);
             $targetOutletId = $this->nullableString($payload['outlet_id'] ?? null);
-            $targetNisj = $this->nullableString($payload['nisj'] ?? null);
             $needsEmployee = $assignmentTitle !== null || $targetOutletId !== null || $targetNisj !== null;
 
             if ($needsEmployee) {
-                $employee = Employee::query()->create([
-                    'user_id' => $subject->id,
-                    'assignment_id' => null,
-                    'nisj' => $targetNisj,
-                    'full_name' => $subject->name,
-                    'nickname' => $subject->name,
-                    'employment_status' => 'manual',
-                ]);
+                if ($matchingEmployee) {
+                    // I07: I04 may already have created this employee with a valid
+                    // Personalia assignment. Claim the orphan row; preserve its history.
+                    $employee = $matchingEmployee;
+                    $employee->user_id = $subject->id;
+                    $employee->full_name = $employee->full_name ?: $subject->name;
+                    $employee->nickname = $employee->nickname ?: $subject->name;
+                    $employee->save();
+                } else {
+                    $employee = Employee::query()->create([
+                        'user_id' => $subject->id,
+                        'assignment_id' => null,
+                        'nisj' => $targetNisj,
+                        'full_name' => $subject->name,
+                        'nickname' => $subject->name,
+                        'employment_status' => 'manual',
+                    ]);
+                }
             }
 
             if ($employee && ($assignmentTitle !== null || $targetOutletId !== null)) {
-                $assignment = Assignment::query()->create([
-                    'employee_id' => $employee->id,
-                    'outlet_id' => $targetOutletId,
-                    'role_title' => $assignmentTitle,
-                    'is_primary' => true,
-                    'status' => 'manual',
-                ]);
-                $employee->assignment_id = $assignment->id;
-                $employee->save();
+                // Existing Personalia assignments are authoritative and must not
+                // be duplicated when auto-provisioning a Squad login account.
+                $current = $employee->assignment;
+                if ($current && (string) $current->employee_id !== (string) $employee->id) {
+                    throw ValidationException::withMessages(['assignment' => ['Pointer assignment employee tidak cocok; perlu audit Personalia.']]);
+                }
+                if (! $current) {
+                    $current = Assignment::query()->where('employee_id', $employee->id)
+                        ->where('is_primary', true)->orderByDesc('created_at')->first();
+                }
+                if (! $current && $matchingEmployee) {
+                    $historical = Assignment::query()->where('employee_id', $employee->id)
+                        ->orderByDesc('created_at')->limit(2)->get();
+                    if ($historical->count() > 1) {
+                        throw ValidationException::withMessages(['assignment' => ['Employee memiliki lebih dari satu assignment tanpa penanda utama. Periksa Personalia.']]);
+                    }
+                    $current = $historical->first();
+                }
+                if (! $current) {
+                    $current = Assignment::query()->create([
+                        'employee_id' => $employee->id,
+                        'outlet_id' => $targetOutletId,
+                        'role_title' => $assignmentTitle,
+                        'is_primary' => true,
+                        'status' => 'manual',
+                    ]);
+                }
+                if ((string) ($employee->assignment_id ?? '') !== (string) $current->id) {
+                    $employee->assignment_id = $current->id;
+                    $employee->save();
+                }
             }
 
             $this->ensureAccessAssignment($subject);
@@ -1020,14 +1065,26 @@ class UserManagementService
             $needsEmployee = $employee || $assignmentTitle !== null || $targetOutletId !== null || $this->nullableString($payload['nisj'] ?? null) !== null;
 
             if (! $employee && $needsEmployee) {
-                $employee = Employee::query()->create([
-                    'user_id' => $subject->id,
-                    'assignment_id' => null,
-                    'nisj' => $this->nullableString($payload['nisj'] ?? $subject->nisj),
-                    'full_name' => $subject->name,
-                    'nickname' => $subject->name,
-                    'employment_status' => 'manual',
-                ]);
+                $nisj = $this->nullableString($payload['nisj'] ?? $subject->nisj);
+                $found = $nisj !== null ? Employee::query()
+                    ->whereRaw('LOWER(TRIM(`nisj`)) = ?', [mb_strtolower(trim($nisj))])->lockForUpdate()->first() : null;
+                if ($found && $found->user_id && (string) $found->user_id !== (string) $subject->id) {
+                    throw ValidationException::withMessages(['nisj' => ['NISJ employee sudah terhubung dengan akun lain.']]);
+                }
+                if ($found) {
+                    $employee = $found;
+                    $employee->user_id = $subject->id;
+                    $employee->save();
+                } else {
+                    $employee = Employee::query()->create([
+                        'user_id' => $subject->id,
+                        'assignment_id' => null,
+                        'nisj' => $nisj,
+                        'full_name' => $subject->name,
+                        'nickname' => $subject->name,
+                        'employment_status' => 'manual',
+                    ]);
+                }
             }
 
             if ($employee) {

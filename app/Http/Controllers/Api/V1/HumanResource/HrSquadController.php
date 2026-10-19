@@ -393,31 +393,63 @@ class HrSquadController extends Controller
         }
 
         $payload = $this->payload($request, $item, false);
+        $newPhotoPath = null;
         if ($request->hasFile('photo')) {
-            if ($item->photo_path) Storage::disk('public')->delete($item->photo_path);
-            $payload['photo_path'] = $request->file('photo')->store('hr/squads', 'public');
+            $newPhotoPath = $request->file('photo')->store('hr/squads', 'public');
+            $payload['photo_path'] = $newPhotoPath;
         }
 
         $assignmentChanged = trim((string) ($item->assignment ?? '')) !== trim((string) ($payload['assignment'] ?? ''))
             || trim((string) ($item->position_name ?? '')) !== trim((string) ($payload['position_name'] ?? ''));
         $assignmentResult = null;
-        DB::transaction(function () use ($item, $payload, $assignmentChanged, &$assignmentResult) {
+        $provisioning = null;
+        try {
+            DB::transaction(function () use ($request, $item, $payload, $assignmentChanged, &$assignmentResult, &$provisioning) {
+            // Serialize concurrent Edit/Generate operations for the same Squad.
+            $locked = DB::table(self::TABLE)->where('id', $item->id)->whereNull('deleted_at')->lockForUpdate()->first();
+            if (! $locked) {
+                throw \Illuminate\Validation\ValidationException::withMessages(['squad' => ['Data Squad tidak ditemukan.']]);
+            }
             DB::table(self::TABLE)->where('id', $item->id)->update(array_merge($payload, [
                 'updated_at' => Carbon::now(),
             ]));
             $this->squadWiring->wireSquadByNisj($item->id);
             if ($assignmentChanged) {
-                // Satu transaksi: rollback Data Squad jika outlet/identity ambigu.
-                // No mutation to user credentials / Spatie access matrix.
+                // Preserve I04 synchronization and its transactional rollback guard.
                 $assignmentResult = $this->assignmentSync->synchronize($item->id, true, true);
             }
-        });
+            // I07: Editing an existing Squad also guarantees a login account.
+            // Existing user credentials are never overwritten. The same NISJ
+            // is idempotently linked; orphan Personalia employee is reused.
+            $freshSquad = DB::table(self::TABLE)->where('id', $item->id)->first();
+            $existingUser = $this->squadWiring->findUserByNisj($freshSquad->nisj ?? null);
+            if ($existingUser) {
+                $this->squadWiring->attachOrphanEmployee($existingUser, $freshSquad->nisj);
+                $this->squadWiring->wireExistingUserToSquad($existingUser, $item->id);
+                $provisioning = ['status' => 'existing_user_linked', 'user_id' => (string) $existingUser->id, 'user_created' => false];
+            } else {
+                $validator = $this->validateProvisionUserInput($request);
+                if ($validator->fails()) {
+                    throw \Illuminate\Validation\ValidationException::withMessages($validator->errors()->toArray());
+                }
+                $provisioning = $this->provisionUserForSquad($request->user(), $freshSquad, $request->all());
+            }
+            }, 3);
+        } catch (\Throwable $e) {
+            // Keep old photo if Squad, Personalia or account provisioning rolled back.
+            if ($newPhotoPath) Storage::disk('public')->delete($newPhotoPath);
+            throw $e;
+        }
+        if ($newPhotoPath && $item->photo_path && $item->photo_path !== $newPhotoPath) {
+            Storage::disk('public')->delete((string) $item->photo_path);
+        }
 
         $fresh = DB::table(self::TABLE)->where('id', $item->id)->first();
         return ApiResponse::ok([
             ...$this->formatSquad($fresh),
             'personalia_assignment_sync' => $assignmentResult,
-        ], 'Data squad berhasil diperbarui; perubahan Penugasan/Jabatan disinkronkan ke Personalia Assignment.');
+            'user_provisioning' => $provisioning,
+        ], 'Data Squad diperbarui, Personalia Assignment diselaraskan, dan Data User dipastikan terhubung.');
     }
 
     public function destroy(Request $request, string $id)
@@ -485,31 +517,30 @@ class HrSquadController extends Controller
             return ApiResponse::error('NISJ Data Squad wajib diisi sebelum membuat Data User.', 'HR_SQUAD_NISJ_REQUIRED', 422);
         }
 
-        $existingUser = $this->squadWiring->findUserByNisj($nisj);
-        if ($existingUser) {
-            $this->squadWiring->wireExistingUserToSquad($existingUser, $squad->id);
-            return ApiResponse::ok([
-                'squad' => $this->formatSquad(DB::table(self::TABLE)->where('id', $squad->id)->first()),
-                'user_id' => (string) $existingUser->id,
-                'user_created' => false,
-                'user_unchanged' => true,
-            ], 'Data User dengan NISJ yang sama sudah ada dan berhasil dihubungkan tanpa perubahan.');
-        }
-
-        $validator = $this->validateProvisionUserInput($request, false);
-        if ($validator->fails()) {
-            return ApiResponse::error('Validasi Data User gagal.', 'VALIDATION_ERROR', 422, $validator->errors()->toArray());
-        }
-
-        $result = DB::transaction(fn () => $this->provisionUserForSquad($request->user(), $squad, $request->all()));
+        $result = DB::transaction(function () use ($request, $squad) {
+            $fresh = DB::table(self::TABLE)->where('id', $squad->id)->whereNull('deleted_at')->lockForUpdate()->first();
+            if (! $fresh) {
+                throw \Illuminate\Validation\ValidationException::withMessages(['squad' => ['Data Squad tidak ditemukan.']]);
+            }
+            // Repeat requests link the same account even if user form changed.
+            $user = $this->squadWiring->findUserByNisj($fresh->nisj ?? null);
+            if (! $user) {
+                $validator = $this->validateProvisionUserInput($request, false);
+                if ($validator->fails()) {
+                    throw \Illuminate\Validation\ValidationException::withMessages($validator->errors()->toArray());
+                }
+            }
+            return $this->provisionUserForSquad($request->user(), $fresh, $request->all());
+        }, 3);
         $fresh = DB::table(self::TABLE)->where('id', $squad->id)->first();
-
+        $created = (bool) ($result['user_created'] ?? false);
         return ApiResponse::ok([
             'squad' => $this->formatSquad($fresh),
             'user_id' => $result['user_id'] ?? null,
-            'user_created' => (bool) ($result['user_created'] ?? false),
+            'user_created' => $created,
+            'user_unchanged' => ! $created,
             'default_password_used' => (bool) ($result['default_password_used'] ?? false),
-        ], 'User baru berhasil dibuat dan dihubungkan melalui pivot NISJ.', 201);
+        ], $created ? 'Data User berhasil dibuat dan ditautkan ke employee existing bila ada.' : 'User existing ditemukan dan ditautkan tanpa perubahan identitas.', $created ? 201 : 200);
     }
 
     public function export(Request $request)
@@ -1585,6 +1616,7 @@ class HrSquadController extends Controller
 
         $existing = $this->squadWiring->findUserByNisj($nisj);
         if ($existing) {
+            $this->squadWiring->attachOrphanEmployee($existing, $nisj);
             $this->squadWiring->wireExistingUserToSquad($existing, $squad->id);
             return [
                 'status' => 'existing_user_linked',

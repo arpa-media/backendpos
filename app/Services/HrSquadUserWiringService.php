@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Validation\ValidationException;
 
 class HrSquadUserWiringService
 {
@@ -18,10 +19,64 @@ class HrSquadUserWiringService
             return null;
         }
 
-        return User::query()
-            ->with(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level'])
-            ->whereRaw('LOWER(TRIM(`nisj`)) = ?', [mb_strtolower($normalized)])
+        $normalizedKey = mb_strtolower($normalized);
+        $load = ['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level'];
+        $user = User::query()->with($load)
+            ->whereRaw('LOWER(TRIM(`nisj`)) = ?', [$normalizedKey])
             ->first();
+        if ($user || ! Schema::hasTable('employees')) {
+            return $user;
+        }
+
+        // I07: An older Personalia/Assignment may already own this NISJ,
+        // even though its User row has a blank NISJ. Never create a second account.
+        $employee = DB::table('employees')
+            ->whereRaw('LOWER(TRIM(`nisj`)) = ?', [$normalizedKey])
+            ->first(['user_id']);
+        if (! $employee || ! $employee->user_id) {
+            return null; // orphan employee: provisioning will attach the existing row
+        }
+        $owner = User::query()->with($load)->find((string) $employee->user_id);
+        if (! $owner) {
+            return null; // missing FK target: handled as unclaimed by provisioning
+        }
+        $ownerNisj = $this->normalizeNisj($owner->nisj);
+        if ($ownerNisj !== '' && mb_strtolower($ownerNisj) !== $normalizedKey) {
+            throw ValidationException::withMessages([
+                'nisj' => ['NISJ sudah dipakai employee milik akun berbeda ('.($owner->username ?: $owner->id).'). Periksa relasi Personalia sebelum membuat akun baru.'],
+            ]);
+        }
+        return $owner;
+    }
+
+    /**
+     * Reconcile an unowned Personalia employee to the matched account.
+     * Used only by explicit Data Squad write paths (not list/reconcile reads).
+     * Never steal an employee from another account or replace another employee.
+     */
+    public function attachOrphanEmployee(User $user, mixed $nisj): bool
+    {
+        $normalized = $this->normalizeNisj($nisj);
+        if ($normalized === '' || ! Schema::hasTable('employees')) return false;
+        return DB::transaction(function () use ($user, $normalized) {
+            $employee = DB::table('employees')
+                ->whereRaw('LOWER(TRIM(`nisj`)) = ?', [mb_strtolower($normalized)])
+                ->lockForUpdate()->first(['id', 'user_id']);
+            if (! $employee) return false;
+            if ($employee->user_id && (string) $employee->user_id !== (string) $user->id) {
+                throw ValidationException::withMessages(['nisj' => ['Employee dengan NISJ tersebut sudah dimiliki akun lain.']]);
+            }
+            $other = DB::table('employees')->where('user_id', $user->id)->first(['id', 'nisj']);
+            if ($other && (string) $other->id !== (string) $employee->id) {
+                throw ValidationException::withMessages(['nisj' => ['Akun ini sudah memiliki employee dengan identitas berbeda. Periksa Personalia.']]);
+            }
+            if (! $employee->user_id) {
+                DB::table('employees')->where('id', $employee->id)
+                    ->update(['user_id' => $user->id, 'updated_at' => now()]);
+                return true;
+            }
+            return false;
+        });
     }
 
     public function findSquadByNisj(mixed $nisj): ?object
