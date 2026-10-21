@@ -14,7 +14,7 @@ class HrPayrollSlip extends Model
     protected $fillable = [
         'cutoff_id', 'employee_id', 'user_id', 'nisj_snapshot', 'full_name_snapshot',
         'company_code_snapshot', 'outlet_id_snapshot', 'outlet_name_snapshot', 'position_snapshot',
-        'salary_tier_snapshot', 'daily_rate', 'basic_salary_snapshot', 'minute_deduction',
+        'bank_name_snapshot', 'bank_account_snapshot', 'email_snapshot', 'salary_tier_snapshot', 'daily_rate', 'basic_salary_snapshot', 'minute_deduction',
         'overtime_rate', 'bonus_amount', 'family_allowance', 'position_allowance',
         'cashbon', 'other_deduction', 'field_duty_bonus', 'manual_adjustment', 'manual_note',
         'bpjs_health', 'bpjs_employment', 'bpjs_other', 'bpjs_total',

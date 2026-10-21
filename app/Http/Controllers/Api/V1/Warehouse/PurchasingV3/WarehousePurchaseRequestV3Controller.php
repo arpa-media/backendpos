@@ -26,6 +26,7 @@ class WarehousePurchaseRequestV3Controller extends WarehouseProcurementBaseContr
         if ($warehouseId instanceof JsonResponse) return $warehouseId;
         $filters = $request->validate([
             'status' => ['nullable', Rule::in(['draft', 'submitted', 'partially_approved', 'approved', 'completed', 'rejected'])],
+            'supplier_source_id' => ['nullable', 'string', Rule::exists('pur_supplier_sources', 'id')],
             'q' => ['nullable', 'string', 'max:120'],
             'from' => ['nullable', 'date_format:Y-m-d'],
             'to' => ['nullable', 'date_format:Y-m-d', 'after_or_equal:from'],

@@ -143,6 +143,46 @@ final class HrPayrollSlipEmailService
         return $this->deliver($claim['row'], $recipient, $slip->full_name_snapshot ?: 'Squad', 'Slip Gaji '.$document['period'], $document, $actor);
     }
 
+    public function resendPayroll(HrPayrollCutoff $cutoff,HrPayrollSlip $slip,?User $actor):array {
+        $this->assertSlip($cutoff,$slip);
+        if ($cutoff->status==='draft') $this->invalid('cutoff','Cutoff Draft tidak boleh dikirim.');
+        $original=DB::table('HR_payroll_slip_email_logs')->where('source_type',self::SOURCE_PAYROLL)
+            ->where('source_id',$slip->id)->where('status','sent')->orderByDesc('created_at')->first();
+        if(!$original) $this->invalid('email','Belum ada pengiriman sukses. Gunakan Kirim biasa.');
+        $latest=DB::table('HR_payroll_slip_email_logs')->where('source_type',self::SOURCE_PAYROLL)
+            ->where('source_id',$slip->id)->orderByDesc('created_at')->first();
+        if($latest && $latest->status==='sending' && $latest->sending_started_at && now()->diffInSeconds(\Illuminate\Support\Carbon::parse($latest->sending_started_at)) < 300)
+            $this->invalid('email','Pengiriman masih berlangsung; jangan kirim ulang bersamaan.');
+        $recipient=$this->recipientForSlip($slip);
+        if(!$recipient) $this->invalid('email','Email penerima tidak tersedia.');
+        $doc=$this->pdf->payroll($slip);
+        $claim=$this->claim('PAYROLL:'.$cutoff->id.':'.$slip->id.':R:'.Str::ulid(),self::SOURCE_PAYROLL,(string)$slip->id,[
+            'payroll_cutoff_id'=>(string)$cutoff->id,'payroll_slip_id'=>(string)$slip->id,'employee_id'=>(string)$slip->employee_id,
+        ],$recipient,$doc,$actor);
+        return $this->deliver($claim['row'],$recipient,$slip->full_name_snapshot?:'Squad','Kirim Ulang Slip Gaji '.$doc['period'],$doc,$actor);
+    }
+
+    public function resendBonus(Request $request,string $projectionId,string $lineId,?User $actor):array {
+        [$projection,$line,$slip]=$this->bonusContext($request,$projectionId,$lineId);
+        if($projection->status==='draft')$this->invalid('projection','Cutoff Bonus Draft tidak boleh dikirim.');
+        $original=DB::table('HR_payroll_slip_email_logs')->where('source_type',self::SOURCE_BONUS)
+            ->where('source_id',$lineId)->where('status','sent')->orderByDesc('created_at')->first();
+        if(!$original)$this->invalid('email','Belum ada pengiriman sukses. Gunakan Kirim biasa.');
+        $latest=DB::table('HR_payroll_slip_email_logs')->where('source_type',self::SOURCE_BONUS)
+            ->where('source_id',$lineId)->orderByDesc('created_at')->first();
+        if($latest && $latest->status==='sending' && $latest->sending_started_at && now()->diffInSeconds(\Illuminate\Support\Carbon::parse($latest->sending_started_at)) < 300)
+            $this->invalid('email','Pengiriman masih berlangsung; jangan kirim ulang bersamaan.');
+        $recipient=$this->recipientForBonusLine($line)?:($slip?$this->recipientForSlip($slip):null);
+        if(!$recipient)$this->invalid('email','Email penerima tidak tersedia.');
+        $doc=$this->pdf->bonus($slip,$projection,$line);
+        $claim=$this->claim('BONUS:'.$projectionId.':'.$lineId.':R:'.Str::ulid(),self::SOURCE_BONUS,$lineId,[
+            'payroll_cutoff_id'=>$slip?->cutoff_id?(string)$slip->cutoff_id:null,
+            'payroll_slip_id'=>$slip?->id?(string)$slip->id:null,
+            'bonus_projection_id'=>$projectionId,'bonus_line_id'=>$lineId,'employee_id'=>(string)$line->employee_id,
+        ],$recipient,$doc,$actor);
+        return $this->deliver($claim['row'],$recipient,(string)$line->name_snapshot,'Kirim Ulang Slip Bonus KPI '.$doc['period'],$doc,$actor);
+    }
+
     public function sendBonus(Request $request, string $projectionId, string $lineId, ?User $actor): array
     {
         [$projection, $line, $slip] = $this->bonusContext($request, $projectionId, $lineId);
@@ -311,7 +351,7 @@ final class HrPayrollSlipEmailService
     private function logs(string $sourceType, array $sourceIds)
     {
         if ($sourceIds === [] || ! Schema::hasTable('HR_payroll_slip_email_logs')) return collect();
-        return DB::table('HR_payroll_slip_email_logs')->where('source_type', $sourceType)->whereIn('source_id', $sourceIds)->get()->keyBy('source_id');
+        return DB::table('HR_payroll_slip_email_logs')->where('source_type', $sourceType)->whereIn('source_id', $sourceIds)->orderBy('created_at')->get()->keyBy('source_id');
     }
 
     private function statusPayload(string $sourceId, ?object $log, ?string $recipient, bool $eligible): array

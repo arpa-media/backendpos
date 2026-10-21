@@ -10,7 +10,7 @@ use Illuminate\Validation\Rule;
 
 class WarehouseFinanceV3Controller extends Controller
 {
-    public function __construct(private readonly WarehouseFinanceV3Service $service) {}
+    public function __construct(private readonly WarehouseFinanceV3Service $service, private readonly \App\Services\Warehouse\FinanceV13I20\InvoiceSettlementV13I20Service $v13i20) {}
 
     public function options(Request $request): JsonResponse
     {
@@ -75,10 +75,20 @@ class WarehouseFinanceV3Controller extends Controller
             'estimate_payment_date' => 'required|date',
             'payment_account_id' => 'required|string|max:80',
             'notes' => 'nullable|string|max:2000',
+            'payment_type' => 'nullable|in:DP,TEMPO,CASH',
+            'dp_amount' => 'nullable|numeric|min:0',
+            'dp_date' => 'nullable|date',
+            'terms' => 'nullable|array|max:24',
+            'terms.*.due_date' => 'required_with:terms|date',
+            'terms.*.amount' => 'required_with:terms|numeric|gt:0',
+            'payer_name' => 'nullable|string|max:180',
+            'reference_number' => 'nullable|string|max:140',
         ]);
 
         return response()->json([
-            'data' => $this->service->approve($direction, $source, $id, $this->warehouseId($request), $data, (string)$request->user()->id),
+            'data' => isset($data['payment_type'])
+                ? $this->v13i20->approve($direction, $source, $id, $this->warehouseId($request), $data, (string)$request->user()->id)
+                : $this->service->approve($direction, $source, $id, $this->warehouseId($request), $data, (string)$request->user()->id),
         ]);
     }
 

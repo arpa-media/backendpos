@@ -24,7 +24,7 @@ class WarehouseInvoicePaymentLifecycleController extends Controller
 
     public function payment(Request $request,string $source,string $id):JsonResponse
     {
-        $data=$request->validate(['payment_date'=>'required|date','payment_term_detail'=>'nullable|string|max:2000','amount'=>'required|numeric|min:0.01','payment_account_id'=>'required|string|max:80','payer_name'=>'required|string|max:180','reference_number'=>'nullable|string|max:140','notes'=>'nullable|string|max:2000','idempotency_key'=>'nullable|string|max:180']);
+        $data=$request->validate(['payment_date'=>'required|date','payment_term_detail'=>'nullable|string|max:2000','payment_type'=>'nullable|in:DP,TEMPO,CASH','term_id'=>'nullable|string|max:80','amount'=>'required|numeric|min:0.01','payment_account_id'=>'required|string|max:80','payer_name'=>'required|string|max:180','reference_number'=>'nullable|string|max:140','notes'=>'nullable|string|max:2000','idempotency_key'=>'nullable|string|max:180']);
         return response()->json(['data'=>$this->service->recordPayment($this->direction($request),$source,$id,$this->warehouseId($request),$data,(string)$request->user()->id)]);
     }
 

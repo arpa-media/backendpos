@@ -8,6 +8,7 @@ use App\Services\HumanResource\HrAttendanceBackofficeScopeService;
 use App\Services\HumanResource\HrAttendanceCheckoutResetService;
 use App\Services\HumanResource\HrAttendancePresentationService;
 use App\Services\Support\SimpleXlsxService;
+use App\Support\HumanResource\HrAttendanceV13I06ExportFormatter;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Http\Request;
@@ -60,6 +61,7 @@ class HrAttendanceDataController extends Controller
             'items' => collect($paginator->items())->map(function ($row) {
                 $payload = $this->presentation->row($row);
                 $payload['checkout_at_utc'] = $row->checkout_at ? (string) $row->checkout_at : null;
+                $payload['shift_code'] = $this->shiftCode($row);
                 return $payload;
             })->values(),
             'pagination' => [
@@ -124,41 +126,13 @@ class HrAttendanceDataController extends Controller
         $sortDir = $data['sort_dir'] ?? 'desc';
         $query->orderBy($this->sortMap()[$sortBy], $sortDir)->orderBy('a.id', $sortDir);
 
-        $rows = [[
-            'Tanggal', 'Nama Squad', 'NISJ', 'Tipe Penugasan', 'Kode Penugasan', 'Penugasan',
-            'Datang', 'Foto Datang', 'Mode Datang', 'Lokasi Datang', 'Jarak Datang (m)', 'Kamera Datang',
-            'Pulang', 'Foto Pulang', 'Mode Pulang', 'Lokasi Pulang', 'Jarak Pulang (m)', 'Kamera Pulang',
-            'Status Record', 'Approval', 'Terlambat (menit)', 'Jam Kerja (menit)', 'Status Kalkulasi', 'Exception',
-        ]];
-
-        foreach ($query->get() as $raw) {
+        $rows = [HrAttendanceV13I06ExportFormatter::headings()];
+        // Single query, with historical schedule joined on employee + business date + outlet.
+        // No per-row shift lookups (N+1), nor current shift substitution for old records.
+        foreach ($query->cursor() as $raw) {
             $row = $this->presentation->row($raw);
-            $rows[] = [
-                $row['business_date'] ?? '',
-                data_get($row, 'employee.full_name', ''),
-                data_get($row, 'employee.nisj', ''),
-                strtoupper((string) data_get($row, 'assignment_outlet.type', 'OUTLET')),
-                data_get($row, 'assignment_outlet.code', ''),
-                data_get($row, 'assignment_outlet.name', ''),
-                data_get($row, 'checkin.at', ''),
-                data_get($row, 'checkin.photo_url', ''),
-                data_get($row, 'checkin.mode', ''),
-                data_get($row, 'checkin.location_status', ''),
-                data_get($row, 'checkin.distance_m', ''),
-                data_get($row, 'checkin.camera_status', ''),
-                data_get($row, 'checkout.at', ''),
-                data_get($row, 'checkout.photo_url', ''),
-                data_get($row, 'checkout.mode', ''),
-                data_get($row, 'checkout.location_status', ''),
-                data_get($row, 'checkout.distance_m', ''),
-                data_get($row, 'checkout.camera_status', ''),
-                $row['record_status'] ?? '',
-                $row['approval_status'] ?? '',
-                $row['late_minutes'] ?? '',
-                $row['work_minutes'] ?? '',
-                $row['calculation_status'] ?? '',
-                implode(', ', $row['exception_flags'] ?? []),
-            ];
+            $row['shift_code'] = $this->shiftCode($raw);
+            $rows[] = HrAttendanceV13I06ExportFormatter::row($row);
         }
 
         $filename = sprintf('HR_DATA_ABSEN_%s_%s.xlsx', $data['from'], $data['to']);
@@ -243,7 +217,7 @@ class HrAttendanceDataController extends Controller
 
     private function baseQuery(): Builder
     {
-        return DB::table('HR_attendances as a')
+        $query = DB::table('HR_attendances as a')
             ->leftJoin('employees as e', 'e.id', '=', 'a.employee_id')
             ->leftJoin('users as u', 'u.id', '=', 'a.user_id')
             ->leftJoin('outlets as scope_o', 'scope_o.id', '=', DB::raw('COALESCE(a.assignment_outlet_id, a.checkin_outlet_id)'))
@@ -255,6 +229,41 @@ class HrAttendanceDataController extends Controller
                 DB::raw('COALESCE(a.assignment_outlet_id, a.checkin_outlet_id) as scope_outlet_id'),
                 'scope_o.code as scope_outlet_code', 'scope_o.name as scope_outlet_name', 'scope_o.type as scope_outlet_type',
             ]);
+
+        if (! Schema::hasTable('HR_shift_schedules')) {
+            return $query;
+        }
+        // Work_date is the attendance business date, not the UTC calendar date.
+        // Employee/day is unique, so this join does not multiply attendance rows.
+        $query->leftJoin('HR_shift_schedules as v13_schedule', function ($join) {
+            $join->on('v13_schedule.employee_id', '=', 'a.employee_id')
+                ->on('v13_schedule.work_date', '=', 'a.business_date')
+                ->on('v13_schedule.outlet_id', '=', DB::raw('COALESCE(a.assignment_outlet_id, a.checkin_outlet_id)'));
+        })->addSelect('v13_schedule.schedule_type as schedule_type_snapshot');
+
+        $nameExpr = 'v13_schedule.shift_name_snapshot';
+        if (Schema::hasTable('HR_shifts')) {
+            $query->leftJoin('HR_shifts as v13_shift', 'v13_shift.id', '=', 'v13_schedule.shift_id');
+            // Existing HR_shifts uses unique `name` as its lookup key. If a future
+            // schema introduces `code`, prefer code while keeping immutable history.
+            if (Schema::hasColumn('HR_shifts', 'code')) {
+                $nameExpr = "COALESCE(NULLIF(v13_shift.code,''), NULLIF(v13_schedule.shift_name_snapshot,''), NULLIF(v13_shift.name,''))";
+            } else {
+                $nameExpr = "COALESCE(NULLIF(v13_schedule.shift_name_snapshot,''), NULLIF(v13_shift.name,''))";
+            }
+        }
+        return $query->addSelect(DB::raw($nameExpr.' as shift_code_snapshot'));
+    }
+
+    private function shiftCode(object $row): string
+    {
+        if (($row->schedule_type_snapshot ?? null) !== 'shift') {
+            return '-';
+        }
+        $code = trim((string) ($row->shift_code_snapshot ?? ''));
+        // Historical HR_shifts has no `code`; the unique shift name was the legacy key.
+        // Never use the employee's *current* schedule for past attendance.
+        return $code !== '' ? $code : '-';
     }
 
     private function emptyResult(): array

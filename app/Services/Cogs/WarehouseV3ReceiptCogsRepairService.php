@@ -70,7 +70,7 @@ class WarehouseV3ReceiptCogsRepairService
             'cogs_purchasing_cost_snapshots', 'cogs_sale_consumptions', 'cogs_sale_consumption_items',
         ] as $table) {
             if (! Schema::hasTable($table)) {
-                throw new RuntimeException("ERP V5 I02 COGS membutuhkan tabel {$table}.");
+                throw new RuntimeException("Proses penyesuaian HPP penerimaan barang membutuhkan tabel {$table}.");
             }
         }
     }

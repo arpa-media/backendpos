@@ -3,6 +3,7 @@
 namespace App\Services\Warehouse\Iteration07;
 
 use Illuminate\Support\Facades\DB;
+use App\Services\Warehouse\ProductionV13\ProductionCostStateI21Service;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -169,7 +170,7 @@ class WarehouseProductionMaterialOpnameV7Service
             abort(404);
         }
 
-        if ((string) $production->status === 'on_progress') {
+        if (in_array((string) $production->status, ['on_progress','completed'],true)) {
             $this->ensureLegacyAllocations($warehouseId, $productionId);
         }
 
@@ -296,6 +297,7 @@ class WarehouseProductionMaterialOpnameV7Service
             ] : null,
             'items' => $items,
             'production_stock_balance' => $stock,
+            'cost_state' => app(ProductionCostStateI21Service::class)->detail($warehouseId, $productionId),
             'reopen_eligibility' => $reopenEligibility,
             'reopen_requests' => $reopenRequests,
             'pending_reopen_request' => collect($reopenRequests)->firstWhere('status', 'pending'),
@@ -313,8 +315,8 @@ class WarehouseProductionMaterialOpnameV7Service
             if (! $production) {
                 abort(404);
             }
-            if ((string) $production->status !== 'on_progress') {
-                throw ValidationException::withMessages(['status' => ['Actual Bahan hanya dapat diisi pada Ongoing Production.']]);
+            if (! in_array((string) $production->status, ['on_progress', 'completed'], true)) {
+                throw ValidationException::withMessages(['status' => ['Actual Bahan hanya dapat diisi pada Ongoing atau Finished Production.']]);
             }
 
             $this->ensureLegacyAllocations($warehouseId, $productionId);
@@ -497,12 +499,8 @@ class WarehouseProductionMaterialOpnameV7Service
                 return;
             }
 
-            if (DB::table('wh_v3_production_results')
-                ->where('production_id', $productionId)
-                ->where('status', 'approved')
-                ->exists()) {
-                throw ValidationException::withMessages(['results' => ['Finalize Actual Bahan sebelum approve Actual Hasil Produksi.']]);
-            }
+            // V13 I21: Material opname may be finalized after results were posted.
+            // Cost differences are recorded, never silently booked to historical ledgers.
 
             $allocs = DB::table('wh_v7_production_material_allocations')
                 ->where('production_id', $productionId)
@@ -573,6 +571,7 @@ class WarehouseProductionMaterialOpnameV7Service
                 'lock_version' => DB::raw('lock_version+1'),
                 'updated_at' => now(),
             ]);
+            app(ProductionCostStateI21Service::class)->sync($warehouseId, $productionId);
         }, 5);
 
         return $this->detail($warehouseId, $productionId);

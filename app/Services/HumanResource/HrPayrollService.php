@@ -77,6 +77,13 @@ class HrPayrollService
             ])), $search))->values();
         }
 
+        // V13 I10: filter out non-matching outlet types before totals/pagination.
+        $group = strtolower((string)$request->query('cutoff_group',''));
+        if (in_array($group,['squad','management'],true)) {
+            $types=$this->v13OutletTypes($items->pluck('outlet_id')->filter()->all());
+            $items=$items->filter(fn($r)=>$this->v13Group($types[(string)($r['outlet_id']??'')]??'')===$group)->values();
+        }
+
         $summary = $this->summary($items);
         $perPage = (int) $request->query('per_page', 25);
         if (! in_array($perPage, [10,25,50,100,500], true)) $perPage = 25;
@@ -99,7 +106,20 @@ class HrPayrollService
         if ($request->filled('status')) $query->where('status', $request->query('status'));
         if ($request->filled('company_code')) $query->where('company_code', strtoupper((string) $request->query('company_code')));
         if ($request->filled('year')) $query->whereYear('period_from', (int) $request->query('year'));
-        $rows = $query->orderByDesc('period_from')->orderByDesc('created_at')->get()->map(fn ($c) => $this->cutoffPayload($c));
+        $cutoffs=$query->orderByDesc('period_from')->orderByDesc('created_at')->get();
+        $types=$this->v13OutletTypes(DB::table('HR_payroll_slips')->whereIn('cutoff_id',$cutoffs->pluck('id'))->pluck('outlet_id_snapshot')->filter()->unique()->all());
+        $byCutoff=DB::table('HR_payroll_slips')->whereIn('cutoff_id',$cutoffs->pluck('id'))
+            ->get(['cutoff_id','outlet_id_snapshot'])->groupBy('cutoff_id');
+        $rows=$cutoffs->map(function($c)use($types,$byCutoff){
+            $p=$this->cutoffPayload($c);
+            $groups=collect($byCutoff[$c->id]??[])->map(fn($s)=>$this->v13Group($types[(string)($s->outlet_id_snapshot??'')]??''))->unique();
+            $p['cutoff_group']=$groups->count()===1?$groups->first():'mixed';
+            return $p;
+        });
+        if(in_array($request->query('cutoff_group'),['squad','management'],true)) {
+            $rows=$rows->filter(fn($r)=>$r['cutoff_group']===$request->query('cutoff_group') || $r['cutoff_group']==='mixed' || $r['cutoff_group']==='unmapped')->values();
+        }
+
         return ['items' => $rows, 'years' => $rows->pluck('period_from')->filter()->map(fn ($d) => (int) substr((string)$d,0,4))->unique()->sortDesc()->values()];
     }
 
@@ -111,6 +131,7 @@ class HrPayrollService
             'company_code' => (string) $request->input('company_code', ''),
             'outlet_id' => (string) $request->input('outlet_id', ''),
             'per_page' => 500,
+            'cutoff_group' => (string) $request->input('cutoff_group', ''),
         ]);
         $projectionRequest->setUserResolver(fn () => $actor);
         foreach ($request->headers->all() as $key => $values) foreach ($values as $value) $projectionRequest->headers->set($key, $value);
@@ -126,6 +147,15 @@ class HrPayrollService
         } while ($page <= $last);
 
         if ($all->isEmpty()) throw ValidationException::withMessages(['period_from' => ['Tidak ada data payroll untuk filter/periode ini.']]);
+        $types=$this->v13OutletTypes($all->pluck('outlet_id')->filter()->all());
+        $groups=$all->map(fn($r)=>$this->v13Group($types[(string)($r['outlet_id']??'')]??''))->unique()->values();
+        if ($groups->count() !== 1 || !in_array($groups->first(),['squad','management'],true)) {
+            throw ValidationException::withMessages(['cutoff_group'=>['Cutoff harus satu kelompok Squad atau Management; outlet tanpa tipe dan cutoff campuran tidak boleh disubmit.']]);
+        }
+        if ($request->filled('cutoff_group') && $request->input('cutoff_group') !== $groups->first()) {
+            throw ValidationException::withMessages(['cutoff_group'=>['Kelompok cutoff tidak cocok dengan tipe outlet.']]);
+        }
+
 
         return DB::transaction(function () use ($request, $actor, $all) {
             $code = trim((string) $request->input('code', '')) ?: $this->nextCode((string) $request->input('period_from'));
@@ -313,11 +343,16 @@ class HrPayrollService
     {
         $calculated = $this->calculate($row);
         $employee = DB::table('employees')->where('id',(string)$row['employee_id'])->first(['id','user_id']);
+        $squad=DB::table('HR_squads')->whereRaw('LOWER(TRIM(nisj)) = ?',[strtolower(trim((string)($row['nisj']??'')))])->whereNull('deleted_at')
+            ->first(['bank_name','bank_account','email']);
         HrPayrollSlip::create([
             'cutoff_id'=>$cutoff->id,'employee_id'=>$row['employee_id'],'user_id'=>$employee?->user_id,
             'nisj_snapshot'=>$row['nisj'] ?? null,'full_name_snapshot'=>$row['full_name'] ?? '-',
             'company_code_snapshot'=>$row['company_code'] ?? null,'outlet_id_snapshot'=>$row['outlet_id'] ?? null,
             'outlet_name_snapshot'=>$row['outlet_name'] ?? '-','position_snapshot'=>$row['position'] ?? '-',
+            'bank_name_snapshot'=>$squad?->bank_name ?: null,
+            'bank_account_snapshot'=>$squad?->bank_account ?: null,
+            'email_snapshot'=>filter_var((string)($squad?->email??''),FILTER_VALIDATE_EMAIL)?strtolower(trim((string)$squad->email)):null,
             'salary_tier_snapshot'=>$row['salary_tier'] ?? null,'daily_rate'=>$row['daily_rate'] ?? 0,
             'basic_salary_snapshot'=>$row['basic_salary'] ?? 0,'minute_deduction'=>$row['minute_deduction'] ?? 0,
             'overtime_rate'=>$row['overtime_rate'] ?? 0,'bonus_amount'=>$row['bonus_amount'] ?? 0,
@@ -459,4 +494,14 @@ class HrPayrollService
     }
 
     private function normalizeNisj(mixed $value): string { return Str::lower(trim((string)$value)); }
+    private function v13OutletTypes(array $ids): array {
+        $ids=array_values(array_unique(array_filter(array_map('strval',$ids))));
+        if (!$ids) return [];
+        return DB::table('outlets')->whereIn('id',$ids)->pluck('type','id')->all();
+    }
+    private function v13Group(string $type): string {
+        $t=strtolower(trim($type));
+        return $t==='outlet'?'squad':(in_array($t,['headquarter','warehouse'],true)?'management':'unmapped');
+    }
+
 }

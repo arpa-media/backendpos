@@ -9,7 +9,7 @@ use Illuminate\Validation\ValidationException;
 
 class WarehouseInvoicePaymentLifecycleService
 {
-    public function __construct(private readonly WarehouseFinanceV3Service $base) {}
+    public function __construct(private readonly WarehouseFinanceV3Service $base, private readonly \App\Services\Warehouse\FinanceV13I20\InvoiceTermsV13I20Service $v13i20Terms) {}
 
     public function invoices(string $direction, string $warehouseId, array $filters): array
     {
@@ -32,6 +32,7 @@ class WarehouseInvoicePaymentLifecycleService
         $detail = $this->base->detail($direction, $source, $id, $warehouseId);
         $detail = array_merge($detail, $this->paymentSnapshot($direction, $source, $id, $warehouseId));
         $detail['payments'] = $this->paymentHistory($direction, $source, $id, $warehouseId);
+        $detail['payment_plan'] = $this->v13i20Terms->snapshot($direction,$source,$id,$warehouseId);
         $detail['can_pay'] = $direction === 'incoming'
             && in_array((string)$detail['status'], ['issued','partially_paid'], true)
             && (float)$detail['outstanding_amount'] > 0.009;
@@ -50,7 +51,11 @@ class WarehouseInvoicePaymentLifecycleService
             $invoice = $this->lockDocument($direction,$source,$id,$warehouseId);
             $key = trim((string)($payload['idempotency_key'] ?? '')) ?: ('whv3-pay:'.Str::uuid());
             $existing = DB::table('wh_v3_invoice_payments')->where('document_source',$source)->where('document_id',$id)->where('idempotency_key',$key)->first();
-            if ($existing) return $this->detail($direction,$source,$id,$warehouseId);
+            if ($existing) {
+                if (abs((float)$existing->amount - round((float)$payload['amount'],2))>0.009 || (string)$existing->payment_account_id !== (string)$payload['payment_account_id'] || (string)$existing->payment_date !== (string)$payload['payment_date'])
+                    throw ValidationException::withMessages(['idempotency_key'=>['Request key sudah dipakai dengan isi pembayaran berbeda.']]);
+                return $this->detail($direction,$source,$id,$warehouseId);
+            }
 
             if (! in_array((string)$invoice->status, ['issued','partially_paid'], true)) {
                 throw ValidationException::withMessages(['status'=>['Pembayaran hanya dapat dicatat pada invoice ISSUED atau PARTIALLY PAID.']]);
@@ -79,9 +84,10 @@ class WarehouseInvoicePaymentLifecycleService
                 'amount'=>$amount,'payment_account_id'=>$account->id,'payment_account_snapshot'=>json_encode($accountSnapshot),
                 'payer_name_snapshot'=>$payerName,'payer_nisj_snapshot'=>$actor->nisj??null,'reference_number'=>$payload['reference_number']??null,
                 'notes'=>$payload['notes']??null,'status'=>'posted','idempotency_key'=>$key,'confirmed_by_user_id'=>$userId,'confirmed_at'=>now(),
-                'metadata'=>json_encode(['lifecycle_version'=>3,'legacy_reference'=>$legacyReference]),'created_at'=>now(),'updated_at'=>now(),
+                'metadata'=>json_encode(['lifecycle_version'=>3,'legacy_reference'=>$legacyReference,'v13_payment_type'=>$payload['payment_type']??null,'v13_term_id'=>$payload['term_id']??null]),'created_at'=>now(),'updated_at'=>now(),
             ]);
 
+            $this->v13i20Terms->allocate($direction,$source,$id,$warehouseId,$paymentId,$amount,$payload['term_id']??null);
             $this->applyPayment($direction,$source,$id,$warehouseId,$amount,$userId);
             $after=$this->paymentSnapshot($direction,$source,$id,$warehouseId);
             $this->event($source,$id,$direction,'payment_posted',(string)$invoice->status,(string)$after['status'],

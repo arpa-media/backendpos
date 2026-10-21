@@ -141,6 +141,7 @@ class WarehouseProductionV3Controller extends Controller
         return $request->validate([
             'result_date'=>['required','date'],'notes'=>['nullable','string','max:2000'],'items'=>['required','array','min:1'],
             'items.*.production_output_id'=>['required','string','max:40','distinct'],'items.*.qty_uom'=>['required','numeric','min:0'],
+            'items.*.uom_id'=>['nullable','string','max:40'], // I06: optional, old clients retain the order UOM snapshot
             'items.*.storage_id'=>['nullable','string','max:40'],'items.*.notes'=>['nullable','string','max:500'],
         ]);
     }

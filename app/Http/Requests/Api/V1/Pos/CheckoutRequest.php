@@ -49,6 +49,8 @@ class CheckoutRequest extends FormRequest
         return [
             'outlet_id' => ['nullable', 'string', 'max:30'],
             'client_sync_id' => ['nullable', 'string', 'max:100'],
+            'pricing_rule_version' => ['nullable', 'integer', Rule::in([1, 2])],
+            'pricing_rule_kind' => ['nullable', 'string', Rule::in(['SQUAD', 'ONLINE_500'])],
             'queue_no' => ['nullable', 'string', 'max:20'],
             'transaction_at' => ['nullable', 'date'],
 
@@ -117,6 +119,10 @@ class CheckoutRequest extends FormRequest
             'payment.payment_method_type_snapshot' => ['nullable', 'string', 'max:50'],
 
             'offline_snapshot' => ['nullable', 'array'],
+            'offline_snapshot.pricing_rule_version' => ['nullable', 'integer', Rule::in([1, 2])],
+            'offline_snapshot.pricing_v2' => ['nullable', 'array'],
+            'offline_snapshot.pricing_v2.kind' => ['nullable', 'string', Rule::in(['SQUAD', 'ONLINE_500'])],
+            'offline_snapshot.pricing_v2.version' => ['nullable', 'integer', Rule::in([2])],
             'offline_snapshot.subtotal' => ['nullable', 'integer', 'min:0', 'max:9999999999'],
             'offline_snapshot.discount_type' => ['nullable', 'string', Rule::in(['NONE', 'PERCENT', 'FIXED'])],
             'offline_snapshot.discount_value' => ['nullable', 'integer', 'min:0', 'max:9999999999'],

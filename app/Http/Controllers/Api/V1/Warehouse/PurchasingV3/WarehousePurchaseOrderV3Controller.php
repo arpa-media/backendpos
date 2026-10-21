@@ -65,22 +65,9 @@ class WarehousePurchaseOrderV3Controller extends WarehouseProcurementBaseControl
     {
         $warehouseId = $this->warehouseId($request);
         if ($warehouseId instanceof JsonResponse) return $warehouseId;
-        $payload = $request->validate([
-            'items' => ['required', 'array', 'min:1', 'max:500'],
-            'items.*.stock_in_item_id' => ['required', 'string', 'distinct', Rule::exists('wh_stock_in_items', 'id')],
-            // ERP-V5 Iteration 10: Complete Stock In memakai Purchase UOM.
-            // received_qty_base dipertahankan hanya sebagai backward-compatible fallback untuk client lama.
-            'items.*.received_qty_uom' => ['nullable', 'numeric', 'min:0'],
-            'items.*.received_qty_base' => ['nullable', 'numeric', 'min:0'],
-            'items.*.storage_id' => ['nullable', 'string', Rule::exists('wh_storages', 'id')->where('is_active', true)],
-            'items.*.supplier_batch_code' => ['nullable', 'string', 'max:100'],
-            'items.*.production_date' => ['nullable', 'date_format:Y-m-d'],
-            'items.*.expiry_date' => ['nullable', 'date_format:Y-m-d'],
-            'items.*.notes' => ['nullable', 'string', 'max:1000'],
-        ]);
-        return ApiResponse::ok(
-            $this->service->completeStockIn($id, $warehouseId, $payload, (string) $request->user()->id),
-            'Stock In selesai. Qty Purchase UOM dikonversi ke Base UOM untuk ledger; stok, batch, Berita Acara, dan draft Incoming Invoice sudah dibuat.'
+        return ApiResponse::error(
+            'Gunakan Logistic Partial Stock In dan Complete PO pada Purchasing. Endpoint otomatis lama dinonaktifkan.',
+            'V13_I18_USE_MANUAL_PO_COMPLETION', 409
         );
     }
 

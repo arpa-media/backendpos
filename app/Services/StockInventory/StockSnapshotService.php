@@ -190,6 +190,8 @@ class StockSnapshotService
                 'sku_id' => $skuId,
                 'sku_code' => (string) $sku->sku_code,
                 'sku_name' => (string) $sku->name,
+                // V13 I14: nullable SKU usage classification from I13, used only by UI filters.
+                'sku_type' => in_array((string) ($sku->sku_type ?? ''), ['bar', 'kitchen'], true) ? (string) $sku->sku_type : null,
                 'category_id' => (string) $sku->category_id,
                 'category_name' => (string) ($sku->category?->name ?? '-'),
                 'uom_id' => $baseUomId,

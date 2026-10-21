@@ -23,6 +23,14 @@ class HrPayrollCutoffWorkflowController extends Controller
         return ApiResponse::ok($this->workflow->reopen($cutoff, $request->user(), $data['reason']), 'Cutoff dibatalkan dan kembali ke Draft.');
     }
 
+    public function exportBpjs(HrPayrollCutoff $cutoff) {
+        return $this->workflow->exportBpjsForCutoff($cutoff);
+    }
+    public function importBpjs(Request $request, HrPayrollCutoff $cutoff) {
+        $request->validate(['file'=>['required','file','mimes:xlsx','max:10240']]);
+        return ApiResponse::ok($this->workflow->importBpjsForCutoff($cutoff,$request->file('file'),$request->user()),'BPJS disimpan pada Draft HR.');
+    }
+
     public function exportAdjustments(HrPayrollCutoff $cutoff)
     {
         return $this->workflow->exportAdjustments($cutoff);

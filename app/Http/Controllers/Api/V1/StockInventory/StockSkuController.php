@@ -106,6 +106,7 @@ class StockSkuController extends StockInventoryBaseController
             'barcode' => filled($data['barcode'] ?? null) ? trim($data['barcode']) : null,
             'notes' => filled($data['notes'] ?? null) ? trim($data['notes']) : null,
             'is_active' => (bool) ($data['is_active'] ?? true),
+            'sku_type' => $data['sku_type'] ?? null,
             'created_by_user_id' => $userId,
             'updated_by_user_id' => $userId,
         ]);
@@ -129,6 +130,7 @@ class StockSkuController extends StockInventoryBaseController
             'barcode' => filled($data['barcode'] ?? null) ? trim($data['barcode']) : null,
             'notes' => filled($data['notes'] ?? null) ? trim($data['notes']) : null,
             'is_active' => (bool) ($data['is_active'] ?? true),
+            'sku_type' => $data['sku_type'] ?? null,
             'updated_by_user_id' => $request->user()?->id,
         ])->save();
 
@@ -160,6 +162,7 @@ class StockSkuController extends StockInventoryBaseController
             'q' => ['nullable', 'string', 'max:120'],
             'category_id' => ['nullable', 'ulid'],
             'is_active' => ['nullable', 'boolean'],
+            'sku_type' => ['nullable', Rule::in(['bar', 'kitchen'])],
         ];
         if ($withPagination) $rules['per_page'] = ['nullable', 'integer', 'min:1', 'max:200'];
         return $request->validate($rules);
@@ -177,6 +180,7 @@ class StockSkuController extends StockInventoryBaseController
             });
         }
         if (! empty($filters['category_id'])) $query->where('category_id', $filters['category_id']);
+        if (! empty($filters['sku_type'])) $query->where('sku_type', $filters['sku_type']);
         if (array_key_exists('is_active', $filters)) $query->where('is_active', (bool) $filters['is_active']);
         return $query;
     }
@@ -191,6 +195,7 @@ class StockSkuController extends StockInventoryBaseController
             'barcode' => ['nullable', 'string', 'max:100', Rule::unique('stk_skus', 'barcode')->ignore($ignoreId)],
             'notes' => ['nullable', 'string', 'max:2000'],
             'is_active' => ['nullable', 'boolean'],
+            'sku_type' => ['nullable', Rule::in(['bar', 'kitchen'])],
         ]);
     }
 
@@ -202,6 +207,7 @@ class StockSkuController extends StockInventoryBaseController
             'name' => (string) $sku->name,
             'barcode' => $sku->barcode,
             'notes' => $sku->notes,
+            'sku_type' => $sku->sku_type,
             'is_active' => (bool) $sku->is_active,
             'category_id' => (string) $sku->category_id,
             'category' => $sku->category ? [

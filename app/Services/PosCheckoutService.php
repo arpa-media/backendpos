@@ -14,6 +14,7 @@ use App\Models\SalePayment;
 use App\Models\Tax;
 use App\Models\User;
 use App\Support\PaymentMethodTypes;
+use App\Support\PosPricingV16I02;
 use App\Support\SaleAmountBreakdown;
 use App\Support\SaleRounding;
 use App\Support\SalesChannels;
@@ -1075,6 +1076,83 @@ class PosCheckoutService
                 $discountReason = (string) (($selectedSquadPackage['code'] ?? null) ?: ($selectedSquadPackage['name'] ?? null) ?: 'SQUAD');
             }
 
+            // V16-I02: explicit versioned snapshot; never upgrade a missing version (old APK/queue).
+            $v2Requested = (int) ($payload['pricing_rule_version'] ?? 1) === 2;
+            $v2Kind = (string) ($payload['pricing_rule_kind'] ?? '');
+            $v2Snapshot = is_array($offlineSnapshot['pricing_v2'] ?? null) ? $offlineSnapshot['pricing_v2'] : [];
+            if ($v2Requested) {
+                if (!$useOfflineSnapshot || (int) ($offlineSnapshot['pricing_rule_version'] ?? 0) !== 2
+                    || (int) ($v2Snapshot['version'] ?? 0) !== 2
+                    || !in_array($v2Kind, ['SQUAD', 'ONLINE_500'], true)
+                    || ($v2Snapshot['kind'] ?? '') !== $v2Kind) {
+                    throw ValidationException::withMessages(['pricing_rule_version' => ['Invalid V2 pricing contract.']]);
+                }
+                if ($v2Kind === 'SQUAD') {
+                    if ($selectedSquadPackage === null || count($discountSnapshots) !== 1) {
+                        throw ValidationException::withMessages(['discounts' => ['V2 Squad requires a single Squad package.']]);
+                    }
+                    $v2Expected = PosPricingV16I02::squad(
+                        $saleItems, $selectedSquadProductIds, $discountSquadNisjInput,
+                        $saleChannel === SalesChannels::DELIVERY ? 0 : (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent),
+                        $saleChannel
+                    );
+                    if ($v2Expected === null || $squadBase !== (int) $v2Expected['eligible_subtotal']) {
+                        throw ValidationException::withMessages(['pricing_rule_version' => ['Squad V2 cannot price this cart or customer safely.']]);
+                    }
+                    $discountAmount = (int) $v2Expected['discount_amount'];
+                    $taxableBase = max(0, $discountableSubtotal - $discountAmount);
+                    foreach ($discountSnapshots as &$squadPriceSnapshot) {
+                        $squadPriceSnapshot['base_discount_amount'] = $v2Expected['base_discount_amount'];
+                        $squadPriceSnapshot['additional_squad_rounding_discount'] = $v2Expected['additional_squad_rounding_discount'];
+                        $squadPriceSnapshot['effective_discount_amount'] = $discountAmount;
+                        $squadPriceSnapshot['amount'] = $discountAmount;
+                        $squadPriceSnapshot['pricing_rule_version'] = 2;
+                        $squadPriceSnapshot['line_targets'] = $v2Expected['line_targets'];
+                    }
+                    unset($squadPriceSnapshot);
+                } else {
+                    $v2Expected = PosPricingV16I02::online(
+                        $saleChannel, $saleItems, $subtotal, $discountAmount, 0, 0
+                    );
+                    if ($v2Expected === null) {
+                        throw ValidationException::withMessages(['pricing_rule_version' => ['Online Rp500 rule requires eligible DELIVERY lines.']]);
+                    }
+                }
+                // Reject divergent/tampered cash register totals instead of silently repricing them.
+                $numberFields = ['rounding_total', 'grand_total'];
+                if ($v2Kind === 'SQUAD') {
+                    $numberFields = array_merge($numberFields, ['discount_amount', 'tax_total', 'base_discount_amount', 'additional_squad_rounding_discount', 'subtotal', 'eligible_subtotal']);
+                    if (($v2Snapshot['line_targets'] ?? null) !== $v2Expected['line_targets']) {
+                        throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ['Squad item targets do not match.']]);
+                    }
+                } else {
+                    $numberFields[] = 'protected_500_total';
+                    if (($v2Snapshot['policy'] ?? null) !== $v2Expected['policy']) {
+                        throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ['Online rounding policy mismatch.']]);
+                    }
+                }
+                foreach ($numberFields as $key) {
+                    if (!is_numeric($v2Snapshot[$key] ?? null) || (int) $v2Snapshot[$key] !== (int) $v2Expected[$key]) {
+                        throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ["Pricing mismatch: {$key}."]]);
+                    }
+                }
+                $expectedFields = [
+                    'subtotal' => $subtotal,
+                    'discount_amount' => $v2Kind === 'SQUAD' ? $v2Expected['discount_amount'] : $discountAmount,
+                    'tax_total' => $v2Kind === 'SQUAD' ? $v2Expected['tax_total'] : 0,
+                    'rounding_total' => $v2Expected['rounding_total'],
+                    'grand_total' => $v2Expected['grand_total'],
+                ];
+                foreach ($expectedFields as $key => $expectedValue) {
+                    if (!is_numeric($offlineSnapshot[$key] ?? null) || (int) $offlineSnapshot[$key] !== (int) $expectedValue) {
+                        throw ValidationException::withMessages(["offline_snapshot.{$key}" => ['V2 totals differ from priced cart.']]);
+                    }
+                }
+            } else if (array_key_exists('pricing_rule_version', $offlineSnapshot)
+                || array_key_exists('pricing_v2', $offlineSnapshot) || array_key_exists('pricing_rule_kind', $payload)) {
+                throw ValidationException::withMessages(['pricing_rule_version' => ['Pricing version fields must agree.']]);
+            }
+
             // 7) Tax (default tax per outlet, except online/delivery which are always no-tax)
             if ($useOfflineSnapshot) {
                 $isOnlineNoTax = $saleChannel === SalesChannels::DELIVERY;
@@ -1086,7 +1164,7 @@ class PosCheckoutService
                     ? 0
                     : max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
                 $serviceChargeTotal = 0;
-                $roundingTotal = (int) ($offlineSnapshot['rounding_total'] ?? 0);
+                $roundingTotal = $v2Requested ? (int) $v2Expected['rounding_total'] : (int) ($offlineSnapshot['rounding_total'] ?? 0);
 
                 // Canonical server-side rule: tax must always be applied after discount,
                 // but PACKAGING lines are excluded from both discount and tax bases.
@@ -1094,6 +1172,7 @@ class PosCheckoutService
                 // carry stale tax snapshots from the active outlet default tax.
                 $effectiveSubtotal = (int) ($offlineSnapshot['subtotal'] ?? $subtotal);
                 $taxTotal = (int) floor(($taxableBase * $effectiveTaxPercent) / 100);
+                // Intentional: V1 ledger formula is unchanged. V2 is verified above.
                 $grandTotalBeforeRounding = max(0, (int) ($effectiveSubtotal - $discountAmount + $taxTotal + $serviceChargeTotal));
                 $grandTotal = max(0, (int) ($grandTotalBeforeRounding + $roundingTotal));
             } else {

@@ -6,7 +6,6 @@ use App\Services\Cogs\CogsValuationResolverService;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
-use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 class OpeningStockService
@@ -35,7 +34,6 @@ class OpeningStockService
             $existing = DB::table('stk_opening_stocks')
                 ->where('outlet_id', $outletId)
                 ->where('sku_id', $skuId)
-                ->lockForUpdate()
                 ->first();
 
             // Frontend selalu mengirim 0 untuk SKU legacy yang belum pernah diberi
@@ -45,14 +43,14 @@ class OpeningStockService
                 return null;
             }
 
-            $cost = $unitCost === null ? null : round(max(0, $unitCost), 6);
+            $cost = $unitCost === null ? null : round(max(0, $unitCost), 4);
             if ($qty > 0 && ($cost === null || $cost <= 0)) {
                 $currentAverage = (float) (DB::table('stk_inventory_balances')
                     ->where('outlet_id', $outletId)
                     ->where('sku_id', $skuId)
                     ->value('average_unit_cost') ?? 0);
                 $resolved = $this->valuation->resolve($outletId, $skuId, $date, $currentAverage);
-                $cost = round((float) ($resolved['unit_cost'] ?? 0), 6);
+                $cost = round((float) ($resolved['unit_cost'] ?? 0), 4);
             }
             $cost ??= 0.0;
 
@@ -64,7 +62,7 @@ class OpeningStockService
 
             if ($existing) {
                 $unchanged = abs((float) $existing->opening_qty - $qty) <= 0.0001
-                    && abs((float) $existing->unit_cost - $cost) <= 0.000001
+                    && abs((float) $existing->unit_cost - $cost) <= 0.0001
                     && (string) $existing->effective_date === $date;
                 if ($unchanged) {
                     return (array) $existing;
@@ -77,55 +75,26 @@ class OpeningStockService
                 ]);
             }
 
-            $id = (string) ($existing->id ?? Str::ulid());
-            $value = round($qty * $cost, 2);
-            $now = now();
-            DB::table('stk_opening_stocks')->updateOrInsert(
-                ['outlet_id' => $outletId, 'sku_id' => $skuId],
-                [
-                    'id' => $id,
-                    'opening_qty' => $qty,
-                    'unit_cost' => $cost,
-                    'inventory_value' => $value,
-                    'effective_date' => $date,
-                    'source' => 'PAR_STOCK_INITIAL',
-                    'notes' => 'Opening stock dari Stock Inventory > Par Stock. Tidak dibuat sebagai stock movement.',
-                    'created_by_user_id' => $existing->created_by_user_id ?? $userId,
-                    'updated_by_user_id' => $userId,
-                    'created_at' => $existing->created_at ?? $now,
-                    'updated_at' => $now,
-                ],
-            );
-
-            // Opening balance is part of existing inventory valuation, but intentionally
-            // does not create stk_inventory_movements. Before operational activity exists,
-            // the aggregate balance can safely be synchronized directly to the opening value.
-            DB::table('stk_inventory_balances')->insertOrIgnore([
-                'id' => (string) Str::ulid(),
-                'outlet_id' => $outletId,
-                'sku_id' => $skuId,
-                'on_hand_qty' => 0,
-                'average_unit_cost' => 0,
-                'inventory_value' => 0,
-                'last_movement_at' => null,
-                'lock_version' => 1,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ]);
-
-            DB::table('stk_inventory_balances')
-                ->where('outlet_id', $outletId)
-                ->where('sku_id', $skuId)
-                ->update([
-                    'on_hand_qty' => $qty,
-                    'average_unit_cost' => $cost,
-                    'inventory_value' => $value,
-                    'last_movement_at' => null,
-                    'lock_version' => DB::raw('lock_version + 1'),
-                    'updated_at' => $now,
+            // I13: legacy Par Stock initial values also go through auditable posting.
+            // Existing opening records may only be revised through the explicit
+            // Reopen flow on Dashboard; Par Stock can never silently rewrite them.
+            if ($existing) {
+                throw ValidationException::withMessages([
+                    'initial_stock_qty' => ['Opening yang sudah disimpan tidak dapat diedit lewat Par Stock. Gunakan Inisialisasi Stok > Revisi dengan audit (atau rekonsiliasi legacy).'],
                 ]);
+            }
 
-            return (array) DB::table('stk_opening_stocks')->where('id', $id)->first();
+            app(OpeningStockBatchV13I13Service::class)->apply($outletId, [
+                'mode' => 'post',
+                'request_key' => 'par-'.hash('sha256', implode('|', [$outletId, $skuId, $qty, $cost, $date])),
+                'effective_date' => $date,
+                'confirmation' => 'POST OPENING STOCK',
+                'items' => [['sku_id' => $skuId, 'quantity' => $qty, 'unit_cost' => $cost]],
+            ], $userId);
+
+            return (array) DB::table('stk_opening_stocks')
+                ->where('outlet_id', $outletId)->where('sku_id', $skuId)->first();
+
         }, 3);
     }
 

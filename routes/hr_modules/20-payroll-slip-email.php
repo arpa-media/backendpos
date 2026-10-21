@@ -21,3 +21,8 @@ Route::post('/bonus-projections/{projectionId}/lines/{lineId}/email', [HrPayroll
 Route::post('/payroll/slip-email-diagnostics', [HrPayrollSlipEmailController::class, 'diagnostics'])
     ->middleware('permission_or_snapshot:hr.payroll.cutoff.email,hr.payroll.cutoff.update,hr.bonus.projection.email,hr.bonus.projection.recalculate,hr.bonus.projection.submit')
     ->name('hr.payroll.i13.mail.diagnostics');
+
+Route::post('/payroll/cutoffs/{cutoff}/slips/{slip}/email/resend', [HrPayrollSlipEmailController::class, 'resendPayroll'])
+    ->middleware('permission_or_snapshot:hr.payroll.cutoff.email,hr.payroll.cutoff.update')->name('hr.payroll.v13i10.mail.resend');
+Route::post('/bonus-projections/{projectionId}/lines/{lineId}/email/resend', [HrPayrollSlipEmailController::class, 'resendBonus'])
+    ->middleware('permission_or_snapshot:hr.bonus.projection.email,hr.bonus.projection.recalculate,hr.bonus.projection.submit')->name('hr.bonus.v13i10.mail.resend');

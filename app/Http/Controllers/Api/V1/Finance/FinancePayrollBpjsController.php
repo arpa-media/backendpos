@@ -27,6 +27,7 @@ class FinancePayrollBpjsController extends Controller
 
     public function import(Request $request, string $id)
     {
+        abort(410, 'Import BPJS di Finance ditutup oleh V13 I10. Gunakan BPJS di HR Draft. Finance memakai potongan PPh21.');
         $this->assertRecordScope($request, $id);
         $request->validate(['file' => ['required','file','mimes:xlsx','max:10240']]);
         return ApiResponse::ok($this->workflow->importBpjsByPosting($id, $request->file('file'), $request->user()), 'Import BPJS selesai.');

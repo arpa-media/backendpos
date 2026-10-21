@@ -88,6 +88,20 @@ class WarehouseV3ValuationBridgeService
                 ->where('reference_type', 'wh_v3_goods_receipt')
                 ->where('reference_line_id', $item->id)
                 ->first();
+            // I05 multi-stage receipt: latest batch movement is the final balance
+            // evidence; the snapshot quantity remains cumulative from the GR item.
+            if (Schema::hasTable('wh_v3_partial_receipt_batches') && Schema::hasTable('wh_v3_partial_receipt_items')) {
+                $latestBatchMovement = DB::table('stk_inventory_movements as m')
+                    ->join('wh_v3_partial_receipt_items as bi','bi.movement_reference_line_id','=','m.reference_line_id')
+                    ->join('wh_v3_partial_receipt_batches as b','b.id','=','bi.batch_id')
+                    ->where('bi.goods_receipt_item_id',$item->id)
+                    ->where('b.goods_receipt_id',$goodsReceiptId)
+                    ->where('m.movement_type','goods_receipt')
+                    ->where('m.reference_type','wh_v3_goods_receipt')
+                    ->orderByDesc('b.created_at')->orderByDesc('bi.id')
+                    ->select('m.*')->first();
+                if ($latestBatchMovement) $movement = $latestBatchMovement;
+            }
 
             $cost = $this->warehouseUnitCost($gr, $item, $movement);
             if ($cost['unit_cost'] <= 0) {

@@ -19,6 +19,7 @@ class StockSku extends Model
         'category_id',
         'base_uom_id',
         'name',
+        'sku_type',
         'barcode',
         'notes',
         'is_active',

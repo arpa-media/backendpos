@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api\V1\HumanResource;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\Api\V1\Common\ApiResponse;
 use App\Services\HumanResource\HrOutletStaffingService;
+use App\Services\HumanResource\HrV13I04OutletCompanyService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -18,7 +19,7 @@ class HrOutletController extends Controller
     private const TABLE = 'outlets';
     private const TYPES = ['outlet', 'headquarter', 'warehouse'];
 
-    public function __construct(private readonly HrOutletStaffingService $staffing)
+    public function __construct(private readonly HrOutletStaffingService $staffing, private readonly HrV13I04OutletCompanyService $ptService)
     {
     }
 
@@ -32,17 +33,21 @@ class HrOutletController extends Controller
         $search = trim((string) $request->query('search', ''));
 
         $rows = DB::table(self::TABLE)
-            ->when($type, fn ($q) => $q->where('type', $type))
-            ->when(Schema::hasColumn(self::TABLE, 'is_active'), fn ($q) => $q->where('is_active', true))
+            ->leftJoin('finance_outlet_company_mappings as hr_i04_m', function ($join): void {
+                $join->on('hr_i04_m.outlet_id', '=', 'outlets.id')->where('hr_i04_m.is_active', true);
+            })
+            ->select('outlets.*', 'hr_i04_m.company_code')
+            ->when($type, fn ($q) => $q->where('outlets.type', $type))
+            ->when(Schema::hasColumn(self::TABLE, 'is_active'), fn ($q) => $q->where('outlets.is_active', true))
             ->when($search !== '', function ($q) use ($search) {
                 $q->where(function ($qq) use ($search) {
-                    $qq->where('name', 'like', "%{$search}%")
-                        ->orWhere('code', 'like', "%{$search}%")
-                        ->orWhere('address', 'like', "%{$search}%");
+                    $qq->where('outlets.name', 'like', "%{$search}%")
+                        ->orWhere('outlets.code', 'like', "%{$search}%")
+                        ->orWhere('outlets.address', 'like', "%{$search}%");
                 });
             })
             ->orderByRaw("FIELD(type, 'outlet', 'headquarter', 'warehouse')")
-            ->orderBy('name')
+            ->orderBy('outlets.name')
             ->get();
 
         $staffingByOutletId = $this->staffing->summariesForOutlets($rows);
@@ -60,7 +65,12 @@ class HrOutletController extends Controller
 
     public function show(string $id)
     {
-        $row = DB::table(self::TABLE)->where('id', $id)->first();
+        $row = DB::table(self::TABLE)
+            ->leftJoin('finance_outlet_company_mappings as hr_i04_m', function ($join): void {
+                $join->on('hr_i04_m.outlet_id', '=', 'outlets.id')->where('hr_i04_m.is_active', true);
+            })
+            ->select('outlets.*', 'hr_i04_m.company_code')
+            ->where('outlets.id', $id)->first();
         if (!$row) return ApiResponse::error('Outlet tidak ditemukan.', 'NOT_FOUND', 404);
 
         $collection = collect([$row]);
@@ -83,11 +93,17 @@ class HrOutletController extends Controller
         $payload = $this->payload($request, null);
         $id = (string) Str::ulid();
 
-        DB::table(self::TABLE)->insert(array_merge($payload, [
-            'id' => $id,
-            'created_at' => $now,
-            'updated_at' => $now,
-        ]));
+        $this->ptService->assertReady();
+        DB::transaction(function () use ($payload, $id, $now, $request): void {
+            DB::table(self::TABLE)->insert(array_merge($payload, [
+                'id' => $id, 'created_at' => $now, 'updated_at' => $now,
+            ]));
+            $outlet = DB::table(self::TABLE)->where('id', $id)->lockForUpdate()->first();
+            $this->ptService->changeLocked($outlet,
+                $request->exists('hr_region'), $request->input('hr_region'),
+                $request->exists('company_code'), $request->input('company_code'), false,
+                null, $request->user()?->id, 'hr-outlet-create');
+        }, 3);
 
         return $this->show($id);
     }
@@ -102,9 +118,18 @@ class HrOutletController extends Controller
             return ApiResponse::error('Validasi gagal.', 'VALIDATION_ERROR', 422, $validator->errors()->toArray());
         }
 
-        DB::table(self::TABLE)->where('id', $id)->update(array_merge($this->payload($request, $row), [
-            'updated_at' => Carbon::now(),
-        ]));
+        $this->ptService->assertReady();
+        DB::transaction(function () use ($id, $row, $request): void {
+            $outlet = DB::table(self::TABLE)->where('id', $id)->lockForUpdate()->first();
+            DB::table(self::TABLE)->where('id', $id)->update(array_merge($this->payload($request, $row), [
+                'updated_at' => Carbon::now(),
+            ]));
+            $this->ptService->changeLocked($outlet,
+                $request->exists('hr_region'), $request->input('hr_region'),
+                $request->exists('company_code') && $request->exists('expected_company_code'), $request->input('company_code'),
+                (bool) $request->boolean('allow_reassignment'),
+                $request->input('expected_company_code'), $request->user()?->id, 'hr-outlet-update');
+        }, 3);
 
         return $this->show($id);
     }
@@ -138,6 +163,10 @@ class HrOutletController extends Controller
             'latitude' => ['nullable', 'numeric', 'between:-90,90'],
             'longitude' => ['nullable', 'numeric', 'between:-180,180'],
             'radius_m' => ['nullable', 'integer', 'min:1'],
+            'hr_region' => ['sometimes', 'nullable', Rule::in(HrV13I04OutletCompanyService::REGIONS)],
+            'company_code' => ['sometimes', 'nullable', 'string', 'max:16'],
+            'expected_company_code' => ['sometimes', 'nullable', 'string', 'max:16'],
+            'allow_reassignment' => ['sometimes', 'boolean'],
         ]);
     }
 
@@ -187,6 +216,8 @@ class HrOutletController extends Controller
             'latitude' => $row->latitude ?? null,
             'longitude' => $row->longitude ?? null,
             'radius_m' => $row->radius_m ?? null,
+            'hr_region' => $row->hr_region ?? null,
+            'company_code' => $row->company_code ?? null,
             'role_counts' => $roleCounts,
             'total_squad' => $total,
             'staffing' => $staffing['rows'] ?? [],

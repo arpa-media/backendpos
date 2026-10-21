@@ -43,6 +43,7 @@ class WarehousePurchasingV3Service
             ->selectSub(fn ($q) => $q->from('wh_supplier_purchase_orders')->whereColumn('purchase_request_id', 'pr.id')->selectRaw('COUNT(*)'), 'order_count');
 
         if (! empty($filters['status'])) $query->where('pr.status', $filters['status']);
+        if (! empty($filters['supplier_source_id'])) $query->where('pr.supplier_source_id', $filters['supplier_source_id']);
         if (! empty($filters['from'])) $query->where('pr.request_date', '>=', $filters['from']);
         if (! empty($filters['to'])) $query->where('pr.request_date', '<=', $filters['to']);
         if (! empty($filters['q'])) {
@@ -428,6 +429,9 @@ class WarehousePurchasingV3Service
             $order = DB::table('wh_supplier_purchase_orders')->where('id', $id)->where('warehouse_id', $warehouseId)->lockForUpdate()->first();
             if (! $order) abort(404);
             if ((int) ($order->flow_version ?? 2) !== 3) throw ValidationException::withMessages(['flow_version' => ['PO legacy bersifat read-only pada flow v3.']]);
+            if (DB::table('wh_v13_i18_stock_in_states')->where('purchase_order_id', $id)->exists()) {
+                throw ValidationException::withMessages(['stock_in' => ['Penerimaan I18 sudah dimulai. Actual Qty PO dikunci untuk menjaga audit partial.']]);
+            }
             if ($order->status === 'completed') return;
             if (! in_array($order->status, ['generated', 'stock_in_prepare'], true)) throw ValidationException::withMessages(['status' => ['PO tidak dapat masuk proses Stock In pada status ini.']]);
             $items = DB::table('wh_supplier_purchase_order_items as i')
@@ -506,13 +510,21 @@ class WarehousePurchasingV3Service
         return $this->showOrder($id, $warehouseId);
     }
 
-    public function completeStockIn(string $id, string $warehouseId, array $payload, string $userId): array
+    public function completeStockIn(string $id, string $warehouseId, array $payload, string $userId, bool $fromStagedCheck = false): array
     {
         DB::transaction(function () use ($id, $warehouseId, $payload, $userId): void {
             $order = DB::table('wh_supplier_purchase_orders')->where('id', $id)->where('warehouse_id', $warehouseId)->lockForUpdate()->first();
             if (! $order) abort(404);
             if ((int) ($order->flow_version ?? 2) !== 3) throw ValidationException::withMessages(['flow_version' => ['PO legacy bersifat read-only pada flow v3.']]);
-            if ($order->status === 'completed') return;
+            if ($order->status === 'completed') return; // Preserve idempotent retries of older clients.
+            // Do not allow the pre-existing direct completion API to bypass a staged
+            // Logistic check. Legacy requests with no checkpoint remain supported.
+            if (!$fromStagedCheck && DB::getSchemaBuilder()->hasTable('wh_v13_i18_stock_in_states')
+                && DB::table('wh_v13_i18_stock_in_states')->where('purchase_order_id', $id)->exists()) {
+                throw ValidationException::withMessages(['stock_in' => [
+                    'PO sudah memakai pengecekan bertahap. Selesaikan melalui menu Logistic Stock In dan Complete PO.',
+                ]]);
+            }
             if ($order->status !== 'stock_in_prepare') throw ValidationException::withMessages(['status' => ['Simpan Actual Qty dan Actual Price terlebih dahulu.']]);
 
             $stockIn = DB::table('wh_stock_ins')->where('purchase_order_id', $id)->where('flow_version', 3)->lockForUpdate()->first();

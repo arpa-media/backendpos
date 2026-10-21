@@ -21,6 +21,7 @@ class StockSkuSpreadsheetService
         'uom_code',
         'barcode',
         'notes',
+        'sku_type',
         'is_active',
     ];
 
@@ -77,7 +78,8 @@ class StockSkuSpreadsheetService
                     ['3', 'category_code harus memakai code atau nama dari worksheet MASTER CATEGORY yang aktif.'],
                     ['4', 'uom_code harus memakai code atau nama dari worksheet MASTER UOM yang aktif.'],
                     ['5', 'barcode boleh kosong tetapi tidak boleh dipakai oleh SKU lain.'],
-                    ['6', 'is_active menerima TRUE/FALSE, 1/0, AKTIF/NONAKTIF, atau YA/TIDAK.'],
+                    ['6', 'sku_type opsional: bar atau kitchen; kosong berarti belum diklasifikasikan.'],
+                    ['7', 'is_active menerima TRUE/FALSE, 1/0, AKTIF/NONAKTIF, atau YA/TIDAK.'],
                     ['7', 'Tidak ada baris contoh statis. Baris contoh RAW pada template v1 telah dihapus karena dapat gagal jika master RAW tidak tersedia.'],
                 ],
             ],
@@ -95,6 +97,7 @@ class StockSkuSpreadsheetService
                 (string) ($sku->baseUom?->code ?? ''),
                 (string) ($sku->barcode ?? ''),
                 (string) ($sku->notes ?? ''),
+                (string) ($sku->sku_type ?? ''),
                 $sku->is_active ? 'TRUE' : 'FALSE',
             ];
         }
@@ -203,6 +206,11 @@ class StockSkuSpreadsheetService
             if (array_key_exists('notes', $data)) {
                 if (mb_strlen($data['notes']) > 2000) $errors[] = $this->errorRow($line, $code, 'notes', 'Notes maksimal 2000 karakter.');
                 else $attributes['notes'] = $data['notes'] !== '' ? $data['notes'] : null;
+            }
+            if (array_key_exists('sku_type', $data)) {
+                $type = strtolower(trim((string) $data['sku_type']));
+                if ($type !== '' && ! in_array($type, ['bar', 'kitchen'], true)) $errors[] = $this->errorRow($line, $code, 'sku_type', 'Hanya bar atau kitchen.');
+                else $attributes['sku_type'] = $type === '' ? null : $type;
             }
             if (array_key_exists('is_active', $data)) {
                 $boolean = $this->booleanValue($data['is_active']);
@@ -343,6 +351,7 @@ class StockSkuSpreadsheetService
             'barcode' => ['barcode', 'kode barcode'],
             'notes' => ['notes', 'note', 'catatan'],
             'is_active' => ['is_active', 'aktif', 'status aktif', 'status'],
+            'sku_type' => ['sku_type', 'type', 'tipe', 'bar kitchen'],
         ];
         $lookup = [];
         foreach ($aliases as $canonical => $values) {

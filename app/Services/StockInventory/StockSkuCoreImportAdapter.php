@@ -23,6 +23,7 @@ final class StockSkuCoreImportAdapter
             'uom_code' => ['uom_code', 'kode uom', 'kode_uom', 'uom', 'satuan'],
             'barcode' => ['barcode', 'kode barcode'],
             'notes' => ['notes', 'note', 'catatan'],
+            'sku_type' => ['sku_type', 'type', 'tipe', 'bar kitchen'],
             'is_active' => ['is_active', 'aktif', 'status aktif', 'status'],
         ];
     }
@@ -84,6 +85,11 @@ final class StockSkuCoreImportAdapter
             $notes = trim((string) $data['notes']);
             if (strlen($notes) > 2000) $errors[] = $this->error('notes', $notes, 'Notes maksimal 2000 karakter.');
             else $attributes['notes'] = $notes !== '' ? $notes : null;
+        }
+        if (array_key_exists('sku_type', $data)) {
+            $type = strtolower(trim((string) $data['sku_type']));
+            if ($type !== '' && ! in_array($type, ['bar', 'kitchen'], true)) $errors[] = $this->error('sku_type', $type, 'Gunakan bar atau kitchen.');
+            else $attributes['sku_type'] = $type === '' ? null : $type;
         }
         if (array_key_exists('is_active', $data)) {
             $active = $this->booleanValue((string) $data['is_active']);

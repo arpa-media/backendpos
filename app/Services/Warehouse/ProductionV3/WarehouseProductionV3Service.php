@@ -8,6 +8,8 @@ use App\Services\Warehouse\Iteration07\WarehouseProductionMaterialOpnameV7Servic
 use App\Services\Warehouse\SalesV3\WarehouseSalesDemandV3Service;
 use App\Services\Warehouse\WarehouseLedgerService;
 use App\Services\Warehouse\WarehouseProductionService;
+use App\Services\Warehouse\Support\WarehouseTransactionUomService;
+use App\Services\Warehouse\ProductionV13\ProductionCostStateI21Service;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -20,6 +22,8 @@ class WarehouseProductionV3Service
         private readonly WarehouseSalesDemandV3Service $sales,
         private readonly WarehouseLedgerService $ledger,
         private readonly WarehouseProductionMaterialOpnameV7Service $productionOpname,
+        private readonly ProductionCostStateI21Service $costState,
+        private readonly WarehouseTransactionUomService $transactionUoms,
     ) {
     }
 
@@ -27,6 +31,10 @@ class WarehouseProductionV3Service
     {
         $options = $this->core->options($warehouseId);
         $options['flow_version'] = 7;
+        // Existing independent production material stock; a single bulk query, not N+1 per SKU.
+        $options['production_stock_available'] = DB::table('wh_v7_production_stock_balances')
+            ->where('warehouse_id', $warehouseId)->where('qty_base', '>', 0)
+            ->pluck('qty_base','sku_id')->all();
         return $options;
     }
 
@@ -129,6 +137,7 @@ class WarehouseProductionV3Service
             ->map(fn ($row) => $this->resultRow($row, true))->values()->all();
 
         return [
+            'cost_state' => $this->costState->detail($warehouseId, $id),
             'id'=>(string)$production->id,'production_number'=>(string)$production->production_number,'production_date'=>$production->production_date,
             'status'=>(string)$production->status,'flow_version'=>(int)($production->flow_version ?? 2),'notes'=>$production->notes,
             'planned_input_value'=>(float)$production->planned_input_value,'actual_input_value'=>(float)$production->actual_input_value,
@@ -217,12 +226,41 @@ class WarehouseProductionV3Service
                 $qtyUom = round((float)($line['qty_uom'] ?? 0),4);
                 if ($qtyUom < 0) throw ValidationException::withMessages(["items.{$index}.qty_uom"=>['Qty hasil tidak boleh negatif.']]);
                 if ($qtyUom <= 0) continue;
+
+                // I06: older clients omit uom_id. Preserve the order's original
+                // conversion snapshot for their payloads and for the same selected UOM.
+                // When the operator chooses a DIFFERENT UOM, resolve it from this SKU's
+                // active transaction-UOM catalog. Never trust a factor supplied by UI.
+                $chosenUomId = trim((string)($line['uom_id'] ?? $output->output_uom_id));
+                if ($chosenUomId === '') {
+                    throw ValidationException::withMessages(["items.{$index}.uom_id"=>['Pilih UOM hasil produksi.']]);
+                }
+                if ($chosenUomId === (string)$output->output_uom_id) {
+                    $unit = [
+                        'uom_id'=>(string)$output->output_uom_id,
+                        'uom_code'=>(string)$output->output_uom_code_snapshot,
+                        'uom_name'=>(string)$output->output_uom_name_snapshot,
+                        'conversion_factor'=>(float)$output->conversion_factor_snapshot,
+                        'base_uom_id'=>(string)$output->base_uom_id,
+                        'base_uom_code'=>(string)$output->base_uom_code_snapshot,
+                        'base_uom_name'=>(string)$output->base_uom_name_snapshot,
+                    ];
+                } else {
+                    // resolve() rejects unmapped or inactive SKU/UOM combinations.
+                    $unit = $this->transactionUoms->resolve((string)$output->sku_id, $chosenUomId);
+                    if ((string)$unit['base_uom_id'] !== (string)$output->base_uom_id) {
+                        throw ValidationException::withMessages(["items.{$index}.uom_id"=>['Base UOM SKU tidak sama dengan snapshot Production Order.']]);
+                    }
+                }
+                $factor = (float)$unit['conversion_factor'];
+                if ($factor <= 0) throw ValidationException::withMessages(["items.{$index}.uom_id"=>['Faktor konversi UOM tidak valid.']]);
+                $qtyBase = round($qtyUom * $factor,4);
+                if ($qtyBase <= 0) throw ValidationException::withMessages(["items.{$index}.qty_uom"=>['Qty hasil terlalu kecil setelah konversi ke Base UOM (presisi 4 desimal).']]);
                 $positive++;
-                $qtyBase = round($qtyUom * (float)$output->conversion_factor_snapshot,4);
                 DB::table('wh_v3_production_result_items')->insert([
-                    'id'=>(string)Str::ulid(),'result_id'=>$id,'production_output_id'=>$output->id,'sku_id'=>$output->sku_id,'uom_id'=>$output->output_uom_id,
-                    'uom_code_snapshot'=>$output->output_uom_code_snapshot,'uom_name_snapshot'=>$output->output_uom_name_snapshot,
-                    'qty_uom'=>$qtyUom,'conversion_factor_snapshot'=>$output->conversion_factor_snapshot,'base_uom_id_snapshot'=>$output->base_uom_id,'base_uom_code_snapshot'=>$output->base_uom_code_snapshot,'base_uom_name_snapshot'=>$output->base_uom_name_snapshot,'qty_base'=>$qtyBase,'storage_id'=>$line['storage_id'] ?? null,
+                    'id'=>(string)Str::ulid(),'result_id'=>$id,'production_output_id'=>$output->id,'sku_id'=>$output->sku_id,'uom_id'=>$unit['uom_id'],
+                    'uom_code_snapshot'=>$unit['uom_code'],'uom_name_snapshot'=>$unit['uom_name'],
+                    'qty_uom'=>$qtyUom,'conversion_factor_snapshot'=>$factor,'base_uom_id_snapshot'=>$unit['base_uom_id'],'base_uom_code_snapshot'=>$unit['base_uom_code'],'base_uom_name_snapshot'=>$unit['base_uom_name'],'qty_base'=>$qtyBase,'storage_id'=>$line['storage_id'] ?? null,
                     'unit_cost_snapshot'=>0,'total_cost_snapshot'=>0,'status'=>'draft','notes'=>$line['notes'] ?? null,'created_at'=>$now,'updated_at'=>$now,
                 ]);
             }
@@ -301,7 +339,7 @@ class WarehouseProductionV3Service
             $production = DB::table('wh_productions')->where('warehouse_id',$warehouseId)->where('id',$productionId)->lockForUpdate()->first();
             if (! $production) abort(404);
             if ((string)$production->status !== 'on_progress') throw ValidationException::withMessages(['status'=>['Production Order tidak lagi ongoing.']]);
-            $this->productionOpname->requireFinalizedBeforeResult($productionId);
+            // V13 I21: approved results may precede material opname. Cost is provisional until reconciled.
             $result = DB::table('wh_v3_production_results')->where('production_id',$productionId)->where('id',$resultId)->lockForUpdate()->first();
             if (! $result) abort(404);
             if ((string)$result->status === 'approved' && $result->ledger_posting_id) return;
@@ -310,8 +348,11 @@ class WarehouseProductionV3Service
             $items = DB::table('wh_v3_production_result_items')->where('result_id',$resultId)->where('qty_base','>',0)->lockForUpdate()->get();
             if ($items->isEmpty()) throw ValidationException::withMessages(['items'=>['Tidak ada hasil produksi positif.']]);
             $estimatedTotal = (float) DB::table('wh_production_outputs')->where('production_id',$productionId)->sum('estimated_qty_base');
-            $costPool = max((float)$production->actual_input_value + (float)($production->labor_cost ?? 0) + (float)($production->overhead_cost ?? 0), 0);
-            $defaultUnitCost = $estimatedTotal > 0 ? round($costPool / $estimatedTotal, 6) : 0.0;
+            $costPool = $this->costState->estimatePool($warehouseId, $productionId, $production);
+            if ($estimatedTotal <= 0 || $costPool <= 0) {
+                throw ValidationException::withMessages(['cost' => ['Nilai bahan atau estimasi output belum cukup untuk posting hasil. Lengkapi valuasi material lebih dahulu.']]);
+            }
+            $defaultUnitCost = round($costPool / $estimatedTotal, 6);
             $ledgerLines = []; $snapshot = []; $totalQty = 0.0; $totalValue = 0.0;
 
             foreach ($items as $item) {
@@ -364,11 +405,14 @@ class WarehouseProductionV3Service
             foreach ($items as $item) {
                 $sumBase = (float) DB::table('wh_v3_production_result_items as ri')->join('wh_v3_production_results as r','r.id','=','ri.result_id')
                     ->where('r.production_id',$productionId)->where('r.status','approved')->where('ri.production_output_id',$item->production_output_id)->sum('ri.qty_base');
-                $sumUom = (float) DB::table('wh_v3_production_result_items as ri')->join('wh_v3_production_results as r','r.id','=','ri.result_id')
-                    ->where('r.production_id',$productionId)->where('r.status','approved')->where('ri.production_output_id',$item->production_output_id)->sum('ri.qty_uom');
                 $output = DB::table('wh_production_outputs')->where('id',$item->production_output_id)->first();
+                // Results can now mix UOMs (e.g. PCS and BOX). Never SUM their raw qty_uom:
+                // aggregate BASE quantities and convert back to the order's output UOM.
+                $orderFactor = (float)$output->conversion_factor_snapshot;
+                if ($orderFactor <= 0) throw ValidationException::withMessages(['uom_id'=>['Faktor konversi Production Order tidak valid.']]);
+                $sumUom = round($sumBase / $orderFactor, 4);
                 DB::table('wh_production_outputs')->where('id',$item->production_output_id)->update([
-                    'actual_qty_base'=>round($sumBase,4),'actual_qty_uom'=>round($sumUom,4),'yield_variance_qty_base'=>round($sumBase-(float)$output->estimated_qty_base,4),
+                    'actual_qty_base'=>round($sumBase,4),'actual_qty_uom'=>$sumUom,'yield_variance_qty_base'=>round($sumBase-(float)$output->estimated_qty_base,4),
                     'actual_unit_cost'=>$defaultUnitCost,'allocated_cost'=>round($sumBase*$defaultUnitCost,2),
                     'status'=>$sumBase+0.0001 >= (float)$output->estimated_qty_base ? 'produced' : 'partially_produced','updated_at'=>now(),
                 ]);
@@ -378,6 +422,7 @@ class WarehouseProductionV3Service
                 'actual_output_value'=>round($actualOutputValue,2),'output_ledger_posting_id'=>$production->output_ledger_posting_id ?: $posting->id,
                 'updated_by_user_id'=>$userId,'lock_version'=>DB::raw('lock_version + 1'),'updated_at'=>now(),
             ]);
+            $this->costState->sync($warehouseId, $productionId);
             $this->event($productionId,'production_result_approved',$userId,['result_id'=>$resultId,'result_number'=>$result->result_number,'ledger_posting_id'=>(string)$posting->id,'qty_base'=>round($totalQty,4),'inventory_value'=>round($totalValue,2)],'PROD-V3-RESULT-APPROVED:'.$resultId);
         },5);
         return $this->resultDetail($warehouseId,$productionId,$resultId);
@@ -390,7 +435,7 @@ class WarehouseProductionV3Service
             if (! $production) abort(404);
             if (in_array((string)$production->status,['completed','approved'],true)) return;
             if ((string)$production->status !== 'on_progress') throw ValidationException::withMessages(['status'=>['Hanya ongoing production yang dapat di-finish.']]);
-            $this->productionOpname->requireFinalizedBeforeResult($productionId);
+            // Production can finish independently; COGS remains provisional until opname and reconciliation.
             if (DB::table('wh_v3_production_results')->where('production_id',$productionId)->where('status','draft')->exists()) {
                 throw ValidationException::withMessages(['results'=>['Masih ada hasil produksi draft. Approve atau hapus draft sebelum Production Finished.']]);
             }
@@ -412,6 +457,7 @@ class WarehouseProductionV3Service
                 'notes'=>trim((string)($payload['notes'] ?? '')) !== '' ? $payload['notes'] : $production->notes,
                 'updated_by_user_id'=>$userId,'lock_version'=>DB::raw('lock_version + 1'),'updated_at'=>now(),
             ]);
+            $this->costState->sync($warehouseId, $productionId);
             $this->event($productionId,'production_finished',$userId,['reconciliation'=>$recon,'notes'=>$payload['notes'] ?? null],'PROD-V3-FINISHED:'.$productionId);
         },5);
         return $this->detail($warehouseId,$productionId);
@@ -445,7 +491,7 @@ class WarehouseProductionV3Service
                     'id'=>(string)$item->id,'production_output_id'=>(string)$item->production_output_id,'sku_id'=>(string)$item->sku_id,'sku_code'=>(string)$item->sku_code,
                     'item_name'=>(string)$item->item_name,'uom_id'=>(string)$item->uom_id,'uom_code'=>(string)($item->uom_code_snapshot ?: $item->uom_code ?: 'UNIT'),'uom_name'=>(string)($item->uom_name_snapshot ?: 'Unit'),'qty_uom'=>(float)$item->qty_uom,
                     'conversion_factor_snapshot'=>(float)$item->conversion_factor_snapshot,'base_uom_id'=>$item->base_uom_id_snapshot,'base_uom_code'=>(string)($item->base_uom_code_snapshot ?: 'UNIT'),'base_uom_name'=>(string)($item->base_uom_name_snapshot ?: 'Unit'),'qty_base'=>(float)$item->qty_base,'storage_id'=>$item->storage_id,'storage_code'=>$item->storage_code,'storage_name'=>$item->storage_name,'batch_id'=>$item->batch_id,
-                    'batch_code'=>$item->batch_code,'unit_cost_snapshot'=>(float)$item->unit_cost_snapshot,'total_cost_snapshot'=>(float)$item->total_cost_snapshot,'status'=>(string)$item->status,'notes'=>$item->notes,
+                    'batch_code'=>$item->batch_code,'unit_cost_snapshot'=>(float)$item->unit_cost_snapshot,'total_cost_snapshot'=>(float)$item->total_cost_snapshot,'price_band_snapshot'=>$item->price_band_snapshot ?? null,'price_snapshot'=>isset($item->price_snapshot) ? (float)$item->price_snapshot : null,'status'=>(string)$item->status,'notes'=>$item->notes,
                 ])->values()->all();
         }
         return $data;

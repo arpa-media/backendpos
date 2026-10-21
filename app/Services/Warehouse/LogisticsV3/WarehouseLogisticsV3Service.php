@@ -57,13 +57,19 @@ class WarehouseLogisticsV3Service
     public function listPrepare(string $warehouseId, array $filters): array
     {
         $query = DB::table('wh_v3_logistics_prepare_requests as p')
-            ->leftJoin('wh_v3_delivery_orders as d', 'd.prepare_request_id', '=', 'p.id')
             ->leftJoin('stk_requests as source_request', function ($join): void {
                 $join->on('source_request.id', '=', 'p.source_id')
                     ->where('p.source_type', '=', 'stock_request');
             })
             ->where('p.warehouse_id', $warehouseId)
-            ->select('p.*', 'd.id as delivery_order_id', 'd.delivery_number', 'd.status as delivery_status', 'source_request.request_date as source_request_date')
+            ->select('p.*', 'source_request.request_date as source_request_date')
+            // Correlated latest DO prevents duplicating Checker rows after partial dispatch.
+            ->selectSub(fn ($q) => $q->from('wh_v3_delivery_orders as d')
+                ->whereColumn('d.prepare_request_id', 'p.id')->orderByDesc('d.created_at')->orderByDesc('d.id')->limit(1)->select('d.id'), 'delivery_order_id')
+            ->selectSub(fn ($q) => $q->from('wh_v3_delivery_orders as d')
+                ->whereColumn('d.prepare_request_id', 'p.id')->orderByDesc('d.created_at')->orderByDesc('d.id')->limit(1)->select('d.delivery_number'), 'delivery_number')
+            ->selectSub(fn ($q) => $q->from('wh_v3_delivery_orders as d')
+                ->whereColumn('d.prepare_request_id', 'p.id')->orderByDesc('d.created_at')->orderByDesc('d.id')->limit(1)->select('d.status'), 'delivery_status')
             ->selectSub(fn ($q) => $q->from('wh_v3_logistics_prepare_items as i')->whereColumn('i.prepare_request_id', 'p.id')->selectRaw('COUNT(*)'), 'line_count')
             ->selectSub(fn ($q) => $q->from('wh_v3_logistics_prepare_items as i')->whereColumn('i.prepare_request_id', 'p.id')->selectRaw('COALESCE(SUM(i.approved_qty_base),0)'), 'approved_qty_base');
         if (! empty($filters['q'])) {
@@ -133,26 +139,40 @@ class WarehouseLogisticsV3Service
     {
         $p = DB::table('wh_v3_logistics_prepare_requests')->where('warehouse_id',$warehouseId)->where('id',$id)->first();
         if (! $p) abort(404);
-        $do = DB::table('wh_v3_delivery_orders')->where('prepare_request_id',$id)->first();
+        $dos = DB::table('wh_v3_delivery_orders')->where('prepare_request_id',$id)
+            ->orderByDesc('created_at')->orderByDesc('id')->get(['id','delivery_number','status','created_at']);
+        $do = $dos->first();
+        $sentByItem = DB::table('wh_v3_delivery_order_items as di')
+            ->join('wh_v3_delivery_orders as d', 'd.id', '=', 'di.delivery_order_id')
+            ->where('d.prepare_request_id', $id)->groupBy('di.prepare_item_id')
+            ->selectRaw('di.prepare_item_id, COALESCE(SUM(di.sent_qty_base),0) as sent_qty_base')
+            ->pluck('sent_qty_base', 'prepare_item_id');
         $items = DB::table('wh_v3_logistics_prepare_items as i')
             ->join('stk_skus as s','s.id','=','i.sku_id')->leftJoin('stk_uoms as u','u.id','=','i.uom_id')
             ->where('i.prepare_request_id',$id)->orderBy('s.name')
-            ->get(['i.*','s.sku_code','s.name as item_name','u.code as uom_code'])
-            ->map(function ($i) use ($warehouseId): array {
+            ->get(['i.*','s.sku_code','s.name as item_name','u.code as uom_code','u.decimal_places as uom_decimal_places'])
+            ->map(function ($i) use ($warehouseId, $sentByItem): array {
                 $available = (float) (DB::table('stk_inventory_balances')->where('outlet_id',$warehouseId)->where('sku_id',$i->sku_id)->value('on_hand_qty') ?? 0);
+                $sentBase = round((float) $sentByItem->get((string) $i->id, 0), 4);
+                $remainingBase = max(0, round((float) $i->approved_qty_base - $sentBase, 4));
                 return [
+                    'remaining_qty_base'=>$remainingBase,
+                    'remaining_qty_uom'=>round($this->baseToUom($remainingBase,(float)$i->approved_qty_base,(float)$i->approved_qty_uom),4),
                     'id'=>(string)$i->id,'sku_id'=>(string)$i->sku_id,'sku_code'=>(string)$i->sku_code,'item_name'=>(string)$i->item_name,
                     'uom_code'=>(string)($i->uom_code ?: 'UNIT'),'requested_qty_uom'=>round((float)$i->requested_qty_uom,4),
                     'requested_qty_base'=>round((float)$i->requested_qty_base,4),'approved_qty_uom'=>round((float)$i->approved_qty_uom,4),
-                    'approved_qty_base'=>round((float)$i->approved_qty_base,4),'sent_qty_uom'=>round($this->baseToUom((float)$i->ready_qty_base,(float)$i->approved_qty_base,(float)$i->approved_qty_uom),4),
-                    'sent_qty_base'=>round((float)$i->ready_qty_base,4),'warehouse_on_hand_qty'=>round($available,4),'status'=>(string)$i->status,'notes'=>$i->notes,
+                    'approved_qty_base'=>round((float)$i->approved_qty_base,4),'sent_qty_uom'=>round($this->baseToUom($sentBase,(float)$i->approved_qty_base,(float)$i->approved_qty_uom),4),
+                    'sent_qty_base'=>$sentBase,'warehouse_on_hand_qty'=>round($available,4),'status'=>(string)$i->status,'notes'=>$i->notes,
                 ];
             })->values()->all();
         return [
             'id'=>(string)$p->id,'prepare_number'=>(string)$p->prepare_number,'source_type'=>(string)$p->source_type,'source_id'=>(string)$p->source_id,
             'source_number'=>$p->source_number,'destination_type'=>$p->destination_type,'destination_id'=>$p->destination_id,
             'destination'=>$this->destination($p->destination_type,$p->destination_id),'status'=>(string)$p->status,'requested_delivery_date'=>$p->requested_delivery_date,
-            'metadata'=>$this->json($p->metadata),'items'=>$items,'delivery_order'=>$do ? ['id'=>(string)$do->id,'delivery_number'=>(string)$do->delivery_number,'status'=>(string)$do->status] : null,
+            'metadata'=>$this->json($p->metadata),'items'=>$items,
+            'outstanding_qty_base'=>round(collect($items)->sum('remaining_qty_base'),4),
+            'delivery_orders'=>$dos->map(fn ($row) => ['id'=>(string)$row->id,'delivery_number'=>(string)$row->delivery_number,'status'=>(string)$row->status])->values()->all(),
+            'delivery_order'=>$do ? ['id'=>(string)$do->id,'delivery_number'=>(string)$do->delivery_number,'status'=>(string)$do->status] : null,
             'timeline'=>$this->events('prepare_request',(string)$p->id),
         ];
     }
@@ -162,8 +182,17 @@ class WarehouseLogisticsV3Service
         $deliveryId = DB::transaction(function () use ($warehouseId,$prepareId,$payload,$userId): string {
             $prepare = DB::table('wh_v3_logistics_prepare_requests')->where('warehouse_id',$warehouseId)->where('id',$prepareId)->lockForUpdate()->first();
             if (! $prepare) abort(404);
-            $existing = DB::table('wh_v3_delivery_orders')->where('prepare_request_id',$prepareId)->lockForUpdate()->first();
-            if ($existing) return (string) $existing->id;
+            $stockRequest = (string) $prepare->source_type === 'stock_request';
+            $requestKey = trim((string) ($payload['idempotency_key'] ?? ''));
+            $existing = DB::table('wh_v3_delivery_orders')->where('prepare_request_id',$prepareId)
+                ->orderByDesc('created_at')->orderByDesc('id')->lockForUpdate()->first();
+            // Old clients never supply an I04 key: preserve legacy retry semantics (no second DO).
+            if ($existing && (!$stockRequest || $requestKey === '')) return (string) $existing->id;
+            if ($existing && $requestKey !== '') {
+                $matched = DB::table('wh_v3_delivery_orders')->where('prepare_request_id',$prepareId)
+                    ->where('dispatch_request_key',$requestKey)->first();
+                if ($matched) return (string) $matched->id;
+            }
             if (! in_array((string)$prepare->status,['queued','preparing'],true)) {
                 throw ValidationException::withMessages(['status'=>['Checker Prepare sudah diproses atau tidak lagi dapat dibuatkan Delivery Order.']]);
             }
@@ -171,6 +200,14 @@ class WarehouseLogisticsV3Service
             $inputMap = collect($payload['items'] ?? [])->keyBy(fn ($row)=>(string)($row['item_id']??''));
             $prepareItems = DB::table('wh_v3_logistics_prepare_items')->where('prepare_request_id',$prepareId)->lockForUpdate()->get();
             if ($prepareItems->isEmpty()) throw ValidationException::withMessages(['items'=>['Checker Prepare tidak memiliki item.']]);
+            // All dispatched quantities are counted across *all* DOs for this prepare.
+            // Parent row lock above serializes concurrent dispatch and bounds outstanding.
+            $sentByItem = $stockRequest ? DB::table('wh_v3_delivery_order_items as di')
+                ->join('wh_v3_delivery_orders as d', 'd.id', '=', 'di.delivery_order_id')
+                ->where('d.prepare_request_id', $prepareId)
+                ->groupBy('di.prepare_item_id')
+                ->selectRaw('di.prepare_item_id, COALESCE(SUM(di.sent_qty_base),0) as sent_qty_base')
+                ->pluck('sent_qty_base', 'prepare_item_id') : collect();
 
             $destination = $this->destination($prepare->destination_type,$prepare->destination_id);
             $isSalesCustomer = false;
@@ -208,6 +245,7 @@ class WarehouseLogisticsV3Service
             $deliveryId = (string) Str::ulid();
             DB::table('wh_v3_delivery_orders')->insert([
                 'id'=>$deliveryId,'delivery_number'=>$this->number('DO'),'prepare_request_id'=>$prepareId,'warehouse_id'=>$warehouseId,
+                'dispatch_request_key'=>$stockRequest && $requestKey !== '' ? $requestKey : null,
                 'source_type'=>$prepare->source_type,'source_id'=>$prepare->source_id,'source_number'=>$prepare->source_number,
                 'destination_type'=>$prepare->destination_type,'destination_id'=>$prepare->destination_id,
                 'destination_code_snapshot'=>$destination['code']??null,'destination_name_snapshot'=>$destination['name']??null,'destination_address_snapshot'=>$destination['address']??null,
@@ -222,26 +260,43 @@ class WarehouseLogisticsV3Service
             ]);
             $positive = 0;
             $dispatchBySku = [];
+            $allDispatched = true;
             foreach ($prepareItems as $item) {
                 $input = $inputMap->get((string)$item->id);
                 if (! $input) throw ValidationException::withMessages(['items'=>['Seluruh item Checker Prepare wajib memiliki Qty Dikirim.']]);
                 $approvedUom = round((float)$item->approved_qty_uom,4);
                 $approvedBase = round((float)$item->approved_qty_base,4);
                 $sentUom = round((float)($input['sent_qty_uom'] ?? 0),4);
-                if ($sentUom < 0 || $sentUom > $approvedUom + 0.0001) {
-                    throw ValidationException::withMessages(['items'=>["Qty dikirim item {$item->id} harus antara 0 dan Approved Qty."]]);
-                }
+                $alreadySent = $stockRequest ? round((float)$sentByItem->get((string)$item->id, 0),4) : 0.0;
+                $outstandingBase = max(0, round($approvedBase-$alreadySent,4));
                 $factor = $approvedUom > 0 ? $approvedBase / $approvedUom : 1.0;
                 $sentBase = round($sentUom*$factor,4);
+                if ($sentUom < 0 || $sentBase < 0 || $sentBase > $outstandingBase + 0.0001 || $sentUom > $approvedUom + 0.0001) {
+                    throw ValidationException::withMessages(['items'=>["Qty Dikirim item {$item->id} melebihi sisa approved; outstanding {$outstandingBase} base UOM."]]);
+                }
+                $cumulative = round($alreadySent + $sentBase,4);
+                if ($cumulative < $approvedBase - 0.0001) $allDispatched = false;
                 if ($sentBase > 0) { $positive++; $dispatchBySku[(string)$item->sku_id] = round(($dispatchBySku[(string)$item->sku_id] ?? 0) + $sentBase, 4); }
+                // Don't create zero-quantity DO lines for stock requests: each DO represents only dispatched goods.
+                if ($stockRequest && $sentBase <= 0.0001) {
+                    DB::table('wh_v3_logistics_prepare_items')->where('id',$item->id)->update([
+                        'ready_qty_base'=>$cumulative,'status'=>$cumulative>0?'partially_dispatched':'queued','updated_at'=>now(),
+                    ]);
+                    continue;
+                }
                 DB::table('wh_v3_delivery_order_items')->insert([
                     'id'=>(string)Str::ulid(),'delivery_order_id'=>$deliveryId,'prepare_item_id'=>$item->id,'source_item_id'=>$item->source_item_id,
-                    'sku_id'=>$item->sku_id,'uom_id'=>$item->uom_id,'requested_qty_uom'=>$item->requested_qty_uom,'requested_qty_base'=>$item->requested_qty_base,
-                    'approved_qty_uom'=>$approvedUom,'approved_qty_base'=>$approvedBase,'sent_qty_uom'=>$sentUom,'sent_qty_base'=>$sentBase,
+                    'sku_id'=>$item->sku_id,'uom_id'=>$item->uom_id,
+                    'requested_qty_uom'=>$stockRequest?$sentUom:$item->requested_qty_uom,
+                    'requested_qty_base'=>$stockRequest?$sentBase:$item->requested_qty_base,
+                    'approved_qty_uom'=>$stockRequest?$sentUom:$approvedUom,'approved_qty_base'=>$stockRequest?$sentBase:$approvedBase,
+                    'sent_qty_uom'=>$sentUom,'sent_qty_base'=>$sentBase,
                     'metadata'=>json_encode(['notes'=>$input['notes']??null,'barcode_used'=>false]),'created_at'=>now(),'updated_at'=>now(),
                 ]);
                 DB::table('wh_v3_logistics_prepare_items')->where('id',$item->id)->update([
-                    'ready_qty_base'=>$sentBase,'status'=>$sentBase>0?'dispatched':'not_dispatched','notes'=>$input['notes']??$item->notes,'updated_at'=>now(),
+                    'ready_qty_base'=>$stockRequest?$cumulative:$sentBase,
+                    'status'=>$stockRequest?($cumulative >= $approvedBase-0.0001?'dispatched':'partially_dispatched'):($sentBase>0?'dispatched':'not_dispatched'),
+                    'notes'=>$input['notes']??$item->notes,'updated_at'=>now(),
                 ]);
             }
             if ($positive === 0) throw ValidationException::withMessages(['items'=>['Minimal satu item harus memiliki Qty Dikirim lebih besar dari nol.']]);
@@ -254,12 +309,14 @@ class WarehouseLogisticsV3Service
                 ? null
                 : $this->dispatchStock->ensurePosted($warehouseId,$deliveryId,$userId);
 
-            DB::table('wh_v3_logistics_prepare_requests')->where('id',$prepareId)->update(['status'=>'dispatched','updated_at'=>now()]);
+            $newStatus = $stockRequest && ! $allDispatched ? 'preparing' : 'dispatched';
+            DB::table('wh_v3_logistics_prepare_requests')->where('id',$prepareId)->update(['status'=>$newStatus,'updated_at'=>now()]);
             $message = (string)$prepare->source_type === 'transfer_stock'
                 ? 'Delivery Order Transfer digenerate. transfer_out tetap ditangani flow Transfer v4.'
                 : 'Delivery Order digenerate. Actual Stock Warehouse langsung berkurang pada DO Dispatch.';
             $meta=['delivery_order_id'=>$deliveryId]; if($dispatchPosting) $meta['dispatch_ledger_posting_id']=(string)$dispatchPosting->id;
-            $this->event('prepare_request',$prepareId,'delivery_order_generated',(string)$prepare->status,'dispatched',$message,$userId,$meta);
+            $meta['partial_dispatch'] = $stockRequest && ! $allDispatched;
+            $this->event('prepare_request',$prepareId,'delivery_order_generated',(string)$prepare->status,$newStatus,$message,$userId,$meta);
             $this->event('delivery_order',$deliveryId,'dispatched',null,'dispatched',$message,$userId,['prepare_request_id'=>$prepareId]+$meta);
             if ($prepare->source_type === 'stock_request') $this->updateStockRequestStatus((string)$prepare->source_id,'on-delivery','warehouse_v3_delivery_order_generated','Delivery Order sudah digenerate dan sedang dikirim.',$userId,['delivery_order_id'=>$deliveryId]);
             return $deliveryId;
@@ -477,12 +534,19 @@ class WarehouseLogisticsV3Service
             if(in_array((string)$g->status,['submitted','completed'],true)) return;
             $byId=collect($payload['items']??[])->keyBy(fn($r)=>(string)($r['item_id']??''));
             $items=DB::table('wh_v3_goods_receipt_items')->where('goods_receipt_id',$g->id)->lockForUpdate()->get();
+            // The UI cannot be trusted for UOM decimals; validate on the server as well.
+            $uomPrecision = DB::table('stk_uoms')->whereIn('id', $items->pluck('uom_id')->filter()->unique()->all())->pluck('decimal_places','id');
             foreach($items as $item){
                 $input=$byId->get((string)$item->id);if(!$input)throw ValidationException::withMessages(['items'=>['Seluruh item wajib diisi Actual Qty diterima.']]);
                 $receivedUom=round((float)($input['received_qty_uom']??0),4);$sentUom=round((float)$item->sent_qty_uom,4);
                 $notUom=array_key_exists('not_received_qty_uom',$input)?round((float)$input['not_received_qty_uom'],4):round($sentUom-$receivedUom,4);
                 if($receivedUom<0||$notUom<0||$receivedUom>$sentUom+0.0001||$notUom>$sentUom+0.0001)throw ValidationException::withMessages(['items'=>["Qty diterima/tidak diterima tidak valid untuk item {$item->id}."]]);
                 if(abs(($receivedUom+$notUom)-$sentUom)>0.0001)throw ValidationException::withMessages(['items'=>["Qty Diterima + Qty Tidak Diterima harus sama dengan Qty Dikirim untuk item {$item->id}."]]);
+                $precision = min(4, max(0, (int) ($uomPrecision->get((string) $item->uom_id) ?? 4)));
+                $scale = 10 ** $precision;
+                if (abs(round($receivedUom * $scale) - $receivedUom * $scale) > 0.00001 || abs(round($notUom * $scale) - $notUom * $scale) > 0.00001) {
+                    throw ValidationException::withMessages(['items'=>["Qty diterima harus sesuai presisi satuan ({$precision} desimal) untuk item {$item->id}."]]);
+                }
                 $factor=$sentUom>0?(float)$item->sent_qty_base/$sentUom:1.0;$receivedBase=round($receivedUom*$factor,4);
                 $notBase=round($notUom*$factor,4);
                 DB::table('wh_v3_goods_receipt_items')->where('id',$item->id)->update([
@@ -495,8 +559,20 @@ class WarehouseLogisticsV3Service
                 'status'=>'submitted','receipt_date'=>$receiptDate,'received_at'=>now(),'receiver_user_id'=>$userId,
                 'receiver_name_snapshot'=>$receiver?->name ?: 'Receiver','receiver_signed_at'=>now(),'notes'=>$payload['notes']??null,'updated_at'=>now(),
             ]);
+            // I15: the outlet stock is posted at receiver confirmation (SUBMITTED),
+            // not delayed until Warehouse finishes the GR paperwork. Source DO
+            // dispatch already posted Warehouse OUT. Legacy non-transfer DOs are
+            // backfilled idempotently by the dispatch service before crediting.
+            // Transfer Stock is owned by transfer v4: never post it in this bridge.
+            if ((string) $d->source_type !== 'transfer_stock') {
+                $dispatchPosting = $this->dispatchStock->ensurePosted((string) $d->warehouse_id, (string) $d->id, $userId);
+                $fresh = DB::table('wh_v3_goods_receipts')->where('id',$g->id)->first();
+                $receivedItems = DB::table('wh_v3_goods_receipt_items')->where('goods_receipt_id',$g->id)->orderBy('sku_id')->orderBy('id')->get();
+                $this->postDestinationInventory($fresh, $receivedItems, (string) $dispatchPosting->id, $userId);
+                DB::table('wh_v3_goods_receipts')->where('id',$g->id)->update(['ledger_posting_id'=>$dispatchPosting->id,'updated_at'=>now()]);
+            }
             DB::table('wh_v3_delivery_orders')->where('id',$deliveryId)->update(['status'=>'receiving','updated_at'=>now()]);
-            $this->event('goods_receipt',(string)$g->id,'outlet_received','draft','submitted','Outlet menginput actual received/not received tanpa scan barcode.',$userId,['delivery_order_id'=>$deliveryId]);
+            $this->event('goods_receipt',(string)$g->id,'outlet_received','draft','submitted','Outlet mengonfirmasi qty actual diterima; stok outlet diposting satu kali untuk DO non-transfer.',$userId,['delivery_order_id'=>$deliveryId]);
             if($d->source_type==='stock_request')$this->updateStockRequestStatus((string)$d->source_id,'goods-receipt','warehouse_v3_outlet_received','Outlet sudah menerima Delivery Order. Goods Receipt menunggu Complete Warehouse.',$userId,['goods_receipt_id'=>(string)$g->id]);
         },5);
         return $this->outletDeliveryDetail($outletId,$deliveryId);
@@ -529,6 +605,8 @@ class WarehouseLogisticsV3Service
                 : $this->dispatchStock->ensurePosted($warehouseId,(string)$d->id,$userId);
             if(!$posting) throw ValidationException::withMessages(['stock_ledger'=>['Posting stock OUT Delivery Order belum tersedia.']]);
             DB::table('wh_v3_goods_receipts')->where('id',$id)->update(['ledger_posting_id'=>$posting->id,'updated_at'=>now()]);
+            // Backward-compatible repair for receipts submitted before I15. For
+            // I15 receipts, the unique reference_line_id prevents a second credit.
             $this->postDestinationInventory($g,$items,(string)$posting->id,$userId);
             $invoice=$this->ensureDraftOutgoingInvoice($g,$d,$items,(string)$posting->id,$userId);
             // Hanya Stock Request/outlet yang menjadi Incoming Invoice di Purchasing outlet.
@@ -544,10 +622,43 @@ class WarehouseLogisticsV3Service
             // This bridge is valuation-only and never mutates Actual Stock quantity.
             $this->cogsValuationBridge->captureCompletedReceipt($id,$userId);
             DB::table('wh_v3_delivery_orders')->where('id',$d->id)->update(['status'=>'completed','updated_at'=>now()]);
-            DB::table('wh_v3_logistics_prepare_requests')->where('id',$d->prepare_request_id)->update(['status'=>'completed','updated_at'=>now()]);
-            DB::table('wh_v3_logistics_prepare_items')->where('prepare_request_id',$d->prepare_request_id)->update(['status'=>'completed','updated_at'=>now()]);
+            $fullyFulfilled = true;
+            if ((string)$d->source_type === 'stock_request') {
+                // A receipt completes only its own DO; do not close the parent while
+                // there are outstanding quantities or other open delivery orders.
+                $parentItems = DB::table('wh_v3_logistics_prepare_items')->where('prepare_request_id',$d->prepare_request_id)
+                    ->get(['id','approved_qty_base']);
+                $sent = DB::table('wh_v3_delivery_order_items as di')
+                    ->join('wh_v3_delivery_orders as x','x.id','=','di.delivery_order_id')
+                    ->where('x.prepare_request_id',$d->prepare_request_id)
+                    ->groupBy('di.prepare_item_id')
+                    ->selectRaw('di.prepare_item_id, COALESCE(SUM(di.sent_qty_base),0) as sent_qty_base')
+                    ->pluck('sent_qty_base','prepare_item_id');
+                foreach ($parentItems as $pi) {
+                    if ((float)$pi->approved_qty_base - (float)$sent->get((string)$pi->id,0) > 0.0001) {
+                        $fullyFulfilled = false;
+                        break;
+                    }
+                }
+                $otherOpen = DB::table('wh_v3_delivery_orders')->where('prepare_request_id',$d->prepare_request_id)
+                    ->where('id','!=',$d->id)->where('status','!=','completed')->exists();
+                $fullyFulfilled = $fullyFulfilled && ! $otherOpen;
+                if ($fullyFulfilled) {
+                    DB::table('wh_v3_logistics_prepare_requests')->where('id',$d->prepare_request_id)->update(['status'=>'completed','updated_at'=>now()]);
+                    DB::table('wh_v3_logistics_prepare_items')->where('prepare_request_id',$d->prepare_request_id)->update(['status'=>'completed','updated_at'=>now()]);
+                }
+            } else {
+                DB::table('wh_v3_logistics_prepare_requests')->where('id',$d->prepare_request_id)->update(['status'=>'completed','updated_at'=>now()]);
+                DB::table('wh_v3_logistics_prepare_items')->where('prepare_request_id',$d->prepare_request_id)->update(['status'=>'completed','updated_at'=>now()]);
+            }
             $this->event('goods_receipt',$id,'completed','submitted','completed','Goods Receipt Complete. Stock origin diposting OUT dan draft Outgoing Invoice dibuat.',$userId,['ledger_posting_id'=>$posting->id,'outgoing_invoice_id'=>$invoice->id]);
-            if($d->source_type==='stock_request')$this->updateStockRequestStatus((string)$d->source_id,'completed','warehouse_v3_goods_receipt_completed','Goods Receipt Complete. Stock Request selesai.',$userId,['ledger_posting_id'=>$posting->id,'outgoing_invoice_id'=>$invoice->id]);
+            if($d->source_type==='stock_request') {
+                $nextSourceStatus = $fullyFulfilled ? 'completed' : 'on-delivery';
+                $this->updateStockRequestStatus((string)$d->source_id,$nextSourceStatus,
+                    $fullyFulfilled?'warehouse_v3_goods_receipt_completed':'warehouse_v3_partial_receipt_completed',
+                    $fullyFulfilled?'Semua Delivery Order selesai. Stock Request completed.':'Goods Receipt sebagian completed. Sisa permintaan masih outstanding.',
+                    $userId,['ledger_posting_id'=>$posting->id,'outgoing_invoice_id'=>$invoice->id,'partial'=>!$fullyFulfilled]);
+            }
         },5);
         return $this->goodsReceiptDetail($warehouseId,$id);
     }
@@ -582,12 +693,15 @@ class WarehouseLogisticsV3Service
             $qty=round((float)$item->received_qty_base,4);if($qty<=0)continue;
             if(InventoryMovement::query()->where('movement_type','goods_receipt')->where('reference_type','wh_v3_goods_receipt')->where('reference_line_id',$item->id)->exists())continue;
             $costRow=DB::table('wh_ledger_entries')->where('posting_id',$postingId)->where('line_key','like','DOITEM-'.$item->delivery_order_item_id.'-%')->selectRaw('COALESCE(SUM(total_cost),0) total_cost,COALESCE(SUM(quantity_base),0) qty')->first();
-            $unitCost=(float)($costRow?->qty??0)>0?round((float)$costRow->total_cost/(float)$costRow->qty,4):0.0;
+            if (! $costRow || abs((float) $costRow->qty) < 0.000001) {
+                throw ValidationException::withMessages(['stock_ledger'=>["Tidak ada dasar valuasi ledger DO untuk item {$item->id}. Posting receiving dibatalkan."]]);
+            }
+            $unitCost=round(abs((float)$costRow->total_cost / (float)$costRow->qty),4);
             $balance=InventoryBalance::query()->where('outlet_id',$g->destination_id)->where('sku_id',$item->sku_id)->lockForUpdate()->first();
             if(!$balance){DB::table('stk_inventory_balances')->insertOrIgnore(['id'=>(string)Str::ulid(),'outlet_id'=>$g->destination_id,'sku_id'=>$item->sku_id,'on_hand_qty'=>0,'average_unit_cost'=>0,'inventory_value'=>0,'last_movement_at'=>null,'lock_version'=>1,'created_at'=>now(),'updated_at'=>now()]);$balance=InventoryBalance::query()->where('outlet_id',$g->destination_id)->where('sku_id',$item->sku_id)->lockForUpdate()->firstOrFail();}
             $oldQty=round((float)$balance->on_hand_qty,4);$oldValue=round((float)$balance->inventory_value,2);$value=round($qty*$unitCost,2);$newQty=round($oldQty+$qty,4);$newValue=round($oldValue+$value,2);$avg=$newQty>0?round($newValue/$newQty,4):0;
             $balance->forceFill(['on_hand_qty'=>$newQty,'average_unit_cost'=>$avg,'inventory_value'=>$newValue,'last_movement_at'=>now(),'lock_version'=>((int)$balance->lock_version)+1])->save();
-            InventoryMovement::query()->create(['outlet_id'=>$g->destination_id,'sku_id'=>$item->sku_id,'movement_type'=>'goods_receipt','reference_type'=>'wh_v3_goods_receipt','reference_id'=>$g->id,'reference_line_id'=>$item->id,'business_date'=>now('Asia/Jakarta')->toDateString(),'quantity'=>$qty,'unit_cost'=>$unitCost,'total_cost'=>$value,'balance_qty_after'=>$newQty,'average_cost_after'=>$avg,'inventory_value_after'=>$newValue,'metadata'=>['warehouse_logistics_v3'=>true,'warehouse_ledger_posting_id'=>$postingId,'not_received_qty_base'=>(float)$item->not_received_qty_base],'created_by_user_id'=>$userId]);
+            InventoryMovement::query()->create(['outlet_id'=>$g->destination_id,'sku_id'=>$item->sku_id,'movement_type'=>'goods_receipt','reference_type'=>'wh_v3_goods_receipt','reference_id'=>$g->id,'reference_line_id'=>$item->id,'business_date'=>($g->receipt_date ?: now('Asia/Jakarta')->toDateString()),'quantity'=>$qty,'unit_cost'=>$unitCost,'total_cost'=>$value,'balance_qty_after'=>$newQty,'average_cost_after'=>$avg,'inventory_value_after'=>$newValue,'metadata'=>['warehouse_logistics_v3'=>true,'warehouse_ledger_posting_id'=>$postingId,'not_received_qty_base'=>(float)$item->not_received_qty_base],'created_by_user_id'=>$userId]);
         }
         DB::table('wh_v3_goods_receipts')->where('id',$g->id)->update(['outlet_inventory_posted_at'=>now(),'updated_at'=>now()]);
     }
@@ -693,8 +807,8 @@ class WarehouseLogisticsV3Service
     private function deliveryItems(string $deliveryId):array
     {
         return DB::table('wh_v3_delivery_order_items as i')->join('stk_skus as s','s.id','=','i.sku_id')->leftJoin('stk_uoms as u','u.id','=','i.uom_id')->where('i.delivery_order_id',$deliveryId)->orderBy('s.name')
-            ->get(['i.*','s.sku_code','s.name as item_name','u.code as uom_code'])->map(fn($i)=>[
-                'id'=>(string)$i->id,'sku_id'=>(string)$i->sku_id,'sku_code'=>(string)$i->sku_code,'item_name'=>(string)$i->item_name,'uom_code'=>(string)($i->uom_code?:'UNIT'),
+            ->get(['i.*','s.sku_code','s.name as item_name','u.code as uom_code','u.decimal_places as uom_decimal_places'])->map(fn($i)=>[
+                'id'=>(string)$i->id,'sku_id'=>(string)$i->sku_id,'sku_code'=>(string)$i->sku_code,'item_name'=>(string)$i->item_name,'uom_code'=>(string)($i->uom_code?:'UNIT'),'uom_decimal_places'=>$i->uom_decimal_places !== null ? (int)$i->uom_decimal_places : null,
                 'requested_qty_uom'=>round((float)$i->requested_qty_uom,4),'approved_qty_uom'=>round((float)$i->approved_qty_uom,4),'sent_qty_uom'=>round((float)$i->sent_qty_uom,4),
                 'requested_qty_base'=>round((float)$i->requested_qty_base,4),'approved_qty_base'=>round((float)$i->approved_qty_base,4),'sent_qty_base'=>round((float)$i->sent_qty_base,4),
             ])->values()->all();
@@ -703,8 +817,8 @@ class WarehouseLogisticsV3Service
     private function goodsReceiptItems(string $grId):array
     {
         return DB::table('wh_v3_goods_receipt_items as i')->join('stk_skus as s','s.id','=','i.sku_id')->leftJoin('stk_uoms as u','u.id','=','i.uom_id')->where('i.goods_receipt_id',$grId)->orderBy('s.name')
-            ->get(['i.*','s.sku_code','s.name as item_name','u.code as uom_code'])->map(fn($i)=>[
-                'id'=>(string)$i->id,'sku_id'=>(string)$i->sku_id,'sku_code'=>(string)$i->sku_code,'item_name'=>(string)$i->item_name,'uom_code'=>(string)($i->uom_code?:'UNIT'),
+            ->get(['i.*','s.sku_code','s.name as item_name','u.code as uom_code','u.decimal_places as uom_decimal_places'])->map(fn($i)=>[
+                'id'=>(string)$i->id,'sku_id'=>(string)$i->sku_id,'sku_code'=>(string)$i->sku_code,'item_name'=>(string)$i->item_name,'uom_code'=>(string)($i->uom_code?:'UNIT'),'uom_decimal_places'=>$i->uom_decimal_places !== null ? (int)$i->uom_decimal_places : null,
                 'requested_qty_uom'=>round((float)$i->requested_qty_uom,4),'sent_qty_uom'=>round((float)$i->sent_qty_uom,4),'received_qty_uom'=>round((float)$i->received_qty_uom,4),'not_received_qty_uom'=>round((float)$i->not_received_qty_uom,4),
                 'requested_qty_base'=>round((float)$i->requested_qty_base,4),'sent_qty_base'=>round((float)$i->sent_qty_base,4),'received_qty_base'=>round((float)$i->received_qty_base,4),'not_received_qty_base'=>round((float)$i->not_received_qty_base,4),'notes'=>$i->notes,
             ])->values()->all();

@@ -50,6 +50,7 @@ class WarehouseLogisticsV3Controller extends Controller
             'estimated_delivery_date' => ['required','date'],
             'estimated_delivery_time' => ['required','date_format:H:i'],
             'sender_user_id' => ['required','string','max:40','exists:users,id'],
+            'idempotency_key' => ['nullable','string','min:12','max:100','regex:/^[A-Za-z0-9_.:\-]+$/'],
             'notes' => ['nullable','string','max:1000'],
             'items' => ['required','array','min:1'],
             'items.*.item_id' => ['required','string','max:40','distinct'],

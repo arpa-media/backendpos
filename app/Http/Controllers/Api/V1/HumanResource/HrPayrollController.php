@@ -34,7 +34,7 @@ class HrPayrollController extends Controller
         $v = Validator::make($request->all(), [
             'period_from'=>['required','date_format:Y-m-d'],'period_to'=>['required','date_format:Y-m-d','after_or_equal:period_from'],
             'company_code'=>['nullable','string','max:16'],'outlet_id'=>['nullable','string','max:26'],
-            'code'=>['nullable','string','max:40'],'description'=>['nullable','string','max:500'],
+            'cutoff_group'=>['required','in:squad,management'],'code'=>['nullable','string','max:40'],'description'=>['nullable','string','max:500'],
         ]);
         if ($v->fails()) return ApiResponse::error('Data cutoff tidak valid.','VALIDATION_ERROR',422,$v->errors()->toArray());
         if (CarbonImmutable::parse($request->period_from)->diffInDays(CarbonImmutable::parse($request->period_to)) > 366) return ApiResponse::error('Rentang cutoff maksimal 366 hari.','HR_PAYROLL_RANGE_TOO_LONG',422);
@@ -71,7 +71,7 @@ class HrPayrollController extends Controller
         $v = Validator::make($request->query(), [
             'from'=>['required','date_format:Y-m-d'],'to'=>['required','date_format:Y-m-d','after_or_equal:from'],
             'company_code'=>['nullable','string','max:16'],'outlet_id'=>['nullable','string','max:26'],'search'=>['nullable','string','max:180'],
-            'per_page'=>['nullable','integer'],'page'=>['nullable','integer','min:1'],'sort_by'=>['nullable','string','max:60'],'sort_dir'=>['nullable','in:asc,desc'],
+            'cutoff_group'=>['nullable','in:squad,management'],'per_page'=>['nullable','integer'],'page'=>['nullable','integer','min:1'],'sort_by'=>['nullable','string','max:60'],'sort_dir'=>['nullable','in:asc,desc'],
         ]);
         if ($v->fails()) return ApiResponse::error(($projection?'Filter Proyeksi Payroll':'Filter payroll').' tidak valid.','VALIDATION_ERROR',422,$v->errors()->toArray());
         if (CarbonImmutable::parse($request->query('from'))->diffInDays(CarbonImmutable::parse($request->query('to'))) > 366) return ApiResponse::error('Rentang maksimal 366 hari.','HR_PAYROLL_RANGE_TOO_LONG',422);

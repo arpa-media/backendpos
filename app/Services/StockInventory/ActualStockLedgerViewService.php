@@ -395,6 +395,12 @@ class ActualStockLedgerViewService
                 ->where('g.destination_id', $outletId)
                 ->where('g.status', 'completed')
                 ->where('i.received_qty_base', '>', 0);
+            // I05 receipts are represented by individual receipt batches below.
+            if (Schema::hasTable('wh_v3_partial_receipt_batches')) {
+                $q->whereNotExists(fn ($sub) => $sub->selectRaw('1')
+                    ->from('wh_v3_partial_receipt_batches as pb')
+                    ->whereColumn('pb.goods_receipt_id','g.id'));
+            }
             if ($skuId) $q->where('i.sku_id', $skuId);
             if ($hardResetAt) $q->where('g.completed_at', '>', $hardResetAt);
 
@@ -418,6 +424,42 @@ class ActualStockLedgerViewService
                     'reference_number' => (string) $row->goods_receipt_number,
                     'counterparty' => $row->warehouse_name ? (string) $row->warehouse_name : 'Warehouse',
                     'notes' => $row->notes,
+                ]);
+            }
+        }
+
+
+        // I05: authoritative partial receiving posts at the moment each batch is confirmed.
+        // These events also remain authoritative after GR Completed, without double-counting.
+        if (Schema::hasTable('wh_v3_partial_receipt_batches') && Schema::hasTable('wh_v3_partial_receipt_items')) {
+            $partial = DB::table('wh_v3_partial_receipt_items as bi')
+                ->join('wh_v3_partial_receipt_batches as b','b.id','=','bi.batch_id')
+                ->join('wh_v3_goods_receipts as g','g.id','=','b.goods_receipt_id')
+                ->join('wh_v3_goods_receipt_items as gi','gi.id','=','bi.goods_receipt_item_id')
+                ->leftJoin('outlets as w','w.id','=','g.warehouse_id')
+                ->where('g.destination_type','outlet')->where('g.destination_id',$outletId)
+                ->where('bi.received_qty_base','>',0);
+            if ($skuId) $partial->where('gi.sku_id',$skuId);
+            if ($hardResetAt) $partial->where('b.created_at','>',$hardResetAt);
+            foreach ($partial->get([
+                'bi.id','gi.sku_id','bi.received_qty_base','b.receipt_date','b.created_at',
+                'g.id as reference_id','g.goods_receipt_number','w.name as warehouse_name','b.notes',
+            ]) as $row) {
+                $events->push([
+                    'id'=>'i05-gr-batch:'.(string)$row->id,
+                    'sku_id'=>(string)$row->sku_id,
+                    'kind'=>'goods_receipt',
+                    'priority'=>10,
+                    'business_date'=>(string)$row->receipt_date,
+                    'event_at'=>(string)$row->created_at,
+                    'quantity'=>round((float)$row->received_qty_base,4),
+                    'actual_qty'=>null,
+                    'reference_type'=>'wh_v3_goods_receipt',
+                    'reference_id'=>(string)$row->reference_id,
+                    'reference_line_id'=>(string)$row->id,
+                    'reference_number'=>(string)$row->goods_receipt_number,
+                    'counterparty'=>$row->warehouse_name ?: 'Warehouse',
+                    'notes'=>$row->notes,
                 ]);
             }
         }

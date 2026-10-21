@@ -44,6 +44,19 @@ final class HrPayrollSlipEmailController extends Controller
         );
     }
 
+    public function resendPayroll(Request $request,HrPayrollCutoff $cutoff,HrPayrollSlip $slip) {
+        $request->validate(['confirmed'=>['required','accepted']]);
+        $result=$this->service->resendPayroll($cutoff,$slip,$request->user());
+        return ($result['success']??false)?ApiResponse::ok($result,'Kirim ulang slip gaji berhasil.'):
+            ApiResponse::error((string)($result['message']??'Kirim ulang gagal.'),'HR_MAIL_RESEND_FAILED',422,[], $result);
+    }
+    public function resendBonus(Request $request,string $projectionId,string $lineId) {
+        $request->validate(['confirmed'=>['required','accepted']]);
+        $result=$this->service->resendBonus($request,$projectionId,$lineId,$request->user());
+        return ($result['success']??false)?ApiResponse::ok($result,'Kirim ulang slip bonus berhasil.'):
+            ApiResponse::error((string)($result['message']??'Kirim ulang gagal.'),'HR_MAIL_RESEND_FAILED',422,[], $result);
+    }
+
     public function bonusStatuses(Request $request, string $projectionId)
     {
         return ApiResponse::ok($this->service->bonusStatuses($request, $projectionId));

@@ -980,6 +980,9 @@ class HrSquadController extends Controller
 
     private function applyOperationalSquadScope($query): void
     {
+        if (Schema::hasColumn(self::TABLE, 'hr_is_non_squad')) {
+            $query->where('hr_is_non_squad', false);
+        }
         foreach (['role_name', 'access_role'] as $roleColumn) {
             if (! Schema::hasColumn(self::TABLE, $roleColumn)) continue;
             $query->where(function ($roleScope) use ($roleColumn) {
@@ -1021,6 +1024,9 @@ class HrSquadController extends Controller
         $nonSquad = Schema::hasTable('users')
             ? $this->buildNonSquadUserQuery()->count()
             : 0;
+        if (Schema::hasColumn(self::TABLE, 'hr_is_non_squad')) {
+            $nonSquad += DB::table(self::TABLE)->whereNull('deleted_at')->where('hr_is_non_squad', true)->count();
+        }
 
         return [
             'active' => (int) $active->count(),
@@ -1217,6 +1223,7 @@ class HrSquadController extends Controller
             'contract_type', 'contract_start_date', 'contract_end_date', 'leave_quota', 'updated_at',
         ];
 
+        $columns[] = 'hr_is_non_squad';
         return array_values(array_filter($columns, fn ($column) => Schema::hasColumn(self::TABLE, $column)));
     }
 
@@ -1342,6 +1349,12 @@ class HrSquadController extends Controller
             'email' => 'email',
             'status' => 'is_active',
         ];
+        // V13 I08: a real Non-Squad tab includes explicitly classified HR profiles
+        // as well as existing non-squad users, with one combined paginator.
+        if (Schema::hasColumn(self::TABLE, 'hr_is_non_squad')) {
+            return $this->classifiedNonSquadIndex($request, $query, $perPage, $direction);
+        }
+
         $query->orderBy($sortColumns[$request->query('sort_by', 'full_name')] ?? 'name', $direction)
             ->orderBy('id');
 
@@ -1363,6 +1376,65 @@ class HrSquadController extends Controller
                 'per_page' => $paginator->perPage(),
                 'total' => $paginator->total(),
                 'last_page' => $paginator->lastPage(),
+            ],
+        ], 'OK');
+    }
+
+    /** Combined, SQL-paginated view: classified HR profiles plus legacy Non-Squad users. */
+    private function classifiedNonSquadIndex(Request $request, $userQuery, int|string $perPage, string $direction)
+    {
+        $userProjection = (clone $userQuery)
+            ->selectRaw("CAST(users.id AS CHAR(64)) AS entity_id, 'user' AS entity_type, users.name AS sort_name, users.nisj AS sort_nisj, users.email AS sort_email, users.is_active AS sort_active")
+            ->toBase();
+
+        $squads = DB::table(self::TABLE)
+            ->whereNull('deleted_at')
+            ->where('hr_is_non_squad', true);
+        $search = trim((string) $request->query('search', ''));
+        if ($search !== '') {
+            $squads->where(function ($q) use ($search) {
+                $q->where('full_name', 'like', "%{$search}%")
+                    ->orWhere('nisj', 'like', "%{$search}%")
+                    ->orWhere('email', 'like', "%{$search}%")
+                    ->orWhere('position_name', 'like', "%{$search}%")
+                    ->orWhere('role_name', 'like', "%{$search}%");
+            });
+        }
+        $outlet = trim((string) $request->query('outlet', ''));
+        if ($outlet !== '') $this->applyOutletFilter($squads, $outlet);
+        $this->applyDetailFilters($squads, $request);
+
+        $squadProjection = $squads->selectRaw("CAST(id AS CHAR(64)) AS entity_id, 'squad' AS entity_type, full_name AS sort_name, nisj AS sort_nisj, email AS sort_email, CASE WHEN status = 'active' THEN 1 ELSE 0 END AS sort_active");
+        $combined = DB::query()->fromSub($userProjection->unionAll($squadProjection), 'entries');
+        $sortMap = ['full_name' => 'sort_name', 'nisj' => 'sort_nisj', 'email' => 'sort_email', 'status' => 'sort_active'];
+        $sortField = $sortMap[(string) $request->query('sort_by', 'full_name')] ?? 'sort_name';
+        $combined->orderBy($sortField, $direction)->orderBy('entity_type')->orderBy('entity_id');
+        $pages = $perPage === 'all' ? null : $combined->paginate($perPage);
+        $selected = $pages ? collect($pages->items()) : $combined->get();
+        $userIds = $selected->where('entity_type', 'user')->pluck('entity_id')->all();
+        $squadIds = $selected->where('entity_type', 'squad')->pluck('entity_id')->all();
+        $users = User::query()->with(['employee.assignment.outlet', 'outlet', 'accessAssignment.role', 'accessAssignment.level'])
+            ->whereIn('id', $userIds)->get()->keyBy(fn (User $u) => (string) $u->id);
+        $records = DB::table(self::TABLE)->whereIn('id', $squadIds)->whereNull('deleted_at')->get()
+            ->keyBy(fn ($record) => (string) $record->id);
+        $items = $selected->map(function ($row) use ($users, $records) {
+            $record = (string) $row->entity_type === 'squad'
+                ? $records->get((string) $row->entity_id)
+                : $users->get((string) $row->entity_id);
+            if (! $record) return null;
+            return (string) $row->entity_type === 'squad'
+                ? $this->formatSquadList($record)
+                : $this->formatNonSquadUser($record);
+        })->filter()->values();
+
+        return ApiResponse::ok([
+            'items' => $items,
+            'counts' => $this->statusCounts(),
+            'pagination' => [
+                'current_page' => $pages ? $pages->currentPage() : 1,
+                'per_page' => $pages ? $pages->perPage() : 'all',
+                'total' => $pages ? $pages->total() : $items->count(),
+                'last_page' => $pages ? $pages->lastPage() : 1,
             ],
         ], 'OK');
     }

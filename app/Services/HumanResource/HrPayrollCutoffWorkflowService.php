@@ -17,6 +17,7 @@ class HrPayrollCutoffWorkflowService
 {
     public function __construct(
         private readonly HrPayrollService $payroll,
+        private readonly HrPayrollRecipientV13I10Service $recipients,
         private readonly SimpleXlsxService $xlsx,
         private readonly HrUniformPayrollDeductionI11Service $uniformDeductions,
         private readonly HrPayrollOvertimeIntegrationI07Service $overtimeI07,
@@ -29,6 +30,11 @@ class HrPayrollCutoffWorkflowService
             if ($locked->status === 'submitted' || $locked->status === 'finance_processing' || $locked->status === 'finalized') return $locked->fresh();
             if ($locked->status !== 'draft') $this->invalid('cutoff', 'Hanya cutoff Draft yang dapat diajukan.');
             if ($locked->slips()->count() === 0) $this->invalid('cutoff', 'Cutoff tidak memiliki slip.');
+            $types=DB::table('HR_payroll_slips as s')->leftJoin('outlets as o','o.id','=','s.outlet_id_snapshot')
+                ->where('s.cutoff_id',$locked->id)->distinct()->pluck('o.type')->map(fn($t)=>strtolower((string)$t))->unique()->values();
+            if($types->count()!==1 || !in_array($types->first(),['outlet','warehouse','headquarter'],true))
+                $this->invalid('cutoff','Cutoff mengandung tipe penugasan tidak diketahui/campuran; harus dipisah antara Squad dan Management sebelum Finance.');
+
 
             // I11: claim any Uniform deductions created after this draft cutoff was made.
             $this->uniformDeductions->attachToCutoff($locked);
@@ -38,8 +44,10 @@ class HrPayrollCutoffWorkflowService
             // I07: capture the latest COMPLETED overtime immediately before the
             // Finance boundary. After this point the cutoff snapshot is frozen.
             $locked = $this->overtimeI07->syncCutoffDraft($locked, (string) $actor->id, 'SUBMIT_TO_FINANCE');
+            $this->recipients->refreshDraftSlipContact($locked);
             $this->payroll->refreshSummary($locked);
             $postingId = $this->createFinancePosting($locked, $actor);
+            $this->recipients->snapshotPayroll($locked, $postingId);
 
             $from = $locked->status;
             $locked->status = 'submitted';
@@ -136,6 +144,24 @@ class HrPayrollCutoffWorkflowService
         });
     }
 
+    public function exportBpjsForCutoff(HrPayrollCutoff $cutoff): Response {
+        if ($cutoff->status !== 'draft') $this->invalid('cutoff','BPJS HR hanya bisa diekspor sebelum submit Finance.');
+        $rows=[['NISJ','Nama','Outlet','BPJS Kesehatan (-)','BPJS Ketenagakerjaan (-)','BPJS Lain (-)','Total BPJS','Net Gaji']];
+        foreach($cutoff->slips()->orderBy('full_name_snapshot')->get() as $s) {
+            $rows[] = [$s->nisj_snapshot,$s->full_name_snapshot,$s->outlet_name_snapshot,(float)$s->bpjs_health,(float)$s->bpjs_employment,(float)$s->bpjs_other,(float)$s->bpjs_total,(float)$s->total_net];
+        }
+        return $this->xlsx->download('bpjs-hr-'.$cutoff->code.'.xlsx','BPJS',$rows);
+    }
+
+    public function importBpjsForCutoff(HrPayrollCutoff $cutoff, UploadedFile $file, User $actor): array {
+        if ($cutoff->status !== 'draft') $this->invalid('cutoff','BPJS HR hanya bisa diimpor sebelum submit Finance.');
+        return $this->applyImport($cutoff,$file,$actor,'HR_BPJS',$this->xlsx->read($file),function(HrPayrollSlip $s,array $d):void{
+            $s->bpjs_health=$d['bpjs_health'];$s->bpjs_employment=$d['bpjs_employment'];$s->bpjs_other=$d['bpjs_other'];
+            $s->bpjs_total=round($d['bpjs_health']+$d['bpjs_employment']+$d['bpjs_other'],2);
+            $this->payroll->recalculateAndSaveSlip($s);
+        });
+    }
+
     public function exportBpjsByPosting(string $postingId, ?string $actorId = null): Response
     {
         $cutoff = $this->cutoffFromPosting($postingId);
@@ -148,6 +174,7 @@ class HrPayrollCutoffWorkflowService
 
     public function importBpjsByPosting(string $postingId, UploadedFile $file, User $actor): array
     {
+        $this->invalid('bpjs','V13 I10: impor BPJS dipindahkan ke HR Cutoff Draft. Finance hanya mengimpor PPh21.');
         $cutoff = $this->cutoffFromPosting($postingId);
         if (! in_array($cutoff->status, ['submitted','finance_processing'], true)) $this->invalid('cutoff', 'BPJS hanya dapat diubah sebelum cutoff finalized.');
         $this->markFinanceProcessing($postingId, $actor->id);
@@ -258,7 +285,7 @@ class HrPayrollCutoffWorkflowService
     {
         $header = array_map(fn ($v) => Str::lower(trim((string)$v)), $rows[0] ?? []);
         $index = array_flip($header);
-        $required = $kind === 'FINANCE_BPJS' ? ['nisj','bpjs kesehatan (-)','bpjs ketenagakerjaan (-)','bpjs lain (-)'] : ['nisj','bonus (+)','bonus dinas (+)','adjustment (+/-)','cashbon (-)','potongan lain (-)'];
+        $required = in_array($kind, ['FINANCE_BPJS','HR_BPJS'], true) ? ['nisj','bpjs kesehatan (-)','bpjs ketenagakerjaan (-)','bpjs lain (-)'] : ['nisj','bonus (+)','bonus dinas (+)','adjustment (+/-)','cashbon (-)','potongan lain (-)'];
         foreach ($required as $column) if (! array_key_exists($column, $index)) $this->invalid('file', "Kolom XLSX wajib tidak ditemukan: {$column}");
 
         $errors = []; $valid = []; $seen = [];
@@ -271,7 +298,7 @@ class HrPayrollCutoffWorkflowService
             $slip = $cutoff->slips()->whereRaw('LOWER(nisj_snapshot) = ?', [$key])->first();
             if (! $slip) { $errors[] = ['row'=>$line,'nisj'=>$nisj,'error'=>'NISJ tidak ditemukan pada cutoff.']; continue; }
             try {
-                $data = $kind === 'FINANCE_BPJS' ? [
+                $data = in_array($kind, ['FINANCE_BPJS','HR_BPJS'], true) ? [
                     'bpjs_health'=>$this->amount($row[$index['bpjs kesehatan (-)']] ?? 0, false),
                     'bpjs_employment'=>$this->amount($row[$index['bpjs ketenagakerjaan (-)']] ?? 0, false),
                     'bpjs_other'=>$this->amount($row[$index['bpjs lain (-)']] ?? 0, false),
@@ -300,6 +327,10 @@ class HrPayrollCutoffWorkflowService
             return ['batch_id'=>$batchId,'total_rows'=>count($valid)+count($errors),'valid_rows'=>count($valid),'invalid_rows'=>count($errors),'applied_rows'=>0,'errors'=>$errors];
         }
         DB::transaction(function () use ($valid,$apply,$cutoff,$file,$actor,$kind,$postingId,$errors,$batchId) {
+            if ($kind === 'HR_BPJS') {
+                $state=HrPayrollCutoff::query()->whereKey($cutoff->id)->lockForUpdate()->value('status');
+                if ($state !== 'draft') $this->invalid('cutoff','Cutoff berubah status selama import. Tidak ada perubahan yang diterapkan.');
+            }
             foreach ($valid as $item) $apply($item['slip'], $item['data']);
             // Recalculation during Adjustment/BPJS import can round a weighted
             // effective overtime rate. Re-apply the frozen I07 source amount.
