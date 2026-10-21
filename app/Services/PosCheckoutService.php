@@ -15,6 +15,7 @@ use App\Models\Tax;
 use App\Models\User;
 use App\Support\PaymentMethodTypes;
 use App\Support\PosPricingV16I02;
+use App\Support\OnlineSuffix500PricingV17I01;
 use App\Support\SaleAmountBreakdown;
 use App\Support\SaleRounding;
 use App\Support\SalesChannels;
@@ -1078,10 +1079,11 @@ class PosCheckoutService
 
             // V16-I02: explicit versioned snapshot; never upgrade a missing version (old APK/queue).
             $v2Requested = (int) ($payload['pricing_rule_version'] ?? 1) === 2;
+            $v3Requested = (int) ($payload['pricing_rule_version'] ?? 1) === 3;
             $v2Kind = (string) ($payload['pricing_rule_kind'] ?? '');
             $v2Snapshot = is_array($offlineSnapshot['pricing_v2'] ?? null) ? $offlineSnapshot['pricing_v2'] : [];
             if ($v2Requested) {
-                if (!$useOfflineSnapshot || (int) ($offlineSnapshot['pricing_rule_version'] ?? 0) !== 2
+                if (array_key_exists('pricing_v3', $offlineSnapshot) || !$useOfflineSnapshot || (int) ($offlineSnapshot['pricing_rule_version'] ?? 0) !== 2
                     || (int) ($v2Snapshot['version'] ?? 0) !== 2
                     || !in_array($v2Kind, ['SQUAD', 'ONLINE_500'], true)
                     || ($v2Snapshot['kind'] ?? '') !== $v2Kind) {
@@ -1148,8 +1150,44 @@ class PosCheckoutService
                         throw ValidationException::withMessages(["offline_snapshot.{$key}" => ['V2 totals differ from priced cart.']]);
                     }
                 }
-            } else if (array_key_exists('pricing_rule_version', $offlineSnapshot)
-                || array_key_exists('pricing_v2', $offlineSnapshot) || array_key_exists('pricing_rule_kind', $payload)) {
+            } elseif ($v3Requested) {
+                // V3 is NEW online suffix-500 pricing; do not reinterpret old V1/V2 queues.
+                $v3Kind = (string) ($payload['pricing_rule_kind'] ?? '');
+                $v3Snapshot = is_array($offlineSnapshot['pricing_v3'] ?? null) ? $offlineSnapshot['pricing_v3'] : [];
+                if (!$useOfflineSnapshot
+                    || array_key_exists('pricing_v2', $offlineSnapshot)
+                    || (int) ($offlineSnapshot['pricing_rule_version'] ?? 0) !== 3
+                    || $v3Kind !== 'ONLINE_SUFFIX_500'
+                    || (int) ($v3Snapshot['version'] ?? 0) !== 3
+                    || ($v3Snapshot['kind'] ?? '') !== $v3Kind) {
+                    throw ValidationException::withMessages(['pricing_rule_version' => ['Invalid V3 online pricing contract.']]);
+                }
+                $v3Expected = OnlineSuffix500PricingV17I01::calculate(
+                    $saleChannel, $saleItems, $subtotal, $discountAmount, 0, 0
+                );
+                if ($v3Expected === null || ($v3Snapshot['policy'] ?? null) !== $v3Expected['policy']) {
+                    throw ValidationException::withMessages(['offline_snapshot.pricing_v3' => ['Invalid V3 online suffix-500 policy.']]);
+                }
+                foreach (['protected_500_total', 'rounding_total', 'grand_total'] as $key) {
+                    if (!is_numeric($v3Snapshot[$key] ?? null) || (int) $v3Snapshot[$key] !== (int) $v3Expected[$key]) {
+                        throw ValidationException::withMessages(['offline_snapshot.pricing_v3' => ["V3 pricing mismatch: {$key}."]]);
+                    }
+                }
+                foreach ([
+                    'subtotal' => $subtotal,
+                    'discount_amount' => $discountAmount,
+                    'tax_total' => 0,
+                    'rounding_total' => $v3Expected['rounding_total'],
+                    'grand_total' => $v3Expected['grand_total'],
+                ] as $key => $value) {
+                    if (!is_numeric($offlineSnapshot[$key] ?? null) || (int) $offlineSnapshot[$key] !== (int) $value) {
+                        throw ValidationException::withMessages(["offline_snapshot.{$key}" => ['V3 totals differ from priced cart.']]);
+                    }
+                }
+            } elseif (array_key_exists('pricing_rule_version', $offlineSnapshot)
+                || array_key_exists('pricing_v2', $offlineSnapshot)
+                || array_key_exists('pricing_v3', $offlineSnapshot)
+                || array_key_exists('pricing_rule_kind', $payload)) {
                 throw ValidationException::withMessages(['pricing_rule_version' => ['Pricing version fields must agree.']]);
             }
 
@@ -1164,7 +1202,7 @@ class PosCheckoutService
                     ? 0
                     : max(0, min(100, (int) ($offlineSnapshot['tax_percent_snapshot'] ?? $taxPercent ?? 0)));
                 $serviceChargeTotal = 0;
-                $roundingTotal = $v2Requested ? (int) $v2Expected['rounding_total'] : (int) ($offlineSnapshot['rounding_total'] ?? 0);
+                $roundingTotal = $v3Requested ? (int) $v3Expected['rounding_total'] : ($v2Requested ? (int) $v2Expected['rounding_total'] : (int) ($offlineSnapshot['rounding_total'] ?? 0));
 
                 // Canonical server-side rule: tax must always be applied after discount,
                 // but PACKAGING lines are excluded from both discount and tax bases.
