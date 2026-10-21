@@ -16,6 +16,7 @@ use App\Models\User;
 use App\Support\PaymentMethodTypes;
 use App\Support\PosPricingV16I02;
 use App\Support\OnlineSuffix500PricingV17I01;
+use App\Support\OnlineSuffix500HydrationRecoveryV17HF03;
 use App\Support\SaleAmountBreakdown;
 use App\Support\SaleRounding;
 use App\Support\SalesChannels;
@@ -435,6 +436,7 @@ class PosCheckoutService
             $onlineOrderSource,
             $queueNo,
             $offlineSnapshot,
+            $rawItems,
             $preferredSaleNumber,
             $transactionAtTz,
             $transactionAtUtc,
@@ -1154,23 +1156,35 @@ class PosCheckoutService
                 // V3 is NEW online suffix-500 pricing; do not reinterpret old V1/V2 queues.
                 $v3Kind = (string) ($payload['pricing_rule_kind'] ?? '');
                 $v3Snapshot = is_array($offlineSnapshot['pricing_v3'] ?? null) ? $offlineSnapshot['pricing_v3'] : [];
+                // HF03: the V17 APK rehydrator sometimes strips BOTH nested
+                // contract fields while keeping envelope V3. Only recover that
+                // identifiable case with complete, unchanged line snapshots.
+                $v3CompleteContract = (int) ($offlineSnapshot['pricing_rule_version'] ?? 0) === 3
+                    && (int) ($v3Snapshot['version'] ?? 0) === 3
+                    && ($v3Snapshot['kind'] ?? '') === $v3Kind;
+                $v3RecoverHydration = !$v3CompleteContract
+                    && OnlineSuffix500HydrationRecoveryV17HF03::canRecover(
+                        $payload, $offlineSnapshot, $rawItems, $saleChannel
+                    );
                 if (!$useOfflineSnapshot
                     || array_key_exists('pricing_v2', $offlineSnapshot)
-                    || (int) ($offlineSnapshot['pricing_rule_version'] ?? 0) !== 3
                     || $v3Kind !== 'ONLINE_SUFFIX_500'
-                    || (int) ($v3Snapshot['version'] ?? 0) !== 3
-                    || ($v3Snapshot['kind'] ?? '') !== $v3Kind) {
+                    || (!$v3CompleteContract && !$v3RecoverHydration)) {
                     throw ValidationException::withMessages(['pricing_rule_version' => ['Invalid V3 online pricing contract.']]);
                 }
                 $v3Expected = OnlineSuffix500PricingV17I01::calculate(
                     $saleChannel, $saleItems, $subtotal, $discountAmount, 0, 0
                 );
-                if ($v3Expected === null || ($v3Snapshot['policy'] ?? null) !== $v3Expected['policy']) {
+                if ($v3Expected === null || (!$v3RecoverHydration && ($v3Snapshot['policy'] ?? null) !== $v3Expected['policy'])) {
                     throw ValidationException::withMessages(['offline_snapshot.pricing_v3' => ['Invalid V3 online suffix-500 policy.']]);
                 }
-                foreach (['protected_500_total', 'rounding_total', 'grand_total'] as $key) {
-                    if (!is_numeric($v3Snapshot[$key] ?? null) || (int) $v3Snapshot[$key] !== (int) $v3Expected[$key]) {
-                        throw ValidationException::withMessages(['offline_snapshot.pricing_v3' => ["V3 pricing mismatch: {$key}."]]);
+                if (!$v3RecoverHydration) {
+                    // Full V3 contracts must remain strict. Missing or altered
+                    // fields are NEVER repaired silently by this hotfix.
+                    foreach (['protected_500_total', 'rounding_total', 'grand_total'] as $key) {
+                        if (!is_numeric($v3Snapshot[$key] ?? null) || (int) $v3Snapshot[$key] !== (int) $v3Expected[$key]) {
+                            throw ValidationException::withMessages(['offline_snapshot.pricing_v3' => ["V3 pricing mismatch: {$key}."]]);
+                        }
                     }
                 }
                 foreach ([
