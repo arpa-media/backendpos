@@ -15,6 +15,7 @@ use App\Models\Tax;
 use App\Models\User;
 use App\Support\PaymentMethodTypes;
 use App\Support\PosPricingV16I02;
+use App\Support\PosPricingV2HydrationRecoveryV21HF01;
 use App\Support\OnlineSuffix500PricingV17I01;
 use App\Support\OnlineSuffix500HydrationRecoveryV17HF03;
 use App\Support\SaleAmountBreakdown;
@@ -301,6 +302,12 @@ class PosCheckoutService
 
     public function checkout(User $user, string $outletId, array $payload): Sale
     {
+        // V21-HF01: decide eligibility from the ORIGINAL queue payload before
+        // rescueOfflinePayload can fill absent prices from today's price master.
+        // This flag alone cannot authorize checkout: V2 recomputation and the
+        // original snapshot-total comparisons below remain mandatory.
+        $v2HydrationRecoveryCandidate = PosPricingV2HydrationRecoveryV21HF01::canRecover($payload);
+
         if ($this->isOfflineLikePayload($payload)) {
             $payload = $this->rescueOfflinePayload($outletId, $payload);
         }
@@ -437,6 +444,7 @@ class PosCheckoutService
             $queueNo,
             $offlineSnapshot,
             $rawItems,
+            $v2HydrationRecoveryCandidate,
             $preferredSaleNumber,
             $transactionAtTz,
             $transactionAtUtc,
@@ -1084,11 +1092,14 @@ class PosCheckoutService
             $v3Requested = (int) ($payload['pricing_rule_version'] ?? 1) === 3;
             $v2Kind = (string) ($payload['pricing_rule_kind'] ?? '');
             $v2Snapshot = is_array($offlineSnapshot['pricing_v2'] ?? null) ? $offlineSnapshot['pricing_v2'] : [];
+            $v2CompleteContract = (int) ($offlineSnapshot['pricing_rule_version'] ?? 0) === 2
+                && (int) ($v2Snapshot['version'] ?? 0) === 2
+                && ($v2Snapshot['kind'] ?? '') === $v2Kind;
+            $v2RecoverHydration = !$v2CompleteContract && $v2HydrationRecoveryCandidate;
             if ($v2Requested) {
-                if (array_key_exists('pricing_v3', $offlineSnapshot) || !$useOfflineSnapshot || (int) ($offlineSnapshot['pricing_rule_version'] ?? 0) !== 2
-                    || (int) ($v2Snapshot['version'] ?? 0) !== 2
+                if (array_key_exists('pricing_v3', $offlineSnapshot) || !$useOfflineSnapshot
                     || !in_array($v2Kind, ['SQUAD', 'ONLINE_500'], true)
-                    || ($v2Snapshot['kind'] ?? '') !== $v2Kind) {
+                    || (!$v2CompleteContract && !$v2RecoverHydration)) {
                     throw ValidationException::withMessages(['pricing_rule_version' => ['Invalid V2 pricing contract.']]);
                 }
                 if ($v2Kind === 'SQUAD') {
@@ -1122,24 +1133,29 @@ class PosCheckoutService
                         throw ValidationException::withMessages(['pricing_rule_version' => ['Online Rp500 rule requires eligible DELIVERY lines.']]);
                     }
                 }
-                // Reject divergent/tampered cash register totals instead of silently repricing them.
-                $numberFields = ['rounding_total', 'grand_total'];
-                if ($v2Kind === 'SQUAD') {
-                    $numberFields = array_merge($numberFields, ['discount_amount', 'tax_total', 'base_discount_amount', 'additional_squad_rounding_discount', 'subtotal', 'eligible_subtotal']);
-                    if (($v2Snapshot['line_targets'] ?? null) !== $v2Expected['line_targets']) {
-                        throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ['Squad item targets do not match.']]);
+                if (!$v2RecoverHydration) {
+                    // Full V2 contracts stay strict. Only the exact two-field
+                    // journal-hydration loss may skip nested comparisons.
+                    $numberFields = ['rounding_total', 'grand_total'];
+                    if ($v2Kind === 'SQUAD') {
+                        $numberFields = array_merge($numberFields, ['discount_amount', 'tax_total', 'base_discount_amount', 'additional_squad_rounding_discount', 'subtotal', 'eligible_subtotal']);
+                        if (($v2Snapshot['line_targets'] ?? null) !== $v2Expected['line_targets']) {
+                            throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ['Squad item targets do not match.']]);
+                        }
+                    } else {
+                        $numberFields[] = 'protected_500_total';
+                        if (($v2Snapshot['policy'] ?? null) !== $v2Expected['policy']) {
+                            throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ['Online rounding policy mismatch.']]);
+                        }
                     }
-                } else {
-                    $numberFields[] = 'protected_500_total';
-                    if (($v2Snapshot['policy'] ?? null) !== $v2Expected['policy']) {
-                        throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ['Online rounding policy mismatch.']]);
+                    foreach ($numberFields as $key) {
+                        if (!is_numeric($v2Snapshot[$key] ?? null) || (int) $v2Snapshot[$key] !== (int) $v2Expected[$key]) {
+                            throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ["Pricing mismatch: {$key}."]]);
+                        }
                     }
                 }
-                foreach ($numberFields as $key) {
-                    if (!is_numeric($v2Snapshot[$key] ?? null) || (int) $v2Snapshot[$key] !== (int) $v2Expected[$key]) {
-                        throw ValidationException::withMessages(['offline_snapshot.pricing_v2' => ["Pricing mismatch: {$key}."]]);
-                    }
-                }
+                // Even recovered clients MUST agree on every stored economic
+                // total. This prevents server-side reprice or silent V1 fallback.
                 $expectedFields = [
                     'subtotal' => $subtotal,
                     'discount_amount' => $v2Kind === 'SQUAD' ? $v2Expected['discount_amount'] : $discountAmount,
@@ -1386,6 +1402,18 @@ class PosCheckoutService
         }
 
         if (! $checkoutReturnedExisting) {
+            if ($v2HydrationRecoveryCandidate) {
+                try {
+                    logger()->notice('pos.checkout.v21_hf01.v2_hydration_recovered', [
+                        'outlet_id' => $outletId,
+                        'client_sync_id' => $clientSyncId,
+                        'kind' => (string) ($payload['pricing_rule_kind'] ?? ''),
+                    ]);
+                } catch (\Throwable) {
+                    // Log transport issues must not turn a committed offline
+                    // transaction into an apparent failure and trigger retry.
+                }
+            }
             try {
                 app(ReportDailySummaryRefreshService::class)->markSale($sale, 'checkout_paid');
             } catch (\Throwable $e) {
